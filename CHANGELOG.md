@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.4.2](https://github.com/pando85/home-energy-optimizer/tree/v0.4.2) - 2026-11-03
+
+### Fixed
+
+- build: Subtract battery charge and add discharge when reconstructing gross load ([4db5f19](https://github.com/pando85/home-energy-optimizer/commit/4db5f19ff8a44f7d487e19d643683b10244f7d54))
+
 ## [v0.4.1](https://github.com/pando85/home-energy-optimizer/tree/v0.4.1) - 2026-10-31
 
 ### Fixed
