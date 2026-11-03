@@ -175,7 +175,6 @@ class PlanningSettings:
 @dataclass(frozen=True)
 class ObservationSettings:
     slot_close_grace_s: float = 20.0
-    counter_max_age_s: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -922,7 +921,6 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
     obs_raw = _section(raw, "observation")
     observation = ObservationSettings(
         slot_close_grace_s=_positive(obs_raw.get("slot_close_grace_s", 20), "slot_close_grace_s"),
-        counter_max_age_s=_positive(obs_raw.get("counter_max_age_s", 300), "counter_max_age_s"),
     )
     archive = _parse_archive(_section(raw, "archive"))
     climate_shadow = _parse_climate_shadow(_section(raw, "climate_shadow"))

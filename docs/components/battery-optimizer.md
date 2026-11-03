@@ -123,3 +123,8 @@ slot plans from the slot in progress. This changes when the actuator follows a p
 kernel, its inputs and the calibration above are untouched, so no recalibration and no dependent goes stale.
 Shadow-report windows that span the deploy mix the two slot rules (`late_intent` slots are not counted as
 coverage, and their counterfactual covers only the adopted share of the slot).
+
+Slot records (`service/v1/slots/`) carry the battery counters, the gross load and the counterfactual cost
+for battery-mapped slots only from the deploy of the edge-value fix on (2026-11-04, code only, regime log):
+earlier live slots have them `null` ([known issues](../known-issues.md#idle-battery-counters-voided-a-live-slots-gross-load)).
+A recording fix, not a plant or model change: no recalibration.

@@ -199,18 +199,28 @@ the planner also requires `actuation.entities.battery_liveness`
 `planning.soc_source: entity` that sensor is tracked in every mode. A number in `freshness_s.battery_soc`
 restores the age test. The committed config now uses `soc_source: entity`.
 
-### Idle battery counters may void a live slot's gross load
+### Idle battery counters voided a live slot's gross load
 
-With the battery mapped, a slot record's gross load needs both AC energy counters at both slot edges, each
-no older than `observation.counter_max_age_s` (300 s). If the counters behave like the SOC (reported on
-change only), an idle battery leaves them older than that and the slot's gross load and counterfactual cost
-are `null` (not wrong). The counters do behave like the SOC (seen at go-live, 2026-11-03: an idle battery's
-counters keep an old `last_reported`), so expect this; check the first days of `service/v1/slots/`. The
-Prometheus history is not affected (it samples on every scrape), and slots that end before
-`battery.commissioned_at` use the grid counter alone. The same behaviour made the counters look stale in
-`/status` and `battery_optimizer_input_stale` under the 900 s they inherited from `freshness_s.grid_energy`;
-resolved: `freshness_s.battery_charge_energy` / `battery_discharge_energy` are `null` (availability only) by
-default, and a number restores the age test. `observation.counter_max_age_s` is unchanged.
+With the battery mapped, a slot record's gross load needs both AC energy counters at both slot edges. The
+observer took an edge value only if it was no older than `observation.counter_max_age_s` (300 s), but
+Omnibattery reports the counters on change only (like the SOC; seen at go-live, 2026-11-03: an idle
+battery's counters keep an old `last_reported`), so the idle direction's counter was always older than
+that, and one unknown counter voids both: from go-live every battery-mapped slot had
+`battery_charge_kwh`, `battery_discharge_kwh`, `gross_load_kwh` and the counterfactual cost `null` (not
+wrong), also while discharging. The grid import counter had the same flaw whenever the battery held the
+import at zero. The same behaviour made the counters look stale in `/status` and
+`battery_optimizer_input_stale` under the 900 s they inherited from `freshness_s.grid_energy`.
+
+Resolved in two steps. `freshness_s.battery_charge_energy` / `battery_discharge_energy` are `null`
+(availability only) by default, as `battery_soc`, and a number restores the age test. At a slot edge the
+value is the last reading at or before the edge, used when the entity is available and the HA session was
+in sync at the edge (from the applied `get_states` to the disconnect, backed off by the heartbeat interval
+plus timeout); an edge before the first sync after a start or inside a disconnection stays unknown. The
+battery counters and the SOC add their `freshness_s` age test at the edge only when it is a number; the
+grid counter has none. So the slot that contains a restart has no start SOC or counters.
+`observation.counter_max_age_s` is gone (ignored if still present). Slot records written before the edge
+fix was deployed keep the `null`s; the Prometheus history was never affected (it samples on every scrape),
+and slots that end before `battery.commissioned_at` use the grid counter alone.
 
 ### The PD loop oscillates; the discharge margin was too small
 
