@@ -12,6 +12,9 @@ Layout (partitioned by **UTC** day, so a DST day is never split or doubled)::
     service/v1/climate_<x>/date=YYYY-MM-DD/climate_<x>.jsonl  (x: decisions, scores, days, models)
                                                        the climate shadow (track B2): decisions,
                                                        scores, days and model refits
+    service/v1/actuation/date=YYYY-MM-DD/actuation.jsonl  dry_run / live only: one row per
+                                                       actuator tick that wrote (or would
+                                                       write) or changed state (ADR-0007)
     service/v1/state/virtual_battery.json              the virtual battery's SOC (mutable)
 
 Plans are written with :func:`battery_optimizer.paths.write_part_atomic` (temp
@@ -92,6 +95,9 @@ class ShadowSink:
     def append_weather_forecast(self, at: datetime, record: dict[str, Any]) -> Path:
         return self._append("weather_forecasts", at, record)
 
+    def append_actuation(self, at: datetime, record: dict[str, Any]) -> Path:
+        return self._append("actuation", at, record)
+
     def append_climate(self, kind: str, at: datetime, record: dict[str, Any]) -> Path:
         if kind not in CLIMATE_KINDS:
             raise ValueError(f"unknown climate record kind {kind!r}")
@@ -129,7 +135,7 @@ def iter_records(
     data_dir: Path, kind: str, since: datetime, until: datetime
 ) -> Iterator[dict[str, Any]]:
     """Records of *kind* (``slots``/``events``/``plans``/``pvpc_snapshots``/
-    ``weather_forecasts``/``climate_*``) from the UTC-day partitions
+    ``weather_forecasts``/``climate_*``/``actuation``) from the UTC-day partitions
     overlapping ``[since, until)``; torn or corrupt lines are skipped."""
     root = data_dir / _ROOT / kind
     day = since.astimezone(UTC).date() - timedelta(days=1)

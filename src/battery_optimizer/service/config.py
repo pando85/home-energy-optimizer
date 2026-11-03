@@ -26,7 +26,10 @@ from battery_optimizer._env import get_env
 __all__ = [
     "BATTERY_ROLES",
     "ENTITY_ROLES",
+    "SERVICE_MODES",
     "SOC_SOURCES",
+    "ActuationEntities",
+    "ActuationSettings",
     "ArchiveSettings",
     "ClimateShadowSettings",
     "EntityMap",
@@ -59,6 +62,10 @@ ENTITY_ROLES: tuple[str, ...] = (
 BATTERY_ROLES: tuple[str, ...] = tuple(r for r in ENTITY_ROLES if r.startswith("battery_"))
 
 SOC_SOURCES: tuple[str, ...] = ("entity", "simulated")
+
+#: ``shadow`` records intents only; ``dry_run`` also computes and records every Omnibattery
+#: write it would make; ``live`` sends them through the guarded allowlist (ADR-0007).
+SERVICE_MODES: tuple[str, ...] = ("shadow", "dry_run", "live")
 
 DEFAULT_PORT = 8080
 
@@ -219,6 +226,90 @@ class ClimateShadowSettings:
         return tuple(e for e in (self.regime_entity, self.dhw_plan_entity, self.away_entity) if e)
 
 
+#: Actuation entity -> required HA domain.  ``kill_switch`` and the sensors are only read.
+ACTUATION_DOMAINS: dict[str, str] = {
+    "kill_switch": "input_boolean",
+    "heartbeat": "input_datetime",
+    "allow_charge": "switch",
+    "allow_discharge": "switch",
+    "pd_target": "number",
+    "power_limits": "switch",
+    "max_discharge_power": "number",
+    "integration_status": "sensor",
+    "battery_ac_power": "sensor",
+    "battery_soc": "sensor",
+}
+
+
+@dataclass(frozen=True)
+class ActuationEntities:
+    """The Omnibattery control surface plus the owner's kill switch and heartbeat helper.
+
+    Written (live mode only, through :mod:`.ha_guard`): the two direction switches, the PD
+    grid target, the system power-limit switch, the system discharge cap and the heartbeat.
+    Only read: the kill switch, the integration status, battery AC power and SOC.
+    """
+
+    kill_switch: str | None = "input_boolean.battery_optimizer_live"
+    heartbeat: str | None = "input_datetime.battery_optimizer_heartbeat"
+    allow_charge: str | None = None
+    allow_discharge: str | None = None
+    pd_target: str | None = None
+    power_limits: str | None = None
+    max_discharge_power: str | None = None
+    integration_status: str | None = None
+    battery_ac_power: str | None = None
+    battery_soc: str | None = None
+
+    def all(self) -> tuple[str, ...]:
+        return tuple(e for k in ACTUATION_DOMAINS if (e := getattr(self, k)))
+
+
+@dataclass(frozen=True)
+class ActuationSettings:
+    """Live control through Omnibattery (ADR-0007); ignored in ``shadow`` mode."""
+
+    entities: ActuationEntities = field(default_factory=ActuationEntities)
+    tick_interval_s: float = 30.0
+    #: Highest grid-import target ever written (W); below the 5 kW contracted import.
+    import_cap_w: float = 4500.0
+    #: Measured import above ``import_cap_w + import_guard_margin_w`` while charging trips charge.
+    import_guard_margin_w: float = 200.0
+    #: After a trip, charge intents stay refused this long.
+    import_trip_hold_s: float = 300.0
+    neutral_pd_target_w: float = 0.0
+    discharge_margin_w: float = 50.0
+    #: The system discharge cap is never written below this (0 would mean UNLIMITED).
+    min_discharge_cap_w: float = 100.0
+    max_discharge_cap_w: float = 2500.0
+    #: ``+1``: the AC power sensor is + while charging; ``-1``: + while discharging.
+    #: Required outside shadow mode (no default: the sign must be measured).
+    battery_ac_power_sign: int | None = None
+    healthy_states: tuple[str, ...] = ("balanced", "charging", "discharging")
+    max_attempts: int = 3
+    readback_timeout_s: float = 10.0
+    min_setpoint_change_w: float = 100.0
+    min_command_interval_s: float = 30.0
+    shutdown_timeout_s: float = 15.0
+    grid_power_max_age_s: float = 30.0
+    battery_soc_max_age_s: float = 300.0
+    battery_ac_power_max_age_s: float = 60.0
+
+    def command_policy(self) -> Any:
+        """The writer knobs as the validated :class:`~battery_optimizer.dispatch.CommandPolicy`.
+
+        ``lease_seconds`` is the readback timeout: how long one write may stay unconfirmed.
+        """
+        from battery_optimizer.dispatch import CommandPolicy
+
+        return CommandPolicy(
+            max_attempts=self.max_attempts,
+            min_setpoint_change_w=self.min_setpoint_change_w,
+            min_command_interval_seconds=self.min_command_interval_s,
+            lease_seconds=self.readback_timeout_s,
+        )
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
     """Fully resolved service configuration."""
@@ -231,6 +322,7 @@ class ServiceConfig:
     freshness_s: Mapping[str, float]
     archive: ArchiveSettings = field(default_factory=ArchiveSettings)
     climate_shadow: ClimateShadowSettings = field(default_factory=ClimateShadowSettings)
+    actuation: ActuationSettings = field(default_factory=ActuationSettings)
     timezone: str = "Europe/Madrid"
     mode: str = "shadow"
     source_path: str | None = None
@@ -273,6 +365,7 @@ class ServiceConfig:
                 else None,
             },
             "freshness_s": dict(self.freshness_s),
+            "actuation": asdict(self.actuation),
             "source_path": self.source_path,
         }
 
@@ -284,6 +377,7 @@ class ServiceConfig:
         public.pop("source_path", None)
         public.pop("archive", None)  # passive collection never changes a plan
         public.pop("climate_shadow", None)  # nor does the climate shadow (it plans no battery)
+        public.pop("actuation", None)  # nor does the way a plan is sent
         text = json.dumps(public, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode()).hexdigest()
 
@@ -500,6 +594,135 @@ def _parse_climate_shadow(raw: Mapping[str, Any]) -> ClimateShadowSettings:
     )
 
 
+_ACTUATION_KEYS = (
+    "entities",
+    "tick_interval_s",
+    "import_cap_w",
+    "import_guard_margin_w",
+    "import_trip_hold_s",
+    "neutral_pd_target_w",
+    "discharge_margin_w",
+    "min_discharge_cap_w",
+    "max_discharge_cap_w",
+    "battery_ac_power_sign",
+    "healthy_states",
+    "command_policy",
+    "readback_timeout_s",
+    "shutdown_timeout_s",
+    "freshness_s",
+)
+
+
+def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
+    """Validate ``actuation:``; outside ``shadow`` every entity and the sign are required."""
+    name = "actuation"
+    _keys(raw, name, _ACTUATION_KEYS)
+    defaults = ActuationSettings()
+    ents_raw = _section(raw, "entities")
+    _keys(ents_raw, f"{name}.entities", tuple(ACTUATION_DOMAINS))
+    ents: dict[str, str | None] = {}
+    for key, domain in ACTUATION_DOMAINS.items():
+        value = ents_raw.get(key, getattr(defaults.entities, key))
+        if value is not None and (
+            not isinstance(value, str)
+            or not _ENTITY_ID.match(value)
+            or not value.startswith(f"{domain}.")
+        ):
+            raise ValueError(
+                f"service config: {name}.entities.{key} must be a {domain}.* entity ID or null"
+            )
+        if value is None and mode != "shadow":
+            raise ValueError(f"service config: mode={mode} needs {name}.entities.{key}")
+        ents[key] = value
+    named = [e for e in ents.values() if e]
+    if len(named) != len(set(named)):
+        raise ValueError(f"service config: {name}.entities must name distinct entities")
+
+    policy_raw = _section(raw, "command_policy")
+    _keys(
+        policy_raw,
+        f"{name}.command_policy",
+        ("max_attempts", "min_setpoint_change_w", "min_command_interval_s"),
+    )
+    fresh_raw = _section(raw, "freshness_s")
+    _keys(fresh_raw, f"{name}.freshness_s", ("grid_power", "battery_soc", "battery_ac_power"))
+
+    def num(
+        key: str,
+        *,
+        allow_zero: bool = False,
+        section: Mapping[str, Any] = raw,
+        prefix: str = "",
+        attr: str = "",
+    ) -> float:
+        default = getattr(defaults, attr or key)
+        label = f"{name}.{prefix}{key}"
+        return _positive(section.get(key, default), label, allow_zero=allow_zero)
+
+    sign = raw.get("battery_ac_power_sign")
+    if sign is not None and (isinstance(sign, bool) or sign not in (1, -1)):
+        raise ValueError(f"service config: {name}.battery_ac_power_sign must be 1, -1 or null")
+    if sign is None and mode != "shadow":
+        raise ValueError(
+            f"service config: mode={mode} needs {name}.battery_ac_power_sign (+1 when the AC "
+            "power sensor is positive while charging, -1 when positive while discharging); "
+            "measure it before leaving shadow mode"
+        )
+    healthy = raw.get("healthy_states", list(defaults.healthy_states))
+    if (
+        not isinstance(healthy, list)
+        or not healthy
+        or not all(isinstance(h, str) and h for h in healthy)
+    ):
+        raise ValueError(f"service config: {name}.healthy_states must be a non-empty list")
+    settings = ActuationSettings(
+        entities=ActuationEntities(**ents),
+        tick_interval_s=num("tick_interval_s"),
+        import_cap_w=num("import_cap_w"),
+        import_guard_margin_w=num("import_guard_margin_w", allow_zero=True),
+        import_trip_hold_s=num("import_trip_hold_s", allow_zero=True),
+        neutral_pd_target_w=num("neutral_pd_target_w", allow_zero=True),
+        discharge_margin_w=num("discharge_margin_w", allow_zero=True),
+        min_discharge_cap_w=num("min_discharge_cap_w"),
+        max_discharge_cap_w=num("max_discharge_cap_w"),
+        battery_ac_power_sign=sign,
+        healthy_states=tuple(healthy),
+        max_attempts=_int(
+            policy_raw.get("max_attempts", defaults.max_attempts),
+            f"{name}.command_policy.max_attempts",
+        ),
+        readback_timeout_s=num("readback_timeout_s"),
+        min_setpoint_change_w=num(
+            "min_setpoint_change_w", allow_zero=True, section=policy_raw, prefix="command_policy."
+        ),
+        min_command_interval_s=num(
+            "min_command_interval_s", allow_zero=True, section=policy_raw, prefix="command_policy."
+        ),
+        shutdown_timeout_s=num("shutdown_timeout_s"),
+        grid_power_max_age_s=num(
+            "grid_power", section=fresh_raw, prefix="freshness_s.", attr="grid_power_max_age_s"
+        ),
+        battery_soc_max_age_s=num(
+            "battery_soc", section=fresh_raw, prefix="freshness_s.", attr="battery_soc_max_age_s"
+        ),
+        battery_ac_power_max_age_s=num(
+            "battery_ac_power",
+            section=fresh_raw,
+            prefix="freshness_s.",
+            attr="battery_ac_power_max_age_s",
+        ),
+    )
+    cap = settings.import_cap_w
+    for key in ("neutral_pd_target_w", "discharge_margin_w"):
+        if getattr(settings, key) > cap:
+            raise ValueError(f"service config: {name}.{key} must not exceed import_cap_w")
+    if settings.min_discharge_cap_w > settings.max_discharge_cap_w:
+        raise ValueError(
+            f"service config: {name}.min_discharge_cap_w must not exceed max_discharge_cap_w"
+        )
+    return settings
+
+
 def _read_token() -> Secret | None:
     token = get_env("BATTERY_OPTIMIZER_HA_TOKEN")
     if token:
@@ -553,11 +776,8 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
     if not isinstance(raw, Mapping):
         raise ValueError(f"service config must be a mapping, got {type(raw).__name__}")
     mode = raw.get("mode", "shadow")
-    if mode != "shadow":
-        raise ValueError(
-            f"service config: mode={mode!r} is not supported — only 'shadow' exists; live "
-            "actuation is Phase D and is not built"
-        )
+    if mode not in SERVICE_MODES:
+        raise ValueError(f"service config: mode={mode!r} is not one of {SERVICE_MODES}")
     timezone = str(raw.get("timezone", "Europe/Madrid"))
     ZoneInfo(timezone)  # validate early
 
@@ -649,6 +869,12 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
     )
     archive = _parse_archive(_section(raw, "archive"))
     climate_shadow = _parse_climate_shadow(_section(raw, "climate_shadow"))
+    actuation = _parse_actuation(_section(raw, "actuation"), mode)
+    if mode == "live" and soc_source != "entity":
+        raise ValueError(
+            "service config: mode=live needs planning.soc_source=entity: a plan made from a "
+            "simulated SOC must never drive the real battery"
+        )
     fresh_raw = _section(raw, "freshness_s")
     freshness = {str(k): _positive(v, f"freshness_s.{k}") for k, v in fresh_raw.items()}
     return ServiceConfig(
@@ -659,6 +885,7 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
         observation=observation,
         archive=archive,
         climate_shadow=climate_shadow,
+        actuation=actuation,
         freshness_s=freshness,
         timezone=timezone,
         mode=mode,

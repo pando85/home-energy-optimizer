@@ -42,11 +42,20 @@ failure is counted and reported and never touches readiness or the battery plann
 
 Safety
 ------
-There is no actuation path: the HA adapters are read-only by construction
-(:mod:`.ha_guard`; its single exception is the ``weather.get_forecasts`` query for
-the archive), and intents are records, not commands.  On start, after every
-reconnect and whenever an input is stale, no decision is taken until a fresh,
-complete snapshot exists; a persisted plan is never resumed.
+In ``mode: shadow`` (the default) there is no actuation path: the HA adapters are
+read-only by construction (:mod:`.ha_guard`; its single exception is the
+``weather.get_forecasts`` query for the archive), and intents are records, not commands.
+On start, after every reconnect and whenever an input is stale, no decision is taken
+until a fresh, complete snapshot exists; a persisted plan is never resumed.
+
+Live control (ADR-0007)
+-----------------------
+In ``dry_run`` and ``live`` an :class:`~.actuator.Actuator` maps the intent frozen for the
+current slot to the Omnibattery entities every ``actuation.tick_interval_s`` and at every
+slot open and new plan.  ``dry_run`` records what it would write and sends nothing; only
+``live`` builds the HA client with an :class:`~.ha_guard.ActuationAllowlist`, the one path
+by which a write can leave the process.  Only plans solved by this process are acted on, and
+a graceful stop sets safe idle before the HA session closes.
 """
 
 from __future__ import annotations
@@ -56,7 +65,7 @@ import contextlib
 import logging
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -66,6 +75,7 @@ from typing import Any
 from battery_optimizer.climate.shadow import LiveInputs, detect_regime
 from battery_optimizer.config import TariffConfig
 
+from .actuator import ActuationContext, Actuator
 from .archive import (
     next_fetch_time,
     pvpc_snapshot_record,
@@ -77,6 +87,7 @@ from .clock import Clock
 from .config import ServiceConfig
 from .entity_store import EntityState, EntityStore, UpdateResult
 from .ha_client import HACommandError, HARestClient, HAWebSocketClient, WSTransport
+from .ha_guard import actuation_allowlist
 from .history import ForecastUnavailableError, LoadHistory, forecast_load
 from .metrics import ServiceMetrics
 from .observer import SlotMeasurements, SlotObserver, normalise_value
@@ -101,6 +112,11 @@ HistoryFetcher = Callable[[datetime, date], LoadHistory]
 Planner = Callable[[PlanningSnapshot], PlanResult]
 
 _HISTORY_RETRY_S = 600.0
+_ACTUATION_TEXT = {
+    "shadow": "none (read-only adapters; intents are recorded, never sent)",
+    "dry_run": "none (writes are computed and recorded under actuation/, never sent)",
+    "live": "Omnibattery entities through the ha_guard allowlist, gated by the kill switch",
+}
 _PLAN_MEMORY = 16
 #: Longest the startup catch-up of the climate shadow waits for the first Home Assistant sync.
 CLIMATE_SYNC_TIMEOUT_S = 60.0
@@ -164,14 +180,20 @@ class ShadowService:
         self._tz = config.tz
 
         climate_entities = config.climate_shadow.entities() if config.climate_shadow.enabled else ()
+        acting = config.mode != "shadow"
+        actuation_entities = config.actuation.entities.all() if acting else ()
         self.store = EntityStore.for_entities(
-            tuple(dict.fromkeys((*config.entities.all_entities(), *climate_entities)))
+            tuple(
+                dict.fromkeys(
+                    (*config.entities.all_entities(), *climate_entities, *actuation_entities)
+                )
+            )
         )
         self.observer = SlotObserver(config)
         self.store.add_listener(self.observer.on_state)
         self.store.add_listener(self._on_state)
 
-        self.metrics = ServiceMetrics(snapshot=self.metric_snapshot)
+        self.metrics = ServiceMetrics(snapshot=self.metric_snapshot, actuation=acting)
         from battery_optimizer import __version__
 
         self.metrics.build_info.labels(
@@ -192,6 +214,7 @@ class ShadowService:
                 transport=ws_transport,
                 on_synced=self._on_synced,
                 on_disconnected=self._on_disconnected,
+                actuation=actuation_allowlist(config),  # None unless mode: live
             )
             self.rest = HARestClient(settings=ha, transport=rest_transport)
 
@@ -236,6 +259,21 @@ class ShadowService:
         self.climate: ClimateShadowJob | None = None
         self.climate_error: str | None = None
         self._climate_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bo-climate")
+        self.actuator: Actuator | None = None
+        self._actuator_task: asyncio.Task[None] | None = None
+        self._actuator_wake = asyncio.Event()
+        if acting:
+            self.actuator = Actuator(
+                settings=config.actuation,
+                mode=config.mode,
+                store=self.store,
+                clock=clock,
+                grid_entity=config.entities.get("grid_power"),
+                send=self._send_actuation,
+                refresh=self._refresh_entities,
+                record=self._record_actuation,
+                metrics=self.metrics,
+            )
         self._climate_factory = climate_job_factory or (
             lambda: build_job(
                 config,
@@ -262,9 +300,20 @@ class ShadowService:
             )
         if self.config.climate_shadow.enabled:
             self._tasks.append(asyncio.create_task(self._climate_loop(), name="climate-shadow"))
+        if self.actuator is not None:
+            self._actuator_task = asyncio.create_task(self._actuator_loop(), name="actuator")
 
     async def stop(self) -> None:
         self._generation += 1  # fence any in-flight solve
+        if self.actuator is not None:
+            # No tick may race the shutdown write; then safe idle while HA is still connected.
+            if self._actuator_task is not None:
+                self._actuator_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._actuator_task
+                self._actuator_task = None
+            with contextlib.suppress(Exception):
+                await self.actuator.shutdown()
         if self.ha is not None:
             await self.ha.stop()
         tasks = [*self._tasks, *([self._replan_task] if self._replan_task else [])]
@@ -288,6 +337,7 @@ class ShadowService:
 
     def _on_synced(self) -> None:
         self._ha_synced.set()
+        self._wake_actuator()
         self._spawn(
             self._record_event("ha_synced", {"resyncs": self.ha.stats.resyncs if self.ha else 0})
         )
@@ -307,6 +357,11 @@ class ShadowService:
 
     def _on_state(self, state: EntityState, result: UpdateResult) -> None:
         role = self.config.entities.role_of(state.entity_id)
+        if self.actuator is not None and role == "grid_power":
+            value = state.numeric()
+            act = self.config.actuation
+            if value is not None and value > act.import_cap_w + act.import_guard_margin_w:
+                self._wake_actuator()  # the import hard rule must not wait for the next tick
         if (
             role == "price"
             and result is UpdateResult.ACCEPTED
@@ -863,6 +918,7 @@ class ShadowService:
         self.metrics.solves.labels(result="ok").inc()
         self.metrics.solve_duration.observe(elapsed)
         self.plans.append(result)
+        self._wake_actuator()
         self.last_solve = {
             "at": now.isoformat(),
             "trigger": trigger,
@@ -912,6 +968,7 @@ class ShadowService:
         )
         self._slot_open[slot_start] = opened
         self._opened_slot = slot_start
+        self._wake_actuator()
         for old in [s for s in self._slot_open if s < slot_start - timedelta(hours=2)]:
             del self._slot_open[old]
         return opened
@@ -1224,6 +1281,79 @@ class ShadowService:
                 delay = 5.0
             await self.clock.sleep(delay)
 
+    # ------------------------------------------------------------------ actuation
+
+    def _wake_actuator(self) -> None:
+        if self.actuator is not None:
+            self._actuator_wake.set()
+
+    def actuation_context(self, now: datetime) -> ActuationContext:
+        """The intent frozen for the current slot and what the guard needs about it."""
+        current = floor_slot(now, self._interval)
+        opened = self._slot_open.get(current)
+        intent = opened.intent if opened is not None else None
+        decision = opened.decision if opened is not None else "no_plan"
+        own = intent is not None and any(
+            p.plan_id == intent.plan_id and p.plan.generated_at >= self._started_at
+            for p in self.plans
+        )
+        curve = self.price_curve
+        price_fresh = curve is not None and curve.price_at(current) is not None
+        return ActuationContext(
+            now=now,
+            ha_synced=self.ha is not None and self.ha.stats.synced,
+            intent=intent,
+            decision=decision,
+            plan_from_this_process=own,
+            price_fresh=price_fresh,
+        )
+
+    async def _send_actuation(
+        self, domain: str, service: str, entity_id: str, data: Mapping[str, Any] | None
+    ) -> None:
+        if self.ha is None:
+            raise HACommandError("actuation", "Home Assistant is not configured")
+        await self.ha.actuate(domain, service, entity_id, data)
+
+    async def _refresh_entities(self, entities: tuple[str, ...]) -> None:
+        """REST GET of *entities* into the store (sensors HA re-reports without an event)."""
+        if self.rest is None:
+            return
+        from .entity_store import parse_ha_state
+
+        for entity in entities:
+            try:
+                payload = await self.rest.get_state(entity)
+                if payload is not None:
+                    self.store.apply(parse_ha_state(payload, received_at=self.clock.now()))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the WebSocket stays authoritative
+                self.metrics.rest_polls.labels(result="error").inc()
+
+    async def _record_actuation(self, at: datetime, record: dict[str, Any]) -> None:
+        await self._write(
+            self.sink.append_actuation, at, {**record, "code_version": self.code_version}
+        )
+
+    async def _actuator_loop(self) -> None:
+        assert self.actuator is not None
+        while True:
+            self._actuator_wake.clear()
+            try:
+                await self.actuator.tick(self.actuation_context(self.clock.now()))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the loop must survive one bad tick
+                log.exception("actuator tick failed")
+            sleep = asyncio.ensure_future(self.clock.sleep(self.config.actuation.tick_interval_s))
+            wake = asyncio.ensure_future(self._actuator_wake.wait())
+            try:
+                await asyncio.wait({sleep, wake}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (sleep, wake):
+                    task.cancel()
+
     # ------------------------------------------------------------------ views
 
     def _inputs_view(self, now: datetime) -> list[dict[str, Any]]:
@@ -1289,6 +1419,7 @@ class ShadowService:
             "virtual_soc": self.virtual_soc,
             "late_samples": self.observer.late_samples,
             "climate_shadow": self._climate_view(),
+            **({"actuator": self.actuator.snapshot()} if self.actuator is not None else {}),
         }
 
     def status(self) -> dict[str, Any]:
@@ -1297,8 +1428,8 @@ class ShadowService:
         ha = self.ha.stats if self.ha else None
         return {
             "service": "battery-optimizer",
-            "mode": "shadow",
-            "actuation": "none (read-only adapters; intents are recorded, never sent)",
+            "mode": self.config.mode,
+            "actuation": _ACTUATION_TEXT[self.config.mode],
             "code_version": self.code_version,
             "now": now.isoformat(),
             "started_at": self._started_at.isoformat(),
@@ -1350,6 +1481,7 @@ class ShadowService:
             },
             "climate_shadow": self._climate_status(),
             "config_hash": self.config.config_hash(),
+            **({"actuator": self.actuator.view()} if self.actuator is not None else {}),
         }
 
     def _climate_status(self) -> dict[str, Any]:
