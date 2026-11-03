@@ -25,7 +25,9 @@ Gross load: with no battery telemetry mapped, gross load is the grid import
 counter (the offline build's ``battery_absent`` assumption, recorded as the
 ``basis``).  With battery energy counters mapped it is
 ``grid_import - battery_charge + battery_discharge`` per slot, and a slot where
-any of the three is unknown is unusable.
+any of the three is unknown is unusable.  A slot that ends at or before
+``battery.commissioned_at`` is the grid counter alone, as in the offline build: the
+battery could not exchange energy yet, and its counters may not exist that far back.
 """
 
 from __future__ import annotations
@@ -259,6 +261,7 @@ class PrometheusHistory:
         price_entity: str | None,
         battery_charge_energy_entity: str | None = None,
         battery_discharge_energy_entity: str | None = None,
+        battery_commissioned_at: datetime | None = None,
         interval_seconds: int = 900,
         client_factory: Callable[[], httpx.Client] | None = None,
     ) -> None:
@@ -270,6 +273,7 @@ class PrometheusHistory:
         self._price = price_entity
         self._charge = battery_charge_energy_entity
         self._discharge = battery_discharge_energy_entity
+        self._commissioned_at = battery_commissioned_at
         self._interval = interval_seconds
         self._client_factory = client_factory or (
             lambda: httpx.Client(timeout=httpx.Timeout(timeout_s, connect=10.0))
@@ -331,9 +335,19 @@ class PrometheusHistory:
                 basis = BASIS_GRID_PLUS_BATTERY
                 _, charge = self._slot_energy(client, self._charge, window_start, cutoff)
                 _, discharge = self._slot_energy(client, self._discharge, window_start, cutoff)
+                step = timedelta(seconds=self._interval)
+                commissioned = self._commissioned_at
+
+                def slot_gross(
+                    start: datetime, g: float | None, c: float | None, d: float | None
+                ) -> float | None:
+                    if commissioned is not None and start + step <= commissioned:
+                        return g  # the battery could not exchange energy yet
+                    return None if g is None or c is None or d is None else g - c + d
+
                 gross = [
-                    None if g is None or c is None or d is None else g - c + d
-                    for g, c, d in zip(grid_kwh, charge, discharge, strict=True)
+                    slot_gross(s, g, c, d)
+                    for s, g, c, d in zip(grid_starts, grid_kwh, charge, discharge, strict=True)
                 ]
                 negative = sum(1 for v in gross if v is not None and v < 0)
                 if negative:

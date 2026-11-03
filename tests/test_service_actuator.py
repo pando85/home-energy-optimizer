@@ -812,7 +812,8 @@ LIVE = {
 def test_committed_actuation_section_names_the_installation_entities():
     config = load_service_config(REPO / "config" / "service.yaml")
     assert config.actuation.entities == ENTS
-    assert config.actuation.battery_ac_power_sign is None  # not measured yet
+    # measured 2026-11-03: sensor.venus_ac_power is negative while charging
+    assert config.actuation.battery_ac_power_sign == -1
     # availability only: Omnibattery reports SOC and AC power on change only
     assert config.actuation.battery_soc_max_age_s is None
     assert config.actuation.battery_ac_power_max_age_s is None
@@ -831,7 +832,7 @@ def test_the_actuation_section_does_not_change_the_plan_identity(tmp_path):
 @pytest.mark.parametrize(
     ("override", "message"),
     [
-        ({"mode": "dry_run"}, "battery_ac_power_sign"),
+        ({"mode": "dry_run", "actuation.battery_ac_power_sign": None}, "battery_ac_power_sign"),
         ({**LIVE, "planning.soc_source": "simulated"}, "soc_source=entity"),
         ({**LIVE, "actuation.entities.pd_target": None}, "needs actuation.entities.pd_target"),
         ({**LIVE, "actuation.entities.allow_charge": "number.x"}, "switch"),

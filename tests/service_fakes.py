@@ -152,6 +152,13 @@ def service_config(tmp_path: Path, **overrides: Any) -> ServiceConfig:
     )
 
 
+#: The committed config maps the battery (commissioned 2026-11-03); this is the house without it.
+NO_BATTERY = {
+    "entities.battery_soc": None,
+    "entities.battery_charge_energy": None,
+    "entities.battery_discharge_energy": None,
+}
+
 ENTITY_MODE = {
     "planning.soc_source": "entity",
     "entities.battery_soc": "sensor.test_soc",

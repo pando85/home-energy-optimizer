@@ -13,7 +13,7 @@ flags are in the [CLI reference](cli.md); the service-specific settings (`config
 | `BATTERY_OPTIMIZER_HA_URL` | Home Assistant base URL | built-in default |
 | `BATTERY_OPTIMIZER_HA_TOKEN` | Home Assistant bearer token of a non-admin user; required for HA extraction, `ha-states` and `serve`. Only `serve` in `mode: live` ever writes, and only the allowlisted Omnibattery entities ([ADR-0007](adr/0007-live-battery-control.md)) | unset |
 | `BATTERY_OPTIMIZER_HA_TOKEN_FILE` | File holding the token (e.g. a mounted secret); used by `serve` when the variable above is unset | unset |
-| `BATTERY_OPTIMIZER_SERVICE_CONFIG` | Shadow service configuration (`serve`, `shadow-report`); `build` and `extract` also read its battery counters and `battery.commissioned_at` (a missing file named here is an error) | `config/service.yaml` relative to the working directory |
+| `BATTERY_OPTIMIZER_SERVICE_CONFIG` | Shadow service configuration (`serve`, `shadow-report`); `build`, `extract` and the `serve` load history also read its battery counters and `battery.commissioned_at` (a missing file named here is an error) | `config/service.yaml` relative to the working directory |
 | `BATTERY_OPTIMIZER_PORT` | HTTP port of `serve` | `8080` |
 | `BATTERY_OPTIMIZER_PROMETHEUS_URL` | Prometheus base URL | built-in default |
 | `BATTERY_OPTIMIZER_GIT_SHA` | Build-time commit identity (40-hex, optional `-dirty`) used when git is unavailable | unset (set by the image build) |

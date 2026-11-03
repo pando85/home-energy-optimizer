@@ -2427,11 +2427,14 @@ class TestBatteryTelemetryConfig:
             with pytest.raises(ValueError, match="commissioned_at"):
                 parse_commissioned_at(bad)
 
-    def test_the_committed_service_config_has_no_battery_yet_and_parses(self) -> None:
+    def test_the_committed_service_config_records_the_commissioning(self) -> None:
         repo_config = Path(__file__).resolve().parents[1] / "config" / "service.yaml"
         loaded = load_battery_telemetry(repo_config)
-        assert loaded.commissioned_at is None
-        assert loaded.entities == ()
+        assert loaded.commissioned_at == datetime(2026, 11, 3, 19, 14, 32, 572000, tzinfo=UTC)
+        assert loaded.entities == (
+            "sensor.venus_total_charging_energy",
+            "sensor.venus_total_discharging_energy",
+        )
 
     def test_loads_entities_and_instant(self, tmp_path: Path) -> None:
         path = tmp_path / "service.yaml"

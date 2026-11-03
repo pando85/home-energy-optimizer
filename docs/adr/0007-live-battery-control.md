@@ -70,7 +70,7 @@ Two separate limits apply and both stay in force:
    |---|---|---|---|
    | `idle` | charge **off**, discharge **off** | `neutral_pd_target_w` (0) | untouched |
    | `charge` at P W | discharge **off**, charge **on** | `min(house load + P, import_cap_w, entity max)`, floored, never negative | untouched |
-   | `discharge` at P W | charge **off**, discharge **on** | `discharge_margin_w` (+50: a small import, never export) | limits **on**, discharge cap `max(P, min_discharge_cap_w)` |
+   | `discharge` at P W | charge **off**, discharge **on** | `discharge_margin_w` (a small import, never export; 200 W committed since 2026-11-03, code default 50) | limits **on**, discharge cap `max(P, min_discharge_cap_w)` |
    | *safe idle* | charge **off**, discharge **off** | untouched | untouched |
 
    House load = grid power − battery AC power (charge positive; the sensor's sign is
@@ -84,7 +84,9 @@ Two separate limits apply and both stay in force:
    desired state records that value with `clamped` set when it was cut. So the charge is at most
    2500 W − house load: with a low night load (~500 W) about **2 kW**, not the battery's 2.5 kW (known limitation,
    see [Follow-ups](#follow-ups)). The grid import while charging is at most 2500 W today, well under the
-   4500 W house guard.
+   4500 W house guard. **Correction (commissioning, 2026-11-03):** ±2500 W is the bound with the system power
+   limits **off**; with them on the bound is `[-system max discharge, +system max charge]`, which caps the charge
+   at the system max charge − house load (see [Commissioning findings](#commissioning-findings-2026-11-03)).
 
 5. **Ordering, one write in flight, readback.** Writes are ordered restrictive first: switch off the direction(s)
    being removed, set the discharge cap, enable the power limits, set the PD target, and only then switch on the
@@ -166,9 +168,11 @@ Two separate limits apply and both stay in force:
 
 ## Not solved by this ADR
 
-- **HA host loss** (power, crash, network). Omnibattery, the watchdog and the heartbeat all live in HA; whether
-  the Venus keeps its last power or idles on its own without HA is **untested** (implementation plan
-  **TODO-5.4**). Until that test is done, unattended live operation relies on the device's own behaviour.
+- **HA host loss** (power, crash, network). Omnibattery, the watchdog and the heartbeat all live in HA. Tested
+  2026-11-03 for outages of 23 s, 40 s and about 10.5 minutes: the Venus **keeps its last power** (it kept
+  discharging) and does not idle on its own; there is no device timeout of at least 10 minutes. HA host
+  power-off is untested (implementation plan **TODO-5.4**). Unattended live operation needs a failsafe that
+  does not depend on HA (see [Commissioning findings](#commissioning-findings-2026-11-03)).
 - **Load steps while charging.** The import while charging is bounded by the PD target (≤ 2500 W today, see
   decision 4) through Omnibattery's PD loop on the meter feedback. A sudden step in house load (the 3 kW heat-pump
   heater, an oven) is absorbed by reducing the battery charge, but not instantly: Omnibattery limits the change of
@@ -177,8 +181,9 @@ Two separate limits apply and both stay in force:
   off. The rollout therefore recommends that the **owner raises that setting to 2000 W**; it is an Omnibattery
   tuning value, set by the owner and **never written by the service** (it is not in the allowlist). Transients
   faster than the PD loop are not bounded by this code.
-- The sign of `sensor.venus_ac_power` has not been measured; `dry_run` and `live` refuse to start until it is set.
-  A wrong sign makes the house-load estimate wrong by twice the battery power; the import cap still holds.
+- The sign of `sensor.venus_ac_power` was measured on 2026-11-03 (negative while charging, so
+  `battery_ac_power_sign: -1`). A wrong sign makes the house-load estimate wrong by twice the battery power; the
+  import cap still holds.
 - Competing Omnibattery features (predictive grid charging, time slots, price controls, hourly balance) must be
   disabled by the owner; the guard only notices them through `integration_status`.
 - Partial writes after a crash: the last state persists in Omnibattery; the next process starts in safe idle once
@@ -273,7 +278,8 @@ restriction. No token value is ever written in this repository or its config.
    watchdog with the kill switch **off**. Measure the
    sign of `sensor.venus_ac_power` with a supervised charge from the Omnibattery UI and set
    `battery_ac_power_sign`; map `entities.battery_soc` (and the battery energy counters) and set
-   `planning.soc_source: entity`. Disable Omnibattery's competing economic strategies. Raise
+   `planning.soc_source: entity` (sign, SOC and counters done 2026-11-03; `entity` waits on the SOC freshness
+   follow-up in [Commissioning findings](#commissioning-findings-2026-11-03)). Disable Omnibattery's competing economic strategies. Raise
    `number.omnibattery_pd_controller_max_power_change` from 800 to 2000 W (owner setting, never written by the
    service) so a load step while charging is backed off within one PD cycle (see [Not solved](#not-solved-by-this-adr)).
 2. **dry_run for 1–2 days:** `mode: dry_run`, kill switch **on** (nothing is sent in `dry_run`; the switch only
@@ -312,3 +318,31 @@ The service gains one narrow write path, compiled in but reachable only with `mo
 the read-only default are unchanged. The ADR-0004 mapping hypothesis becomes testable on the hardware. Live
 dispatch remains subject to the hardware safety gates of ADR-0004 decision 5 and TODO-5.4; acceptance of this ADR
 is not by itself authorization to leave the battery under unattended live control.
+
+### Commissioning findings (2026-11-03)
+
+A supervised test on the commissioning evening (details in
+[known issues](../known-issues.md#battery-findings-of-the-commissioning-test-2026-11-03)) changes these points
+of the decision; none is a code change yet.
+
+- **Charge ceiling with the power limits on.** Omnibattery bounds the PD target to `[-system max discharge,
+  +system max charge]` while `switch.omnibattery_system_power_limits` is on (-800..+1000 W with the owner's
+  test caps). The actuator reads that live bound and never turns the limits off (decision 4 turns them on for
+  discharge), so a charge is silently cut to `system max charge − house load`, down to zero, with no alert:
+  only `clamped` records it. Before `live` the owner raises the system max charge to 2500 W, or a follow-up
+  changes the charge mapping (power limits off while charging, or a written charge cap, which needs the
+  allowlist of decision 3).
+- **Discharge margin.** The PD loop swings ±150 to 200 W on a ~2 s period; the 50 W margin gave brief exports
+  (-10..-94 W). The committed config sets `discharge_margin_w: 200`.
+- **HA outage.** On an HA restart (40 s), a forced kill (23 s) and a 10.5-minute stop the battery held its last
+  command and kept discharging (about 620 W through the long one); Omnibattery does not set standby on shutdown
+  and the firmware has no timeout of at least 10 minutes. The watchdog (decision 8) and safe idle act only while
+  HA runs, so during an outage nothing follows the house load or backs a charge off a load step. The watchdog
+  design must not assume the battery stops when HA stops: unattended `live` needs an HA-independent failsafe.
+- **`backup_mode` latch.** An upstream Omnibattery race can keep `integration_status` at `backup_mode` after
+  the grid returns while the backup-port load exceeds `number.venus_backup_offgrid_threshold`; the guard then
+  holds safe idle indefinitely. Workaround: a threshold above the backup-port load (200 W in the test, 500 W
+  since); upstream fix ffunes/Omnibattery#723.
+- **Measured SOC.** `planning.soc_source: entity`, required by `live` (decision 1), ages the SOC against
+  `freshness_s.battery_soc`; an idle battery's SOC looks stale (decision 6), so planning would stop. The committed
+  config stays `simulated` until the planner gets the same availability-only check as the actuator.

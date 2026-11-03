@@ -515,7 +515,7 @@ Price enters through **boost** (at most 0.04 €/kWh for 3 h or more, tunable): 
 
 *Before battery go-live (gates C and D)*
 
-6. Gross-load reconstruction in `build` (`raw - charge + discharge`; sign corrected 2026-11-03, register and extract the battery counters, refuse the no-battery assumption after commissioning); needs tests. **Done in code (2026-10-31)**: configuration in `config/service.yaml` (`battery.commissioned_at`, `entities.battery_*_energy`, both still unset), [data-pipeline](../components/data-pipeline.md). Install day: set both, then extract the counters.
+6. Gross-load reconstruction in `build` (`raw - charge + discharge`; sign corrected 2026-11-03, register and extract the battery counters, refuse the no-battery assumption after commissioning); needs tests. **Done in code (2026-10-31)**: configuration in `config/service.yaml` (`battery.commissioned_at`, `entities.battery_*_energy`, set at commissioning 2026-11-03), [data-pipeline](../components/data-pipeline.md). Install day: set both, then extract the counters.
 7. Disable OmniBattery's native economic features.
 8. Charge adapter with a grid target capped below the import limit minus a margin, with a charge-rate bound; test the target and cap interaction at commissioning.
 9. Boost interlock in AppDaemon (battery state of charge, then soak, then DHW), reading the battery state read-only.

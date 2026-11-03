@@ -10,6 +10,7 @@ from datetime import date, timedelta
 import pytest
 from service_fakes import (
     ENTITY_MODE,
+    NO_BATTERY,
     NOW,
     TARIFF,
     TZ,
@@ -313,7 +314,8 @@ def _slot_rows(tmp_path):
 
 def test_slot_cycle_records_decision_measurements_and_counterfactual(tmp_path, cleanup):
     clock = FakeClock(NOW)
-    service = make_service(tmp_path, clock)
+    # Gross load = grid here; with the battery mapped it also needs the battery counters.
+    service = make_service(tmp_path, clock, **NO_BATTERY)
     cleanup(service)
     feed(service, NOW, energy=1000.0)
     assert run(service.request_solve("test")) == "ok"

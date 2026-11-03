@@ -15,6 +15,7 @@ from service_fakes import ENTITY_MODE, TARIFF, TZ, entity_state, flat_history, s
 from battery_optimizer.service.entity_store import UpdateResult
 from battery_optimizer.service.history import (
     BASIS_GRID_ONLY,
+    BASIS_GRID_PLUS_BATTERY,
     ForecastUnavailableError,
     PrometheusHistory,
     forecast_load,
@@ -214,6 +215,80 @@ def test_prometheus_history_from_raw_counter_samples():
     assert np.nanmedian(history.load_kwh) == pytest.approx(0.1, rel=1e-3)
     assert history.mean_price_eur_per_kwh == pytest.approx(0.2)
     assert all("[" in q and "query_range" not in q for q in queries)
+
+
+@pytest.mark.parametrize("commissioned", [True, False])
+def test_prometheus_history_uses_the_grid_alone_before_commissioning(commissioned):
+    """Counters that only exist from commissioning on must not void the older history."""
+    day = date(2026, 10, 20)
+    cutoff = local_day_bounds_utc(day, TZ)[0]
+    commissioned_at = cutoff - timedelta(hours=12)
+    t0 = commissioned_at.timestamp()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = parse_qs(request.url.query.decode())
+        query, at = params["query"][0], float(params["time"][0])
+        window = int(re.search(r"\[(\d+)s\]", query).group(1))
+        start = at - window
+        ts = [t for t in range(int(math.ceil(start / 60)) * 60, int(at) + 1, 60) if t > start]
+        if "shellyem" in query:  # grid import, 400 W
+            values = [[t, str(1000 + 0.4 / 3600 * (t - 1_790_000_000))] for t in ts]
+        elif "discharging" in query:
+            values = [[t, "0.0"] for t in ts if t >= t0]
+        elif "charging" in query:  # charge counter from commissioning on, 100 W
+            values = [[t, str(0.1 / 3600 * (t - t0))] for t in ts if t >= t0]
+        else:
+            values = [[t, "0.2"] for t in ts]
+        metric = {"__name__": "x", "entity": "e", "job": "home-assistant", "instance": "10.0.0.1"}
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {"resultType": "matrix", "result": [{"metric": metric, "values": values}]},
+            },
+        )
+
+    fetcher = PrometheusHistory(
+        base_url="http://prom.test:9090",
+        timeout_s=5,
+        tz=TZ,
+        window_days=2,
+        grid_energy_entity="sensor.shellyem_main_channel_1_energy",
+        price_entity="sensor.esios_pvpc",
+        battery_charge_energy_entity="sensor.venus_total_charging_energy",
+        battery_discharge_energy_entity="sensor.venus_total_discharging_energy",
+        battery_commissioned_at=commissioned_at if commissioned else None,
+        client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    history = fetcher.fetch(utc(2026, 10, 20, 9, 0), day)
+    assert history.basis == BASIS_GRID_PLUS_BATTERY
+    step = timedelta(minutes=15)
+    before = np.array([s + step <= commissioned_at for s in history.starts])
+    # The last slot before the cutoff is partial in this fake (no sample at the cutoff).
+    after = np.array([commissioned_at + step <= s < cutoff - step for s in history.starts])
+    if commissioned:
+        assert history.usable[before].all()
+        assert history.load_kwh[before] == pytest.approx(0.1)
+    else:
+        assert not history.usable[before].any()
+    assert history.usable[after].all()
+    assert history.load_kwh[after] == pytest.approx(0.075)
+
+
+def test_serve_passes_the_commissioning_instant_to_the_history(tmp_path, monkeypatch):
+    from service_fakes import REPO
+
+    from battery_optimizer.service.serve import build_service
+
+    monkeypatch.setenv("BATTERY_OPTIMIZER_PROMETHEUS_URL", "http://prom.test:9090")
+    service, _ = build_service(
+        service_config=str(REPO / "config" / "service.yaml"),
+        tariff_config=str(REPO / "config" / "tariff.yaml"),
+        data_dir=str(tmp_path / "data"),
+    )
+    fetcher = service._history_fetcher.__self__
+    assert fetcher._commissioned_at == utc(2026, 11, 3, 19, 14, 32, 572000)
+    assert fetcher._charge == "sensor.venus_total_charging_energy"
 
 
 # ---------------------------------------------------------------------------
