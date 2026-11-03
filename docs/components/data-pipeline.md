@@ -51,8 +51,8 @@ and the data volume are deployed from the homelab repository.
    (ISO with offset) in `config/service.yaml`; date the regime-log row.
 2. `extract --entities <charge>,<discharge>` (alone), `validate`, `build` ([CLI](../cli.md#build)), then
    `build-features --signal-set climate`.
-3. Acceptance: `build_manifest.json` has `battery_reconstruction` with few unusable intervals, and gross
-   minus raw equals the metered charge minus discharge on a sampled week.
+3. Acceptance: `build_manifest.json` has `battery_reconstruction` with few unusable intervals, and raw
+   minus gross equals the metered charge minus discharge on a sampled week.
 
 ## Status
 
