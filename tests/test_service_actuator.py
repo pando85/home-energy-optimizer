@@ -1144,6 +1144,33 @@ def test_dry_run_service_records_actuation_and_sends_nothing(tmp_path, cleanup):
     assert "battery_optimizer_actuator_guard_ok 1.0" in text
 
 
+def test_restart_mid_slot_takes_control_in_that_slot_through_the_full_guard(tmp_path, cleanup):
+    clock = FakeClock(NOW)  # a fresh process, 5 minutes into the 10:45 slot
+    service = make_service(tmp_path, clock, mode="dry_run")
+    cleanup(service)
+    _live_world(service, clock)
+    service.ha.stats.synced = False  # the slot opens before the first HA sync
+    asyncio.run(service.open_slot(SLOT))
+    assert service.actuation_context(NOW).decision == "not_ready"
+    service.ha.stats.synced = True
+    feed(service, NOW)
+
+    async def go():
+        assert await service.request_solve("event:resync") == "ok"  # a catch-up plan
+        return await service.actuator.tick(service.actuation_context(clock.now()))
+
+    record = asyncio.run(go())
+    plan = service.plans[-1]
+    assert service._slot_open[SLOT].decision == "late_intent"
+    assert record["guard_reasons"] == [] and record["desired"]["reason"] == "intent"
+    assert record["intent"]["plan_id"] == plan.plan_id
+    # The kill switch still gates a late intent like any other.
+    clock.advance(1)
+    service.store.apply(entity_state(ENTS.kill_switch, "off", clock.now()))
+    record = asyncio.run(service.actuator.tick(service.actuation_context(clock.now())))
+    assert "kill_switch_off" in record["guard_reasons"]
+
+
 def test_live_service_stop_sets_safe_idle_before_closing_ha(tmp_path, cleanup):
     clock = FakeClock(NOW)
     service = make_service(tmp_path, clock)

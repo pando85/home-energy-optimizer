@@ -487,7 +487,14 @@ class ServiceMetrics:
             self.skipped.labels(reason=reason)
         for result in ("ok", "error", "timeout", "discarded"):
             self.solves.labels(result=result)
-        for decision in ("intent", "no_plan", "plan_expired", "not_ready", "not_observed"):
+        for decision in (
+            "intent",
+            "late_intent",
+            "no_plan",
+            "plan_expired",
+            "not_ready",
+            "not_observed",
+        ):
             self.shadow_slots.labels(decision=decision)
         for direction in ("charge", "discharge"):
             self.shadow_planned_energy.labels(direction=direction)

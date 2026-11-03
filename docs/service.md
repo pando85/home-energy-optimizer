@@ -98,15 +98,46 @@ every boundary `B`:
 1. `B - solve_lead_s` (120 s): scheduled solve; the plan's first slot is `B`.
 2. `B`: the slot opens and its decision is **frozen**: the actionable intent valid at `B` from the
    newest unexpired plan made before `B`, or no decision with a reason (`no_plan`, `plan_expired`,
-   `not_ready`). If any input is stale at `B`, the decision is `not_ready` even if a plan exists.
+   `not_ready`). If any input is stale at `B`, the decision is `not_ready` even if a plan exists. A slot
+   without an intent can still adopt one later in the slot (late adoption, below).
 3. `B + slot_close_grace_s` (20 s): the previous slot closes — measurements, the frozen decision,
    the virtual-battery step and the costs are appended to the store.
+
+**Late adoption.** A slot that opened **without** an intent (`no_plan`, `plan_expired`, `not_ready`) is
+re-evaluated every 15 s and after every new plan until it ends. Once every input is ready and an unexpired plan
+solved by this process has an actionable intent covering the slot, the slot adopts it for the rest of the slot:
+the decision becomes `late_intent`, and from then on the slot is frozen like any other. A slot that opened
+**with** an intent is never re-decided, whatever plans arrive mid-slot. Typical cases: a pod restart (deploy,
+config change), whose first slot used to stay in safe idle for up to 15 minutes, and a transient not-ready at
+`B` (the day's load history is fetched just after local midnight, so the slot at local midnight usually opened
+`history_unavailable`).
+
+```
+                 open at B
+  ┌─────────────────┴──────────────────┐
+  intent ── frozen until B + 15 min     no intent (no_plan / plan_expired / not_ready)
+                                          │ every 15 s and on every new plan:
+                                          │ inputs ready and an unexpired own plan covers the slot?
+                                          ├── no: stays without intent (safe idle in live)
+                                          └── yes: late_intent, frozen until B + 15 min
+```
+
+For a slot without intent to have a plan to adopt, a solve that starts inside such a slot, before
+`B + 15 min - solve_lead_s`, plans from the **slot in progress** instead of the next boundary (a *catch-up*
+plan: its first slot began before its decision time, and it expires `plan_ttl_slots` slots after that first
+slot as usual). The event solve after the first HA sync or the history refresh is the usual one at startup;
+and whenever the inputs are ready inside such a slot but no plan covers it, the scheduler requests one itself
+(`trigger: catch_up`), at most once per slot. The planner models the catch-up plan's first slot whole; the intent is a
+power target held only for the rest of the slot, so the battery moves less energy than planned in that slot,
+never more, and the next scheduled solve starts from the measured SOC again. In the last `solve_lead_s` of a
+slot a solve plans from the next boundary, as the scheduled solve always does.
 
 Extra solves are requested after a completed resync, newly published next-day prices, a refreshed
 history or an SOC change of at least `replan.soc_change_frac`; they are debounced and rate-limited.
 Solves run one at a time in a single-thread executor with `solve_timeout_s`. A request while the
 worker is busy is skipped and counted (`busy`); a timed-out solve keeps the worker until its thread
-really ends. A plan whose first slot has started by the time it lands is discarded as obsolete.
+really ends. A plan whose first slot has started by the time it lands is discarded as obsolete; a catch-up
+plan, whose first slot is the slot it was made in, is discarded only when that slot has ended.
 
 ### Intents
 
@@ -232,7 +263,7 @@ ID, price, timestamp or household reading is a label.
 | `current_intent_power_watts`, `current_intent_active` | gauge | — |
 | `history_refresh_total` | counter | `result` |
 | `history_usable_slots`, `history_age_seconds`, `terminal_value_eur_per_kwh` | gauge | — |
-| `shadow_slots_total` | counter | `decision` (`intent`, `no_plan`, `plan_expired`, `not_ready`, `not_observed`) |
+| `shadow_slots_total` | counter | `decision` (`intent`, `late_intent`, `no_plan`, `plan_expired`, `not_ready`, `not_observed`) |
 | `shadow_planned_energy_kwh_total`, `shadow_actual_battery_energy_kwh_total` | counter | `direction` |
 | `shadow_native_cost_eur`, `shadow_counterfactual_cost_eur` | gauge (since start; PVPC can be negative) | — |
 | `shadow_comparable_slots_total`, `shadow_soc_violations_total`, `shadow_clipped_energy_kwh_total` | counter | — |
@@ -291,8 +322,10 @@ per actuator tick; `-v`/`--verbose` adds DEBUG. Tokens never appear in it. At IN
   `solve skipped trigger=... reason=... detail=...` the first time a reason occurs (repeats are DEBUG);
   timeouts and discarded plans at WARNING, solver errors at ERROR; `prices published`;
 - slots: `slot opened start=... decision=intent mode=charge power_w=1500 plan_id=... not_ready=-` (or
-  `decision=not_ready ... not_ready=ha_disconnected,...`) and `slot closed start=... decision=... grid_kwh=...
-  battery_charge_kwh=... battery_discharge_kwh=... soc_start=... soc_end=...`;
+  `decision=not_ready ... not_ready=ha_disconnected,...`), `slot adopted start=... mode=charge power_w=1500
+  plan_id=... after_s=60 decision_at_open=not_ready` (a [late adoption](#scheduling-and-the-slot-cycle)) and
+  `slot closed start=... decision=... grid_kwh=... battery_charge_kwh=... battery_discharge_kwh=... soc_start=...
+  soc_end=...`;
 - actuator (`dry_run`/`live`): `actuator kill_switch=on previous=off`, `actuator in_control=True`,
   `actuator guard reasons=no_plan` (when the set changes; `ok` when empty), `actuator desired mode=charge
   reason=intent pd_target_w=1900 max_discharge_w=- clamped_w=0` (when mode or reason changes), every write
@@ -315,9 +348,19 @@ files `0600`, directories `0700`:
 | Path | Content |
 |---|---|
 | `plans/date=YYYY-MM-DD/<plan_id>.json` | One immutable file per plan (atomic, no-clobber): snapshot summary and inputs, solver result, intents |
-| `slots/date=YYYY-MM-DD/slots.jsonl` | One row per closed slot: decision, measurements, price, virtual-battery step, costs |
+| `slots/date=YYYY-MM-DD/slots.jsonl` | One row per closed slot: decision, measurements, price, virtual-battery step, costs (see below) |
 | `events/date=YYYY-MM-DD/events.jsonl` | Start/stop, HA sync/disconnect, solve skipped/error/timeout/discarded, history refresh, price publication |
 | `state/virtual_battery.json` | Virtual SOC (restored after a restart if younger than 6 h) |
+
+A slot row's `decision` is the outcome that held when the slot closed: `intent`, `late_intent`, `no_plan`,
+`plan_expired`, `not_ready` or `not_observed`. `decision_at_open` is the decision frozen at `B` (equal to
+`decision` except for `late_intent`; `null` when the slot was not observed); `inputs_ready_at_open` and
+`not_ready_reasons` also describe `B`. For a `late_intent` slot, `adopted_at` is when the intent was adopted,
+`adopted_after_s` the seconds from the slot start to then (both `null` otherwise), and `intent` is the adopted
+intent as the plan holds it (its `plan_id` names the plan). Everything derived from the intent covers only the
+time it was in force, `1 - adopted_after_s / interval_seconds` of the slot: `planned_charge_kwh` and
+`planned_discharge_kwh`, the SOC-limit check, and the virtual-battery step that gives the counterfactual
+(the intent's power scaled by that share, the energy-equivalent of no intent before `adopted_at`).
 | `pvpc_snapshots/date=YYYY-MM-DD/pvpc_snapshots.jsonl` | One row per PVPC sensor state change (see [Passive archives](#passive-archives)) |
 | `weather_forecasts/date=YYYY-MM-DD/weather_forecasts.jsonl` | One row per fetched HA weather forecast (see [Passive archives](#passive-archives)) |
 | `climate_{decisions,scores,days,models}/date=YYYY-MM-DD/*.jsonl` | The [climate shadow](#climate-shadow-track-b2)'s records (only when it is enabled) |
@@ -514,14 +557,14 @@ a threshold or a window is a preregistration amendment, allowed only before go-l
 | Token rejected | `ha_failures_total{stage="auth"}` | Retried only at the maximum backoff |
 | Subscribe or `get_states` refused or not acknowledged | `stage="subscribe"` / `"get_states"` | Session ends, reconnect |
 | Missed pong | `stage="heartbeat"` | Session ends, reconnect |
-| Stale grid power or SOC | `input_stale`, `not_ready_reason` | No solve (`skipped_solves_total{reason}`), no decision |
+| Stale grid power or SOC | `input_stale`, `not_ready_reason` | No solve (`skipped_solves_total{reason}`), no decision; a slot that opened not ready adopts an intent once the inputs recover (`late_intent`) |
 | Prices missing, or next day not yet published late in the day | `prices_missing` / `prices_insufficient` | No solve until `min_horizon_slots` are published |
 | Prometheus down at the daily refresh | `history_refresh_total{result="error"}` | Retried every 10 min; yesterday's history is not reused for today |
 | Solver error or timeout | `solves_total{result}` | Reported; a timed-out thread keeps the worker (`busy`) |
 | Store write fails | `sink_write_errors_total` | Logged; service continues |
 | Archive write fails, or a forecast fetch fails (no session, call refused, timeout, empty or malformed response) | `pvpc_snapshots_total{result="failed"}`, `weather_forecast_fetches_total{result="failed"}` | Logged and counted; the record is dropped; a failed fetch is retried after 30 s, 60 s, ... capped at 10 min (never past the next grid instant); readiness, solves and slot closes are untouched |
 | Climate shadow cannot load (prior, site file or config missing) or a run fails | `climate_shadow_up`, `climate_shadow_runs_total{result="error"}`, `/status` | Recorded (an `error` decision row or a `climate_shadow_error` event), retried at the next hour; readiness and the battery planner are untouched |
-| Restart | `build_info`, events | No plan is resumed; decisions start after the first fresh solve |
+| Restart | `build_info`, events | No plan is resumed; decisions start after the first fresh solve, a catch-up plan adopted by the slot in progress (`late_intent`) |
 
 ## Shadow-vs-native comparison
 
@@ -536,11 +579,12 @@ alone, per local day and overall:
 
 * **Coverage:** slots with a valid intent at their start divided by the real quarter-hours of the
   window (92/96/100 per local day), with decision outcomes, skipped-solve reasons, solve failures,
-  plans and HA disconnects.
+  plans and HA disconnects. A `late_intent` slot is not covered (it is listed under the outcomes).
 * **Planned vs actual:** requested charge/discharge energy against the energy the native controller
   moved (battery counters, else integrated battery power, labelled), and the mean absolute and mean
   signed difference of slot-average power.
 * **Cost:** native = `price × measured grid import`. Counterfactual = the frozen decisions replayed
+  (a `late_intent` for the share of the slot it was in force, as in the slot row)
   open-loop on a virtual battery starting from the first measured SOC, against the measured gross
   load `grid − battery charge + battery discharge`, clipped by power, SOC window, import ceiling and
   no-export — `price × (load + charge − discharge)`. Same slots, prices and loads for both.
@@ -623,7 +667,10 @@ turns both direction switches off when it is older than 5 minutes while the kill
 cannot even confirm safe idle sends no heartbeat.
 
 **Restart and shutdown.** Plans live only in memory; the actuator acts only on intents of plans solved by
-this process, so after a restart it holds safe idle until a fresh plan's slot opens. A graceful stop (SIGTERM)
+this process, so after a restart it holds safe idle until the first fresh plan: a catch-up plan solved after
+the first HA sync is adopted by the slot in progress ([late adoption](#scheduling-and-the-slot-cycle)), so
+control resumes within that slot rather than at the next boundary. A late-adopted intent passes the same
+guard as any other. A graceful stop (SIGTERM)
 cancels the actuator loop and sets safe idle before the HA session closes (`shutdown_timeout_s`). None of
 this reaches the battery while Home Assistant itself is down: in the commissioning test (HA outages of 23 s
 to 10.5 minutes) the battery kept its last command, see
