@@ -107,7 +107,7 @@ Two separate limits apply and both stay in force:
    process did not solve (`plan_not_from_this_process`), grid power older than 30 s, battery SOC or battery
    AC power missing, `unavailable`/`unknown` or non-numeric (SOC also outside 0..100 %; no age test by default,
    see below), `sensor.omnibattery_non_responsive_batteries` not exactly `None` (`battery_unresponsive`;
-   optional `actuation.entities.battery_liveness`), no PVPC price for the current slot,
+   `actuation.entities.battery_liveness`, required outside shadow), no PVPC price for the current slot,
    `sensor.omnibattery_integration_status` outside `healthy_states` (`balanced`, `charging`, `discharging`; any
    other value — `manual`, `grid_charging`, `backup_mode`, `initializing`, a competing Omnibattery strategy,
    `unavailable` — holds safe idle). **Hard rule:** measured import above `import_cap_w + import_guard_margin_w`
@@ -123,8 +123,10 @@ Two separate limits apply and both stay in force:
    on change, and HA does not refresh `last_reported` for an unchanged value on this install (`get_states` and
    REST included), so an idle battery's SOC and AC power keep a `last_reported` hours old while healthy. An age
    test would hold safe idle forever and the battery could never leave idle to charge. So
-   `freshness_s.battery_soc` and `freshness_s.battery_ac_power` are `null` (availability only); those entities
-   turn `unavailable` when Modbus polling fails, and the liveness sensor covers a non-responsive battery. A
+   `freshness_s.battery_soc` and `freshness_s.battery_ac_power` are `null` (availability only). Those entities
+   do **not** turn `unavailable` when Modbus polling fails: on 2026-11-03 the battery stopped answering at 18:17
+   and SOC/AC power kept their last values, while `sensor.omnibattery_non_responsive_batteries` changed from
+   `None` to `venus` within a minute. The liveness guard is therefore the check that catches it. A
    number of seconds still enables an age test. The Shelly grid power reports every ~2 s and stays age-checked.
 
 7. **Restart never resumes.** Plans are held only in memory and the actuator acts only on an intent whose plan

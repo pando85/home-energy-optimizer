@@ -587,9 +587,10 @@ already have written (the real ones never change), so a stable situation records
 The actuator also wakes on a kill-switch change, and on a grid reading above
 `import_cap_w + import_guard_margin_w` while charging, at most once per `tick_interval_s`.
 
-Configuration keys (`actuation:` in `config/service.yaml`; defaults in parentheses): `entities.*` (ten
-entity IDs, all required outside shadow, plus the optional `battery_liveness`, deployed as
-`sensor.omnibattery_non_responsive_batteries`), `battery_ac_power_sign` (none: required outside shadow),
+Configuration keys (`actuation:` in `config/service.yaml`; defaults in parentheses): `entities.*` (eleven
+entity IDs, all required outside shadow, including `battery_liveness`, deployed as
+`sensor.omnibattery_non_responsive_batteries`: Omnibattery keeps the last SOC and AC power values when
+Modbus fails, so this is the check that catches a silent battery), `battery_ac_power_sign` (none: required outside shadow),
 `tick_interval_s` (30), `import_cap_w` (4500), `import_guard_margin_w` (200), `import_trip_hold_s` (300),
 `neutral_pd_target_w` (0), `discharge_margin_w` (50), `min_discharge_cap_w` (100), `max_discharge_cap_w`
 (2500), `healthy_states` (`balanced`, `charging`, `discharging`), `command_policy.max_attempts` (3),

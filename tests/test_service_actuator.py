@@ -854,6 +854,7 @@ def test_the_actuation_section_does_not_change_the_plan_identity(tmp_path):
         ({**LIVE, "actuation.max_discharge_cap_w": 3000}, "battery's 2500 W"),
         ({**LIVE, "actuation.freshness_s.battery_soc": 0}, "freshness_s.battery_soc"),
         ({**LIVE, "actuation.entities.battery_liveness": "binary_sensor.x"}, "battery_liveness"),
+        ({**LIVE, "actuation.entities.battery_liveness": None}, "needs actuation.entities.batt"),
     ],
 )  # fmt: skip
 def test_invalid_actuation_config_is_refused(tmp_path, override, message):
@@ -874,12 +875,10 @@ def test_dry_run_and_live_configs_load(tmp_path):
             **{
                 **LIVE,
                 "actuation.freshness_s.battery_soc": 600,
-                "actuation.entities.battery_liveness": None,  # optional even in live
             },
         )
     )
     assert aged.actuation.battery_soc_max_age_s == 600
-    assert aged.actuation.entities.battery_liveness is None
 
 
 # ---------------------------------------------------------------------------

@@ -248,8 +248,9 @@ BATTERY_RATED_POWER_W = 2500.0
 #: Longest tick: well inside the HA watchdog's 5-minute heartbeat window.
 MAX_TICK_INTERVAL_S = 120.0
 
-#: Entities that may stay ``null`` even outside shadow mode.
-_OPTIONAL_ACTUATION_ENTITIES = frozenset({"battery_liveness"})
+#: Entities that may stay ``null`` even outside shadow mode. None: ``battery_liveness`` is required
+#: because Omnibattery keeps the last SOC/AC power values when Modbus fails (seen 2026-11-03).
+_OPTIONAL_ACTUATION_ENTITIES: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -259,7 +260,7 @@ class ActuationEntities:
     Written (live mode only, through :mod:`.ha_guard`): the two direction switches, the PD
     grid target, the system power-limit switch, the system discharge cap and the heartbeat.
     Only read: the kill switch, the integration status, battery AC power and SOC, and the
-    optional ``battery_liveness`` sensor (Omnibattery's non-responsive-batteries count, whose
+    ``battery_liveness`` sensor (Omnibattery's non-responsive-batteries count, whose
     healthy state is the text ``None``).
     """
 
@@ -308,7 +309,8 @@ class ActuationSettings:
     grid_power_max_age_s: float = 30.0
     #: ``None`` = availability only (present, not unavailable/unknown, numeric), no age test:
     #: Omnibattery's coordinator entities report only on change, so an idle battery's SOC and
-    #: AC power keep their old ``last_reported``; they turn ``unavailable`` when Modbus fails.
+    #: AC power keep their old ``last_reported``; they also keep their last value when Modbus
+    #: fails, so ``battery_liveness`` is the check that catches a non-responsive battery.
     battery_soc_max_age_s: float | None = None
     battery_ac_power_max_age_s: float | None = None
 
