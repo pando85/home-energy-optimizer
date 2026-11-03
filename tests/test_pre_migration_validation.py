@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import re
@@ -1346,8 +1347,8 @@ class TestCodeProvenance:
         head = _git(scratch_repo["repo"], "rev-parse", "HEAD")
         assert head.returncode == 0, head.stderr
         identity = representative_run["summary"]["run_identity"]
-        # The exact string the defect recorded — the value a reader could pin nothing to.
-        assert static_version == "0.1.0"
+        # The distribution version names a release, never a commit.
+        assert static_version == importlib.metadata.version("battery-optimizer")
         assert identity["code_version"] != static_version
         assert re.fullmatch(r"[0-9a-f]{40}(-dirty)?", identity["code_version"]), identity
         assert identity["git_head"] == head.stdout.strip()
