@@ -280,6 +280,33 @@ for 2 m; `actuator_in_control == 1 and actuator_guard_ok == 0` for 30 m;
 `min_over_time(actuator_clamped_watts[30m]) > 100` (the plan is cut for a whole half hour, typically the
 system max charge while the power limits are on).
 
+## Logs
+
+The log (stderr, `LEVEL logger: message`) carries one `key=value` line per event, on change only, never
+per actuator tick; `-v`/`--verbose` adds DEBUG. Tokens never appear in it. At INFO:
+
+- startup: `serving mode=live soc_source=entity version=... code_version=<sha> on 0.0.0.0:8080 (store ...)`;
+- planner: `plan generated plan_id=... trigger=scheduled status=optimal solve_s=0.41 slots=52 first_slot=...
+  first_mode=charge first_power_w=1500 soc=0.432 soc_measured=0.432 soc_clamped=False soc_source=entity`;
+  `solve skipped trigger=... reason=... detail=...` the first time a reason occurs (repeats are DEBUG);
+  timeouts and discarded plans at WARNING, solver errors at ERROR; `prices published`;
+- slots: `slot opened start=... decision=intent mode=charge power_w=1500 plan_id=... not_ready=-` (or
+  `decision=not_ready ... not_ready=ha_disconnected,...`) and `slot closed start=... decision=... grid_kwh=...
+  battery_charge_kwh=... battery_discharge_kwh=... soc_start=... soc_end=...`;
+- actuator (`dry_run`/`live`): `actuator kill_switch=on previous=off`, `actuator in_control=True`,
+  `actuator guard reasons=no_plan` (when the set changes; `ok` when empty), `actuator desired mode=charge
+  reason=intent pd_target_w=1900 max_discharge_w=- clamped_w=0` (when mode or reason changes), every write
+  `actuator write role=pd_target service=number.set_value value=1900 result=ok` (`actuator dry_run write ...`
+  in `dry_run`; the heartbeat is not logged). WARNING: write failures and readback timeouts,
+  `actuator import trip ...` and `actuator import trip ended`, `actuator alert=write_failed`; ERROR:
+  `actuator alert=safe_idle_failed`, a failed or timed-out safe idle at shutdown;
+- Home Assistant: `home assistant connected`, `home assistant synced states=... tracked_seen=... resyncs=...`;
+  WARNING `home assistant disconnected: ...; reconnect in ...` and `connect failed` (once per distinct
+  error while retrying); ERROR `home assistant auth failed`;
+- history: `history refreshed cutoff_day=... usable_slots=...`; WARNING `history refresh failed ...`;
+- archives and climate shadow: `weather forecast archived ...` (WARNING when the fetch fails) and
+  `climate shadow run t0=... status=... regime=...` per run.
+
 ## Store
 
 Under `<data_dir>/service/v1/`, partitioned by UTC day (a DST day is never split or doubled),

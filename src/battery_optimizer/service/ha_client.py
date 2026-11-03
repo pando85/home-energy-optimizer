@@ -247,8 +247,11 @@ class HAWebSocketClient:
     async def run(self) -> None:
         """Connect, resync and consume until :meth:`stop`; reconnect on any failure."""
         attempt = 0
+        logged_error: str | None = None  # a failure repeating while retrying is logged once
         while not self._stopping.is_set():
             stage = "connect"
+            connects_before = self.stats.connects
+            auth_failed = False
             try:
                 conn = await asyncio.wait_for(
                     self._transport.connect(self._url, timeout=self._settings.request_timeout_s),
@@ -267,6 +270,7 @@ class HAWebSocketClient:
                 except HAAuthError as exc:
                     self.stats.fail("auth", exc)
                     attempt = max(attempt, 30)  # back off at the cap, never hammer
+                    auth_failed = True
                 except HACommandError as exc:
                     self.stats.fail(exc.stage, exc)
                 except HAConnectionClosedError as exc:
@@ -290,6 +294,16 @@ class HAWebSocketClient:
             )
             attempt += 1
             self.stats.next_retry_delay_s = delay
+            error = self.stats.last_error
+            if auth_failed:
+                log.error("home assistant auth failed: %s; retry in %.0f s", error, delay)
+            elif self.stats.connects > connects_before:
+                log.warning("home assistant disconnected: %s; reconnect in %.1f s", error, delay)
+            elif error != logged_error:
+                log.warning("home assistant connect failed: %s; retry in %.1f s", error, delay)
+            else:
+                log.debug("home assistant connect failed again; retry in %.1f s", delay)
+            logged_error = error
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stopping.wait(), timeout=delay)
             self.stats.reconnects += 1
@@ -335,6 +349,11 @@ class HAWebSocketClient:
         self.stats.connected = True
         self.stats.connects += 1
         self.stats.last_connected_at = self._clock.now()
+        log.info(
+            "home assistant connected connects=%d reconnects=%d",
+            self.stats.connects,
+            self.stats.reconnects,
+        )
 
         reader = asyncio.create_task(self._reader(conn), name="ha-reader")
         heartbeat: asyncio.Task[None] | None = None
@@ -359,6 +378,12 @@ class HAWebSocketClient:
             self.stats.synced = True
             self.stats.resyncs += 1
             self.stats.last_synced_at = self._clock.now()
+            log.info(
+                "home assistant synced states=%d tracked_seen=%d resyncs=%d",
+                len(states),
+                sum(1 for e in self._store.tracked if self._store.get(e) is not None),
+                self.stats.resyncs,
+            )
             self._conn, self._reader_task = conn, reader
             if self._on_synced is not None:
                 self._on_synced()

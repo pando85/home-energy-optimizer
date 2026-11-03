@@ -816,6 +816,75 @@ def test_dry_run_plans_against_its_simulated_state_so_it_does_not_repeat():
     assert len(records) == 2
 
 
+def _actuator_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.name.endswith(".actuator")]
+
+
+def test_transitions_are_logged_once_and_not_on_an_unchanged_tick(caplog):
+    caplog.set_level("INFO", logger="battery_optimizer.service.actuator")
+    clock = FakeClock(NOW)
+    store = world(clock)
+    actuator, _, _ = make(clock, store)
+    tick(actuator, ctx(clock))  # no plan: safe idle
+    lines = _actuator_lines(caplog)
+    assert "actuator kill_switch=on previous=unknown" in lines
+    assert "actuator in_control=True" in lines
+    assert "actuator guard reasons=no_plan" in lines
+    assert any(m.startswith("actuator desired mode=safe_idle reason=no_plan") for m in lines)
+    caplog.clear()
+    clock.advance(30)
+    store.apply(entity_state(GRID, 400, clock.now()))
+    store.apply(entity_state(ENTS.battery_ac_power, 0, clock.now()))
+    tick(actuator, ctx(clock))
+    assert _actuator_lines(caplog) == []  # unchanged: nothing logged
+    clock.advance(1)
+    store.apply(entity_state(ENTS.kill_switch, "off", clock.now()))
+    tick(actuator, ctx(clock))
+    lines = _actuator_lines(caplog)
+    assert "actuator kill_switch=off previous=on" in lines
+    assert "actuator in_control=False" in lines
+    assert "actuator guard reasons=kill_switch_off" in lines
+
+
+def test_each_write_is_logged_with_its_role_and_value(caplog):
+    caplog.set_level("INFO", logger="battery_optimizer.service.actuator")
+    clock = FakeClock(NOW)
+    actuator, _, _ = make(clock, world(clock, grid=400, ac=0))
+    tick(actuator, ctx(clock, intent("charge", 1000)))
+    lines = _actuator_lines(caplog)
+    assert "actuator write role=pd_target service=number.set_value value=1400 result=ok" in lines
+    assert "actuator write role=allow_charge service=switch.turn_on value=- result=ok" in lines
+    assert "actuator guard reasons=ok" not in lines  # the reasons were already empty
+    assert not any("heartbeat" in m for m in lines)  # the heartbeat is never logged per tick
+
+    caplog.clear()
+    clock = FakeClock(NOW)
+    dry, _, _ = make(clock, world(clock, grid=400, ac=0), mode="dry_run")
+    tick(dry, ctx(clock, intent("charge", 1000)))
+    assert (
+        "actuator dry_run write role=pd_target service=number.set_value value=1400 "
+        "result=dry_run" in _actuator_lines(caplog)
+    )
+
+
+def test_an_import_trip_start_and_end_are_warnings(caplog):
+    caplog.set_level("INFO", logger="battery_optimizer.service.actuator")
+    clock = FakeClock(NOW)
+    store = world(clock, grid=4800, ac=1500, charge="on", pd=4500)
+    actuator, _, _ = make(clock, store)
+    for advance, grid in ((0, 4800), (60, 3000), (SETTINGS.import_trip_hold_s, 3000)):
+        clock.advance(advance)
+        for entity, value in ((GRID, grid), (ENTS.battery_ac_power, 0), (ENTS.battery_soc, 50)):
+            store.apply(entity_state(entity, value, clock.now()))
+        tick(actuator, ctx(clock, intent("charge", 1000, valid_from=floor_slot(clock.now(), 900))))
+    trips = [
+        (r.levelname, r.getMessage()) for r in caplog.records if "import trip" in r.getMessage()
+    ]
+    assert [level for level, _ in trips] == ["WARNING", "WARNING"]
+    assert trips[0][1].startswith("actuator import trip grid_power_w=4800")
+    assert trips[1][1] == "actuator import trip ended"
+
+
 def test_unchanged_ticks_are_not_recorded_again():
     clock = FakeClock(NOW)
     store = world(clock)

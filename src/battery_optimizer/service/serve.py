@@ -76,6 +76,7 @@ def build_service(
 def run_server(service: ShadowService, *, host: str, port: int) -> None:
     import uvicorn
 
+    from battery_optimizer import __version__
     from battery_optimizer._logging import quiet_http_loggers
 
     from .api import create_app
@@ -95,5 +96,14 @@ def run_server(service: ShadowService, *, host: str, port: int) -> None:
             timeout_graceful_shutdown=20,
         )
     )
-    log.info("serving shadow service on %s:%d (store %s)", host, port, Path(service.sink.root))
+    log.info(
+        "serving mode=%s soc_source=%s version=%s code_version=%s on %s:%d (store %s)",
+        service.config.mode,
+        service.config.planning.soc_source,
+        __version__,
+        service.code_version,
+        host,
+        port,
+        Path(service.sink.root),
+    )
     server.run()
