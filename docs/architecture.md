@@ -44,8 +44,8 @@ plant and control changes. Update them when a component or the plant changes.
   snapshots** before evaluating any new estimator against future outcomes.
 - The **Battery Model** describes physics and allowable state transitions. It is an
   independent input to the optimizer, **not a third forecast** nor a downstream stage
-  of either forecaster. When the real battery is commissioned, measured SOC replaces
-  `soc_source: simulated`; efficiency/power characteristics must be measured before
+  of either forecaster. Since commissioning the planner reads the measured SOC
+  (`soc_source: entity`); efficiency/power characteristics must be measured before
   treating model upgrades as calibrated.
 - The **Dispatch Optimizer** does not ingest raw HA events directly and does not own
   the physical regulation loop. The service assembles a frozen, hashable
@@ -371,7 +371,7 @@ weather-forecast archives, see [service.md](service.md#passive-archives)), reads
 Prometheus, solves the offline MPC kernel every 15 minutes in a bounded worker, records time-bounded
 shadow intents and exposes `/health/live`, `/health/ready`, `/status`, `/plan` and `/metrics`.
 `battery-optimizer shadow-report` compares the recorded plans with the native battery behaviour.
-The battery was commissioned on 2026-11-03 and its SOC and AC energy counters are mapped, but the
-committed configuration still runs a virtual battery (`soc_source: simulated`) until the planner's SOC
-freshness check suits Omnibattery's report-on-change entities. Architecture, configuration,
+The battery was commissioned on 2026-11-03; its SOC and AC energy counters are mapped and the planner
+reads the measured SOC (`soc_source: entity`, availability plus Omnibattery's liveness sensor, no age test,
+because the SOC is reported only on change). Architecture, configuration,
 metrics, failure modes and the comparison method: [service.md](service.md).

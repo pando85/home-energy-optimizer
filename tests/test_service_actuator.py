@@ -323,6 +323,44 @@ def test_the_entity_maximum_is_the_effective_charge_ceiling():
     assert record["desired"]["clamped"] is True
 
 
+@pytest.mark.parametrize(
+    ("mode", "power", "load", "clamped_w"),
+    [
+        ("charge", 1000, 400, 400.0),  # 400 + 1000 > 1000: only 600 W of charge requested
+        ("charge", 500, 2000, 500.0),  # load alone above the ceiling: no charge at all
+        ("charge", 500, 400, 0.0),
+        ("discharge", 1200, 400, 400.0),  # cap entity max 800
+        ("discharge", 600, 400, 0.0),
+    ],
+)
+def test_clamped_battery_power_is_exported(mode, power, load, clamped_w):
+    from battery_optimizer.service.metrics import _actuator_families
+
+    # System power limits on, as on 2026-11-03: PD target -800..+1000, discharge cap max 800.
+    clock = FakeClock(NOW)
+    store = world(clock, grid=load, ac=0, limits="on")
+    clock.advance(1)
+    store.apply(
+        entity_state(
+            ENTS.pd_target, 0, clock.now(), attributes={"min": -800, "max": 1000, "step": 1}
+        )
+    )
+    store.apply(
+        entity_state(
+            ENTS.max_discharge_power, 0, clock.now(), attributes={"min": 0, "max": 800, "step": 1}
+        )
+    )
+    actuator, _, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent(mode, power)))
+    assert record["desired"]["clamped_w"] == clamped_w
+    assert record["desired"]["clamped"] is (clamped_w > 0)
+    family = next(
+        f for f in _actuator_families(actuator.snapshot()) if f.name.endswith("_clamped_watts")
+    )
+    assert family.name == "battery_optimizer_actuator_clamped_watts"
+    assert [s.value for s in family.samples] == [clamped_w]
+
+
 def test_battery_power_sign_is_configuration():
     clock = FakeClock(NOW)
     # The sensor reads -1000 while charging 1000 W: sign -1 makes it +1000 (charge positive).

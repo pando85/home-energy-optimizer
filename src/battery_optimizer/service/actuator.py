@@ -33,7 +33,10 @@ write but a ``turn_off`` re-checks the kill switch first and aborts to safe idle
 Numeric targets are bounded by the entity's own ``min``/``max`` as well as ours: Omnibattery
 bounds the PD target by the batteries' summed charge limit (±2500 W here), so the effective
 charge ceiling is ``min(import_cap_w, entity max)``; ``Desired`` carries the value actually
-written and ``clamped`` says when it was cut.
+written, ``clamped`` says when it was cut and ``clamped_w`` how much planned battery power
+the cut removed (exported as ``battery_optimizer_actuator_clamped_watts``).  With
+Omnibattery's system power limits on, the PD target's max is the system max charge, so a
+charge plan above ``system max charge - house load`` is under-delivered.
 
 The owner's kill switch gates everything: while it is off nothing is written, except one
 safe idle when it goes from on to off.  Each live tick that ends reconciled publishes a
@@ -154,6 +157,8 @@ class Desired:
     max_discharge_w: float | None = None
     house_load_w: float | None = None
     clamped: bool = False
+    #: Planned battery power (W) the clamp removed; 0 when nothing was cut.
+    clamped_w: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -303,12 +308,13 @@ class Actuator:
 
     def _number_target(
         self, entity: str | None, value: float, low: float, high: float
-    ) -> tuple[float, bool]:
-        """``(value to write, clamped)`` inside our ``[low, high]`` and the entity's own bounds."""
+    ) -> tuple[float, float]:
+        """``(value to write, W cut)`` inside our ``[low, high]`` and the entity's own bounds."""
         state = self._observed(entity)
         ceiling = min(high, _attr(state, "max") if _attr(state, "max") is not None else high)
         written = _quantize(value, state, low, high)
-        return written, value > ceiling + 1e-9
+        cut = value - ceiling
+        return written, cut if cut > 1e-9 else 0.0
 
     def _switch_state(self, entity: str | None) -> bool | None:
         state = self._store.get(entity)
@@ -414,7 +420,7 @@ class Actuator:
                 return safe_idle("battery_power_stale")
             # Effective ceiling min(import_cap_w, entity max): Omnibattery bounds the target by
             # the batteries' charge limit, so the charge is at most that ceiling - house load.
-            target, clamped = self._number_target(
+            target, cut = self._number_target(
                 e.pd_target, float(math.floor(max(load + power, 0.0))), 0.0, s.import_cap_w
             )
             return Desired(
@@ -423,10 +429,11 @@ class Actuator:
                 allow_charge=True,
                 pd_target_w=target,
                 house_load_w=load,
-                clamped=clamped,
+                clamped=cut > 0,
+                clamped_w=round(min(cut, power), 3),
             )
         if intent.mode == "discharge":
-            cap, clamped = self._number_target(
+            cap, cut = self._number_target(
                 e.max_discharge_power,
                 max(power, s.min_discharge_cap_w),
                 s.min_discharge_cap_w,
@@ -441,7 +448,8 @@ class Actuator:
                 power_limits=True,
                 max_discharge_w=cap,
                 house_load_w=load,
-                clamped=clamped,
+                clamped=cut > 0,
+                clamped_w=round(min(cut, power), 3),
             )
         neutral, _ = self._number_target(e.pd_target, s.neutral_pd_target_w, 0.0, s.import_cap_w)
         return Desired(mode="idle", reason="intent", pd_target_w=neutral, house_load_w=load)
@@ -819,6 +827,7 @@ class Actuator:
             "desired_allow_charge": flag(desired.allow_charge) if desired else None,
             "desired_allow_discharge": flag(desired.allow_discharge) if desired else None,
             "desired_max_discharge_w": desired.max_discharge_w if desired else None,
+            "clamped_w": desired.clamped_w if desired else None,
             "observed_battery_ac_power_w": self.readings.get("battery_ac_power_w"),
             "observed_grid_power_w": self.readings.get("grid_power_w"),
             "house_load_w": self.readings.get("house_load_w"),

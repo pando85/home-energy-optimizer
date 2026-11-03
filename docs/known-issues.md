@@ -171,23 +171,33 @@ house load reaches the system max charge, since the discharge switch is off. Not
 range, the readback confirms it, the guard passes and the heartbeat runs; only `clamped: true` in the
 `actuation/` record and the gap between desired and observed battery power show it.
 
-Before `live`, either the owner raises `number.omnibattery_system_max_charge_power` to the battery's 2500 W
-once the battery is off the temporary socket (configuration only; the bound is then +2500 W, as ADR-0007
-decision 4 assumes), or the actuator turns the power limits off in charge mode (the discharge cap does not
-matter while discharge is off) or writes the system max charge (needs the allowlist and an ADR-0007
-amendment). Either code change removes the owner's own charge cap, so it is an owner decision, not a fix in
-this change. A `clamped` metric for the dry run is a small, useful follow-up.
+This is the **pre-go-live state** (battery on the temporary test socket, caps 1000 W charge / 800 W
+discharge). The **go-live configuration** (owner decision) sets both system caps to the battery's rating:
+`number.omnibattery_system_max_charge_power` = `number.omnibattery_system_max_discharge_power` = **2500 W**,
+so the PD target is bounded to ±2500 W, as ADR-0007 decision 4 assumes, and the charge is at most
+2500 W − house load. Discharge above 800 W also needs **Premium mode** in the Marstek app (the firmware limits
+discharge to 800 W without it). The planner (`config/tariff.yaml` `battery.power_kw: 2.5`) and the actuator
+(`actuation.max_discharge_cap_w: 2500`) already assume 2500 W both ways, so the owner must enable Premium at
+go-live; without it a discharge intent above 800 W is under-delivered by the firmware, which the actuator
+cannot see (the cap it writes is in range). No code change is planned for this. Turning the power limits
+off in charge mode or writing the system max charge from the service stays an owner decision (it removes the
+owner's own cap and needs an ADR-0007 amendment). The cut is visible in `dry_run` and `live` as `battery_optimizer_actuator_clamped_watts`: the
+planned battery power the last tick could not request (0 when nothing was cut; see
+[service metrics](service.md#metrics) for the alert).
 
-### Planning from the SOC entity stops while the battery is idle
+### Planning from the SOC entity checks availability and liveness, not age
 
-`planning.soc_source: entity` ages the SOC against `freshness_s.battery_soc` (900 s). Omnibattery reports
-the SOC only on change and HA does not refresh `last_reported` for an unchanged value (verified 2026-11-03,
-ADR-0007 decision 6), so an idle battery's SOC looks stale after 15 minutes and the planner refuses to plan
-(`soc_stale`); in `live` that would also block the first charge out of idle. The age test protects nothing
-here: when Modbus fails Omnibattery keeps the last SOC (the liveness sensor catches it). The committed config
-therefore keeps `soc_source: simulated` after commissioning. Fix before `live`: let the planner's battery SOC
-freshness be `null` (availability only, as `actuation.freshness_s`) and gate it on
-`sensor.omnibattery_non_responsive_batteries`.
+Omnibattery reports the SOC only on change and HA does not refresh `last_reported` for an unchanged value
+(verified 2026-11-03, ADR-0007 decision 6), so with the old 900 s age test an idle battery's SOC looked stale
+after 15 minutes and the planner refused to plan (`soc_stale`); in `live` that would also have blocked the
+first charge out of idle. When Modbus fails Omnibattery keeps the last SOC instead, so the age test protected
+nothing. Resolved: `freshness_s.battery_soc` is `null` by default (availability only: present, not
+`unavailable`/`unknown`, numeric, within 0..100 %), as the actuator's `actuation.freshness_s.battery_soc`, and
+the planner also requires `actuation.entities.battery_liveness`
+(`sensor.omnibattery_non_responsive_batteries`) to read exactly `None`, the actuator's
+`battery_unresponsive` check; any other state refuses to plan with `soc_stale`. With
+`planning.soc_source: entity` that sensor is tracked in every mode. A number in `freshness_s.battery_soc`
+restores the age test. The committed config now uses `soc_source: entity`.
 
 ### Idle battery counters may void a live slot's gross load
 
@@ -225,7 +235,30 @@ cooldown: an upstream race (in `coordinator.py` the key-update timestamps are se
 published later) skips the Bypass zeroing, and a backup-port load above `number.venus_backup_offgrid_threshold`
 (default 50 W; 57 to 85 W observed) keeps refreshing the 5-minute cooldown. While it lasts
 `integration_status` is `backup_mode`, so the actuator holds safe idle (`integration_unhealthy`), possibly
-indefinitely. Workaround: a threshold of 200 W cleared the state within 5 minutes; the owner has since set
-500 W. It must stay above the backup-port load, so re-check it when the servers move to the backup port.
-Upstream: issue ffunes/Omnibattery#660, fixed by ffunes/Omnibattery#723 (stage `_key_update_times` together
-with `data.update`); drop the workaround once a release with it is installed.
+indefinitely. Upstream: issue ffunes/Omnibattery#660, fixed by ffunes/Omnibattery#723 (stage
+`_key_update_times` together with `data.update`; targets `release/v1.5.1`).
+
+**Workaround in place:** `number.venus_backup_offgrid_threshold` = **500 W** (Omnibattery default 50 W). A
+threshold of 200 W cleared the state within 5 minutes in the test; the owner set 500 W the same evening. It
+must stay above the backup-port load, so re-check it when the servers move to the backup port.
+
+Side effects while the high threshold is in place:
+
+- During a real outage with a backup-port load **below** the threshold, Omnibattery does not treat it as
+  genuine off-grid demand: it keeps the battery in its PD loop and goes on commanding the islanded battery
+  against a grid meter that no longer sees it. `integration_status` then need not be `backup_mode`, so the
+  actuator's guard may pass and the actuator may keep writing as well.
+- When the grid returns there is no 5-minute settle: below the threshold the cooldown never starts, so
+  Omnibattery (and the actuator) resume control at once instead of waiting for the inverter to settle in
+  Bypass.
+
+**Removal procedure** (once an Omnibattery release containing ffunes/Omnibattery#723 is installed):
+
+1. Check the installed Omnibattery version against the release notes for #723.
+2. Set `number.venus_backup_offgrid_threshold` back to **50 W**.
+3. With a load on the backup port and the inverter in Bypass (grid present), verify that
+   `sensor.omnibattery_integration_status` returns to `balanced` within 5 minutes and stays there (no
+   `backup_mode` latch). A short supervised grid-loss test (as in the commissioning test) then confirms
+   Backup Mode on loss and the return to `balanced` after the grid comes back.
+4. If it latches again, put 500 W back and reopen the upstream issue. Otherwise record the change in the
+   [regime log](components/regime-log.md) and delete this workaround here and in ADR-0007.

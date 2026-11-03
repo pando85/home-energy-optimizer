@@ -15,6 +15,7 @@ order.  When a slot closes, its row is computed from those samples:
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -239,7 +240,8 @@ class SlotObserver:
             discharge_kwh = max(-batt_avg, 0.0) * span_h / 1000.0
             battery_source = "power_integral"
 
-        soc_age = cfg.freshness_for("battery_soc")
+        soc_limit = cfg.freshness_for("battery_soc")
+        soc_age = math.inf if soc_limit is None else soc_limit  # None: availability only
         soc_start = soc_end = None
         if "battery_soc" in self._roles:
             soc_start = self._edge_value("battery_soc", slot_start, soc_age)

@@ -293,9 +293,9 @@ secrets references, storage, policies, dashboards and runbooks. The history impo
   *Built 2026-10-25 in `src/battery_optimizer/service/` ([service docs](../service.md)): read-only allowlist guard on
   every WebSocket frame and REST request, subscribe-then-`get_states` resync on every connect, source-time ordering,
   `oracle.solve_oracle` + `dispatch.intents_from_schedule` in a one-worker executor with a timeout, time-bounded
-  shadow intents and an append-only store. The committed config runs a virtual battery (`soc_source: simulated`);
-  the Omnibattery SOC and counters are mapped since commissioning (2026-11-03), `entity` waits on the SOC
-  freshness follow-up in [known issues](../known-issues.md#planning-from-the-soc-entity-stops-while-the-battery-is-idle).*
+  shadow intents and an append-only store. The Omnibattery SOC and counters are mapped since commissioning
+  (2026-11-03) and the committed config plans from the SOC entity (`soc_source: entity`, availability plus
+  liveness, see [known issues](../known-issues.md#planning-from-the-soc-entity-checks-availability-and-liveness-not-age)).*
 - [x] **PROD-C2 — HTTP surface.** FastAPI/ASGI with `GET /health/live`, `/health/ready`, `/status`, `/plan` and
   `/metrics`; ClusterIP only, no public ingress and no writable commands.
   *Built 2026-10-25 (`battery-optimizer serve`, port 8080); `battery-optimizer shadow-report` adds the

@@ -338,7 +338,8 @@ class ServiceConfig:
     prometheus: PrometheusSettings
     planning: PlanningSettings
     observation: ObservationSettings
-    freshness_s: Mapping[str, float]
+    #: ``battery_soc`` may be ``None``: availability only, no age test (see :meth:`freshness_for`).
+    freshness_s: Mapping[str, float | None]
     archive: ArchiveSettings = field(default_factory=ArchiveSettings)
     climate_shadow: ClimateShadowSettings = field(default_factory=ClimateShadowSettings)
     actuation: ActuationSettings = field(default_factory=ActuationSettings)
@@ -350,8 +351,16 @@ class ServiceConfig:
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
 
-    def freshness_for(self, role: str) -> float:
-        """Maximum age for a role; power roles share ``battery_power``'s limit."""
+    def freshness_for(self, role: str) -> float | None:
+        """Maximum age for a role; power roles share ``battery_power``'s limit.
+
+        ``None`` (``battery_soc`` only, its default) = availability only, no age test:
+        Omnibattery reports the SOC only on change, so an idle battery's SOC keeps an old
+        ``last_reported`` while healthy, exactly as the actuator's ``freshness_s`` assumes.
+        """
+        if role == "battery_soc":
+            value = self.freshness_s.get(role)
+            return None if value is None else float(value)
         if role in self.freshness_s:
             return float(self.freshness_s[role])
         if role in ("battery_charge_power", "battery_discharge_power"):
@@ -915,7 +924,10 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
             "simulated SOC must never drive the real battery"
         )
     fresh_raw = _section(raw, "freshness_s")
-    freshness = {str(k): _positive(v, f"freshness_s.{k}") for k, v in fresh_raw.items()}
+    freshness: dict[str, float | None] = {
+        str(k): None if k == "battery_soc" and v is None else _positive(v, f"freshness_s.{k}")
+        for k, v in fresh_raw.items()
+    }
     return ServiceConfig(
         entities=entities,
         home_assistant=ha,

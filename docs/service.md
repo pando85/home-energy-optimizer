@@ -87,7 +87,7 @@ mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 | SOC floor | Evaluation window's opening SOC (seed protection) | Physical window minimum (`soc_window_min`) | Seed protection is a fairness device between policies; live energy in the battery is real and is valued at the terminal value instead |
 | Price horizon | May plan past publication with exact or noise-perturbed true prices | Ends at the last published slot (capped by `max_horizon_slots`) | Unpublished prices do not exist live; the trailing-mean terminal value keeps the plan from emptying the battery at the edge |
 | Orchestration | `replay_runtime.ReplayRuntime` | `runtime.ShadowService` | The replay runtime requires a temperature reading, keeps an unbounded in-memory record list and uses a fixed-terminal oracle adapter; the service borrows its rules (one worker, timeouts never free the worker, obsolete plans discarded) |
-| SOC before commissioning | — | `soc_source: simulated` | No battery entity exists in HA yet; a virtual battery evolves by applying the service's own decisions against measured load (see below) |
+| SOC | — | `soc_source: entity` (committed); `simulated` without a battery | The measured SOC entity, checked for availability and Omnibattery's liveness sensor; `simulated` is a virtual battery that evolves by applying the service's own decisions against measured load (see below) |
 
 ## Scheduling and the slot cycle
 
@@ -128,7 +128,7 @@ the last `interval + solve_lead + 60 s`; otherwise 503 with the reasons (bounded
 | `ha_unconfigured` | `BATTERY_OPTIMIZER_HA_URL` / token not set |
 | `ha_disconnected`, `ha_not_synced` | WebSocket down, or connected but the post-connect `get_states` has not completed |
 | `grid_power_stale` | Grid power missing, unavailable or older than `freshness_s.grid_power` |
-| `soc_unconfigured`, `soc_stale` | SOC entity not mapped (entity mode) / missing, stale or out of range |
+| `soc_unconfigured`, `soc_stale` | SOC entity not mapped (entity mode) / missing, unavailable, out of range, older than `freshness_s.battery_soc` when set, or the battery liveness sensor not exactly `None` |
 | `prices_missing`, `prices_insufficient` | No PVPC state, or fewer than `min_horizon_slots` published slots ahead |
 | `history_unavailable`, `forecast_unavailable` | Load history not fetched for today / no usable history for a target slot |
 | `tariff_invalid` | `tariff.yaml` missing or unconfirmed battery fields |
@@ -155,13 +155,16 @@ roles mapped at commissioning on 2026-11-03:
 | `battery_power` | — | not mapped: `sensor.venus_ac_power` is + while discharging, this role is + charge |
 | observed | `sensor.shellyem_main_channel_2_power` | present (aerotherm branch, context only) |
 
-The committed config still uses `soc_source: simulated`: `entity` ages the SOC against
-`freshness_s.battery_soc`, and an idle battery's SOC is reported only on change, so planning would stop
-([known issues](known-issues.md#planning-from-the-soc-entity-stops-while-the-battery-is-idle)). With the
+The committed config uses `soc_source: entity`. The SOC is reported only on change, so it is checked as
+the actuator checks it: availability only (`freshness_s.battery_soc: null`, the default; a number restores
+an age test), and `actuation.entities.battery_liveness` (`sensor.omnibattery_non_responsive_batteries`, read
+in every mode with `soc_source: entity`) must be exactly `None`; otherwise planning is refused with
+`soc_stale` ([known issues](known-issues.md#planning-from-the-soc-entity-checks-availability-and-liveness-not-age)). With the
 counters mapped, the load history is `grid - charge + discharge` per slot, except slots that end at or before
 `battery.commissioned_at`, which are the grid counter alone (the counters need not reach back that far).
 
-The `actuation:` section is read only in `dry_run` and `live` (it is validated in every mode); see
+The `actuation:` section is read only in `dry_run` and `live` (it is validated in every mode), except
+`entities.battery_liveness`, which the planner reads with `soc_source: entity`; see
 [Live control](#live-control-dry_run-and-live).
 
 The optional `archive:` section switches the two [passive archives](#passive-archives) on; without it
@@ -255,6 +258,7 @@ ID, price, timestamp or household reading is a label.
 | `actuator_guard_reason` | gauge 0/1 | `reason` (the guard reasons of [Live control](#live-control-dry_run-and-live)) |
 | `actuator_desired_pd_target_watts`, `actuator_desired_allow_charge`, `actuator_desired_allow_discharge`, `actuator_desired_max_discharge_watts` | gauge (requested) | — |
 | `actuator_observed_pd_target_watts`, `actuator_observed_battery_power_watts` (+ charge), `actuator_observed_grid_power_watts`, `actuator_house_load_watts` | gauge (observed; absent when stale) | — |
+| `actuator_clamped_watts` | gauge (W of planned battery power the last tick could not request; 0 = none cut) | — |
 | `actuator_writes_total` | counter | `role` (`allow_charge`, `allow_discharge`, `max_discharge_power`, `power_limits`, `pd_target`, `heartbeat`), `result` (`ok`, `failed`, `dry_run`) |
 | `actuator_write_failures_total` | counter (each attempt) | `reason` (`ha_error`, `readback_timeout`, `forbidden`) |
 | `actuator_safe_idles_total` | counter | `reason` (guard reasons, `write_failed`, `shutdown`) |
@@ -272,7 +276,9 @@ shadow (when enabled): `climate_shadow_up == 0` for 2 h, `time() - climate_shado
 > 7200`, or `increase(climate_shadow_runs_total{result="error"}[6h]) > 2`. Actuator (`live`): `actuator_alert == 1`
 for 2 m; `actuator_in_control == 1 and actuator_guard_ok == 0` for 30 m;
 `increase(actuator_heartbeats_total{result="failed"}[10m]) > 0`;
-`actuator_guard_reason{reason="import_over_cap"} == 1`.
+`actuator_guard_reason{reason="import_over_cap"} == 1`; charge under-delivery (`dry_run` and `live`):
+`min_over_time(actuator_clamped_watts[30m]) > 100` (the plan is cut for a whole half hour, typically the
+system max charge while the power limits are on).
 
 ## Store
 
@@ -557,10 +563,14 @@ kill switch first; if it went off mid-reconcile the actuator aborts to safe idle
 Omnibattery bounds the PD target by its entity `min`/`max`, which the actuator reads live: the batteries'
 summed limits (±2500 W) with the system power limits off, `[-system max discharge, +system max charge]` with
 them on (-800..+1000 W on 2026-11-03). The written charge target is `min(house load + P, import_cap_w, entity
-max)`; the desired state records the value actually written and `clamped` when it was cut. The charge is
+max)`; the desired state records the value actually written, `clamped` when it was cut and `clamped_w`, the
+planned battery power the cut removed (`min(requested − bound, P)`, also for the discharge cap), exported as
+`actuator_clamped_watts`. The charge is
 therefore at most 2500 W − house load (about 2 kW at night) with the limits off, and only `system max charge −
 house load` (zero once the load reaches it) with them on. The actuator turns the limits on for a discharge and
-never off, so the second case is the normal one until the owner raises the system max charge: see
+never off, so the second case is the normal one: before go-live (test socket, 1000 W system max charge) the
+charge is cut hard; the go-live configuration sets both system caps to 2500 W and Marstek Premium mode on
+(discharge above 800 W), so the bound is then ±2500 W, as the planner's `power_kw: 2.5` assumes: see
 [known issues](known-issues.md#the-pd-target-is-bounded-by-the-system-caps-while-the-power-limits-are-on).
 
 `discharge_margin_w` is 200 W in the committed config (code default 50 W): Omnibattery's PD loop swings by

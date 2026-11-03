@@ -278,15 +278,16 @@ restriction. No token value is ever written in this repository or its config.
    watchdog with the kill switch **off**. Measure the
    sign of `sensor.venus_ac_power` with a supervised charge from the Omnibattery UI and set
    `battery_ac_power_sign`; map `entities.battery_soc` (and the battery energy counters) and set
-   `planning.soc_source: entity` (sign, SOC and counters done 2026-11-03; `entity` waits on the SOC freshness
-   follow-up in [Commissioning findings](#commissioning-findings-2026-11-03)). Disable Omnibattery's competing economic strategies. Raise
+   `planning.soc_source: entity` (all done: sign, SOC and counters 2026-11-03; `entity` committed once the
+   planner's SOC check became availability plus liveness, see
+   [Commissioning findings](#commissioning-findings-2026-11-03)). Disable Omnibattery's competing economic strategies. Raise
    `number.omnibattery_pd_controller_max_power_change` from 800 to 2000 W (owner setting, never written by the
    service) so a load step while charging is backed off within one PD cycle (see [Not solved](#not-solved-by-this-adr)).
 2. **dry_run for 1–2 days:** `mode: dry_run`, kill switch **on** (nothing is sent in `dry_run`; the switch only
    makes the rehearsal faithful). Review `service/v1/actuation/` and the `actuator_*` metrics: guard reasons, the
    mapping at every slot, setpoint churn (planned against the simulated written state, so a repeated write is
-   real churn), how often a charge is `clamped` by the 2500 W target bound, the house-load estimate against the
-   meter.
+   real churn), how often a charge is `clamped` by the target bound (`actuator_clamped_watts`), the house-load
+   estimate against the meter.
 3. **live, supervised:** kill switch **off**, `mode: live` with the `battery-optimizer-live` user's token (its
    own Vault KV path) mounted instead of the read-only one, roll out, then switch the kill switch **on** while
    watching the meter. Verify readback, heartbeat, a slot change in each direction, the watchdog (stop the pod
@@ -323,15 +324,18 @@ is not by itself authorization to leave the battery under unattended live contro
 
 A supervised test on the commissioning evening (details in
 [known issues](../known-issues.md#battery-findings-of-the-commissioning-test-2026-11-03)) changes these points
-of the decision; none is a code change yet.
+of the decision. The code changes they led to are the SOC check and the clamp metric below; the rest is
+configuration or the [live preconditions](#live-preconditions-2026-11-03).
 
 - **Charge ceiling with the power limits on.** Omnibattery bounds the PD target to `[-system max discharge,
   +system max charge]` while `switch.omnibattery_system_power_limits` is on (-800..+1000 W with the owner's
   test caps). The actuator reads that live bound and never turns the limits off (decision 4 turns them on for
-  discharge), so a charge is silently cut to `system max charge − house load`, down to zero, with no alert:
-  only `clamped` records it. Before `live` the owner raises the system max charge to 2500 W, or a follow-up
-  changes the charge mapping (power limits off while charging, or a written charge cap, which needs the
-  allowlist of decision 3).
+  discharge), so a charge is cut to `system max charge − house load`, down to zero. Nothing fails; the cut
+  is recorded as `clamped`/`clamped_w` and exported as `battery_optimizer_actuator_clamped_watts` (planned
+  battery power not requested), on which homelab can alert ([service metrics](../service.md#metrics)). This is the pre-go-live
+  state on the test socket; the go-live configuration sets both system caps to 2500 W (live precondition (c)).
+  Changing the charge mapping instead (power limits off while charging, or a written charge cap, which needs
+  the allowlist of decision 3) stays an owner decision.
 - **Discharge margin.** The PD loop swings ±150 to 200 W on a ~2 s period; the 50 W margin gave brief exports
   (-10..-94 W). The committed config sets `discharge_margin_w: 200`.
 - **HA outage.** On an HA restart (40 s), a forced kill (23 s) and a 10.5-minute stop the battery held its last
@@ -342,7 +346,38 @@ of the decision; none is a code change yet.
 - **`backup_mode` latch.** An upstream Omnibattery race can keep `integration_status` at `backup_mode` after
   the grid returns while the backup-port load exceeds `number.venus_backup_offgrid_threshold`; the guard then
   holds safe idle indefinitely. Workaround: a threshold above the backup-port load (200 W in the test, 500 W
-  since); upstream fix ffunes/Omnibattery#723.
-- **Measured SOC.** `planning.soc_source: entity`, required by `live` (decision 1), ages the SOC against
-  `freshness_s.battery_soc`; an idle battery's SOC looks stale (decision 6), so planning would stop. The committed
-  config stays `simulated` until the planner gets the same availability-only check as the actuator.
+  since, default 50 W); upstream fix ffunes/Omnibattery#723 (for #660, targets `release/v1.5.1`). While it is in
+  place a backup load below the threshold during a real outage is not treated as off-grid demand (Omnibattery
+  keeps commanding the islanded battery) and there is no 5-minute settle after the grid returns. Removal
+  procedure (back to 50 W once a release with #723 is installed, then `integration_status` must return to
+  `balanced` within 5 minutes with a backup-port load in Bypass) in
+  [known issues](../known-issues.md#omnibattery-can-stay-in-backup_mode-after-the-grid-returns).
+- **Measured SOC.** `planning.soc_source: entity`, required by `live` (decision 1), aged the SOC against
+  `freshness_s.battery_soc` (900 s); an idle battery's SOC looked stale (decision 6), so planning would stop.
+  Resolved: the planner now checks the SOC as the actuator does, availability only by default
+  (`freshness_s.battery_soc: null`; a number restores an age test) plus `actuation.entities.battery_liveness`
+  exactly `None` (tracked in every mode with `soc_source: entity`), and the committed config uses `entity`.
+
+### Live preconditions (2026-11-03)
+
+Found in the commissioning test; each must hold before the kill switch is turned on in `live`:
+
+- **(a) HA-independent failsafe.** The battery holds its last command for at least 10.5 minutes with HA down
+  (no firmware timeout, no standby on Omnibattery shutdown), so neither safe idle nor the HA watchdog
+  (decision 8) can stop it during an HA outage. Required before `live`: a failsafe that does not depend on
+  HA. Planned (homelab ESPHome config, not this repository): the battery's ESPHome smart plug turns its relay
+  off after N minutes without a connected HA API client, which removes the battery's AC input.
+- **(b) Import margin 200 W.** Omnibattery's PD loop oscillates by about ±150 to 200 W on a ~2 s period; with a
+  50 W grid-import target while discharging the grid briefly exported (-10..-94 W). The committed
+  `discharge_margin_w` is 200 W (the code default stays 50 W); a smaller margin needs a smoother Omnibattery
+  PD tuning profile first.
+- **(c) System caps at the battery's rating.** *Pre-go-live state:* on the temporary test socket the system
+  caps are 1000 W charge / 800 W discharge with the power limits on, so the PD target, and with it the charge,
+  is bounded by `system max charge − house load` (the charge-ceiling finding above), and
+  `battery_optimizer_actuator_clamped_watts` shows the planned power that is not requested. *Go-live
+  configuration (owner):* off the test socket, `number.omnibattery_system_max_charge_power` and
+  `number.omnibattery_system_max_discharge_power` both **2500 W**, and **Premium mode** enabled in the Marstek
+  app, without which the firmware limits discharge to 800 W. The planner (`battery.power_kw: 2.5` in
+  `config/tariff.yaml`) and `actuation.max_discharge_cap_w: 2500` already assume 2500 W both ways; with
+  Premium off a discharge intent above 800 W would be under-delivered by the firmware without any clamp or
+  guard reason, so enabling Premium is part of go-live, not a code change.
