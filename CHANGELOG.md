@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.1](https://github.com/pando85/home-energy-optimizer/tree/v0.6.1) - 2026-11-03
+
+### Fixed
+
+- extract: Stop querying Prometheus entities after their retirement ([67f2b5e](https://github.com/pando85/home-energy-optimizer/commit/67f2b5e2cb929f99b5197c04a6b01ce7c7286a78))
+- package: Report the version pyproject.toml declares ([697f471](https://github.com/pando85/home-energy-optimizer/commit/697f4716ac1fe8893285505690a31f130720197e))
+- service: Check the idle battery energy counters for availability only ([dbb6f1d](https://github.com/pando85/home-energy-optimizer/commit/dbb6f1d73d5622922d71f30241c905e371eb8be4))
+- service: Adopt a plan late in a slot that opened without one ([a0494d6](https://github.com/pando85/home-energy-optimizer/commit/a0494d6783550e50804c975c63a89a0960fe23be))
+- service: Keep unchanged counters and SOC at slot edges while HA is in sync ([ebc9ef5](https://github.com/pando85/home-energy-optimizer/commit/ebc9ef5b4e8889af60d16c896e16539dc57f9f3e))
+
 ## [v0.6.0](https://github.com/pando85/home-energy-optimizer/tree/v0.6.0) - 2026-11-03
 
 ### Added
