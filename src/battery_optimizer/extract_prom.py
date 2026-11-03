@@ -271,6 +271,9 @@ ENTITY_SPECS: dict[str, EntitySpec] = {
         # ``dataset_id`` never read them.  Request them with ``--entities`` (or via
         # ``FEATURE_ENTITY_IDS``).  Names and units confirmed against the live archive.
         EntitySpec("sensor.shellypmmini_servers_power", "hass_sensor_power_w", "W"),
+        # The servers' load from 2026-11-03 (``features.SERVERS_SIGNAL``): the battery's
+        # backup-port output.  A feature entity, not a battery counter of the canonical build.
+        EntitySpec("sensor.venus_ac_offgrid_power", "hass_sensor_power_w", "W"),
         EntitySpec("sensor.aquarea_heat_power_consumed", "hass_sensor_power_w", "W"),
         EntitySpec("sensor.aquarea_dhw_power_consumed", "hass_sensor_power_w", "W"),
         EntitySpec("sensor.aquarea_cool_power_consumed", "hass_sensor_power_w", "W"),

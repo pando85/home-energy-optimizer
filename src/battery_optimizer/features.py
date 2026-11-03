@@ -58,6 +58,14 @@ span's increase is spread over the span in proportion to time and then follows t
 under half of the previous value is a counter reset and the span adds the value read after it;
 a smaller drop is a rollback and adds nothing (see :func:`counter_rates`).
 
+Source switch
+-------------
+A signal whose quantity moved to another meter (a plant change in the regime log) names its later
+sources in :attr:`Signal.successors`: the first entity is read before the first switch instant and
+each successor from its instant on, so a renamed or reassigned entity never feeds the alias outside
+its window.  The pieces join into one series under the same rules: a span that crosses a switch
+holds the last reading of the earlier source until the first one of the next, unless it is a gap.
+
 Leakage note: every feature of slot ``k`` uses samples from inside slot ``k``.  A forecaster may
 use only ``*_at_start`` of the slot it forecasts, or any feature of an earlier slot.
 """
@@ -141,6 +149,21 @@ class Signal:
     #: The metric to read when the entity carries more than one (a thermostat's current and
     #: target temperature); ``None`` reads the entity's only metric.
     metric: str | None = None
+    #: Later sources of the same quantity, ``(since, entity)`` in time order (aware instants):
+    #: :attr:`entity` is read before the first ``since``, each successor from its ``since`` until
+    #: the next one.  The series keeps :attr:`source` as its key.
+    successors: tuple[tuple[datetime, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        instants = [since for since, _ in self.successors]
+        if any(t.tzinfo is None for t in instants) or instants != sorted(set(instants)):
+            raise ValueError(f"{self.alias}: successors need strictly increasing aware instants")
+
+    def entity_windows(self) -> tuple[tuple[str, datetime | None, datetime | None], ...]:
+        """``(entity, since, until)`` of every source in time order; ``None`` is unbounded."""
+        bounds: list[datetime | None] = [None, *(since for since, _ in self.successors), None]
+        entities = (self.entity, *(entity for _, entity in self.successors))
+        return tuple((e, bounds[i], bounds[i + 1]) for i, e in enumerate(entities))
 
     @property
     def source(self) -> str:
@@ -172,8 +195,23 @@ class Signal:
         raise ValueError(f"unknown signal kind {self.kind!r}")
 
 
+#: The servers moved to the battery's backup (EPS) port on 2026-11-03 (regime log).  From then on
+#: the Shelly PM mini that metered them meters an unrelated workstation (its Home Assistant entity
+#: was renamed about 20 minutes later), and the battery's backup-port output is the servers' load.
+#: Prometheus brackets the rewiring: the PM mini's last servers reading is at 22:04:31 UTC, then a
+#: scrape gap, and from 22:11:43 UTC it reads the workstation while the backup port reads the
+#: servers.  Any instant inside that gap gives the same feature table (a gap is never held).
+SERVERS_ON_BACKUP_PORT_SINCE = datetime(2026, 11, 3, 22, 5, tzinfo=UTC)
+
+SERVERS_SIGNAL = Signal(
+    "sensor.shellypmmini_servers_power",
+    "servers",
+    KIND_POWER,
+    successors=((SERVERS_ON_BACKUP_PORT_SINCE, "sensor.venus_ac_offgrid_power"),),
+)
+
 SIGNALS: tuple[Signal, ...] = (
-    Signal("sensor.shellypmmini_servers_power", "servers", KIND_POWER),
+    SERVERS_SIGNAL,
     Signal("sensor.aquarea_heat_power_consumed", "hp_heat", KIND_POWER),
     Signal("sensor.aquarea_dhw_power_consumed", "hp_dhw", KIND_POWER),
     Signal("sensor.aquarea_cool_power_consumed", "hp_cool", KIND_POWER),
@@ -227,7 +265,7 @@ CLIMATE_SIGNALS: tuple[Signal, ...] = (
     Signal("sensor.aquarea_compressor_frequency", "compressor_freq", KIND_GAUGE),
     Signal("sensor.aquarea_compressor_start_stop_counter", "compressor_starts", KIND_COUNTER_DELTA),
     Signal("sensor.aquarea_pump_flow", "pump_flow", KIND_GAUGE),
-    Signal("sensor.shellypmmini_servers_power", "servers", KIND_POWER),
+    SERVERS_SIGNAL,
     Signal("sensor.aquarea_heat_power_consumed", "hp_heat", KIND_POWER),
     Signal("sensor.aquarea_dhw_power_consumed", "hp_dhw", KIND_POWER),
     Signal("sensor.aquarea_cool_power_consumed", "hp_cool", KIND_POWER),
@@ -441,6 +479,16 @@ class RawSeries:
     conflicting_duplicates: int = 0
 
 
+def _within(table: pa.Table, since: datetime | None, until: datetime | None) -> pa.Table:
+    """Rows of *table* with ``since <= ts < until`` (``None`` is unbounded)."""
+    ts_type = pa.timestamp("us", tz="UTC")
+    if since is not None:
+        table = table.filter(pc.greater_equal(table.column("ts"), pa.scalar(since, ts_type)))
+    if until is not None:
+        table = table.filter(pc.less(table.column("ts"), pa.scalar(until, ts_type)))
+    return table
+
+
 def load_signal_samples(
     data_dir: Path,
     signals: tuple[Signal, ...],
@@ -461,7 +509,7 @@ def load_signal_samples(
     """
     import datetime as _dt
 
-    wanted = {s.entity for s in signals}
+    wanted = {entity for s in signals for entity, _since, _until in s.entity_windows()}
     manifests = [
         m
         for m in _iter_prometheus_manifests(data_dir)
@@ -528,13 +576,19 @@ def load_signal_samples(
                 for metric in pc.unique(met).to_pylist():
                     sub = of_entity.filter(pc.equal(met, metric))
                     for key, sig in sources.items():
-                        if sig.entity != entity or sig.metric not in (None, metric):
+                        if sig.metric not in (None, metric):
                             continue
-                        ts_parts[key].append(sub.column("ts").cast(pa.int64()).to_numpy())
-                        val_parts[key].append(sub.column("value").to_numpy())
-                        metrics[key].add(metric)
-                        units[key].update(pc.unique(sub.column("unit")).to_pylist())
-                        keys[key].update(pc.unique(sub.column("series_key")).to_pylist())
+                        for source, since, until in sig.entity_windows():
+                            if source != entity:
+                                continue
+                            rows = _within(sub, since, until)
+                            if not rows.num_rows:
+                                continue
+                            ts_parts[key].append(rows.column("ts").cast(pa.int64()).to_numpy())
+                            val_parts[key].append(rows.column("value").to_numpy())
+                            metrics[key].add(metric)
+                            units[key].update(pc.unique(rows.column("unit")).to_pylist())
+                            keys[key].update(pc.unique(rows.column("series_key")).to_pylist())
         if read_any:
             extraction_ids.append(str(record.get("extraction_id")))
 
@@ -915,10 +969,17 @@ def compute_feature_set_id(
             "window_start": iso_z(window_start),
             "window_end": iso_z(window_end),
             "params": params,
-            # A pinned metric extends the entry; the default signals have none, so their id is
-            # the one computed before metrics could be pinned.
+            # A pinned metric or successors extend the entry; a signal without them keeps the
+            # entry it had before either existed.
             "signals": [
-                [s.entity, s.alias, s.kind, *([s.metric] if s.metric else [])] for s in signals
+                [
+                    s.entity,
+                    s.alias,
+                    s.kind,
+                    *([s.metric] if s.metric else []),
+                    *([[[iso_z(t), e] for t, e in s.successors]] if s.successors else []),
+                ]
+                for s in signals
             ],
             "raw_parts": [[p["part"], p["sha256"]] for p in part_hashes],
         },
@@ -1038,6 +1099,11 @@ def build_features(
                 "columns": list(s.columns()),
                 "metric": series[s.source].metric if s.source in series else None,
                 "unit": series[s.source].unit if s.source in series else None,
+                **(
+                    {"successors": [{"since": iso_z(t), "entity": e} for t, e in s.successors]}
+                    if s.successors
+                    else {}
+                ),
             }
             for s in signals
         ],

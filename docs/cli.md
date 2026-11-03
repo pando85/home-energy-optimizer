@@ -213,7 +213,7 @@ directory, or remove that one dataset directory yourself and re-run.
 ```bash
 uv run battery-optimizer extract --source prometheus --config config/tariff.yaml \
   --start 2024-01-01T00:00:00Z --end 2026-10-01T00:00:00Z --allow-coverage-gaps \
-  --entities sensor.shellypmmini_servers_power,sensor.aquarea_heat_power_consumed
+  --entities sensor.shellypmmini_servers_power,sensor.venus_ac_offgrid_power,sensor.aquarea_heat_power_consumed
 uv run battery-optimizer build-features \
   --start 2024-01-01T00:00:00Z --end 2026-10-01T00:00:00Z \
   --dataset ~/data/energy-baseline/analysis/v1/<dataset_id>
@@ -225,7 +225,10 @@ and the AppDaemon control states; `extract_prom.FEATURE_ENTITY_IDS` also lists t
 which belongs to the climate set below and must be extracted alone). Each power series becomes kWh per
 slot by sample-and-hold integration; a gap longer than `--max-gap-seconds` (300) is not held, and
 a slot with less than `--min-coverage` (0.8) covered is `unknown`, never zero. The rule is spelled
-out in the `features` module docstring and pinned in the manifest.
+out in the `features` module docstring and pinned in the manifest. The servers circuit is
+`sensor.shellypmmini_servers_power` before `features.SERVERS_ON_BACKUP_PORT_SINCE` (2026-11-03, when the
+servers moved to the battery backup port) and `sensor.venus_ac_offgrid_power` from it on; each entity is
+read only inside its window (`Signal.successors`, listed under `signals` in the manifest).
 
 The table is written to `<data_dir>/analysis/v1/features/<feature_set_id>/` with a
 `features_manifest.json` (hashes of every raw part read, code version, parameters, quality checks:

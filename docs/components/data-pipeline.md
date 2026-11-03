@@ -37,6 +37,11 @@ and the data volume are deployed from the homelab repository.
   a negative result nulls `gross_kwh` (`battery_counters_missing`, `battery_gross_negative`); counters
   not configured or absent from the archive refuse the build. Any counter decrease nulls its interval
   (stricter than the `counter_rates` rollback rule).
+- The `servers` feature is the Shelly PM mini before `features.SERVERS_ON_BACKUP_PORT_SINCE` (2026-11-03
+  22:05 UTC) and the battery's backup-port output `sensor.venus_ac_offgrid_power` from it on; each entity is
+  read only inside its window ([regime log](regime-log.md)). In Bypass the servers stay inside channel 1.
+  **Unverified:** whether a discharge feeds the backup port from the battery; the discharge counter excludes
+  the backup port, so that energy would be missing from `gross_kwh` and show as `servers + heat pump > main`.
 - HA recorder history cannot be re-extracted; string states are not exported ([known issues](../known-issues.md)).
 - Heat-pump electricity: the branch meter (channel 2) reads about 1.28 times the HeishaMon counters and also feeds appliances ([climate plan](../planning/climate-optimizer-implementation.md)).
 
@@ -56,7 +61,9 @@ and the data volume are deployed from the homelab repository.
 2. `extract --entities <charge>,<discharge>` (alone), `validate`, `build` ([CLI](../cli.md#build)), then
    `build-features --signal-set climate`.
 3. Acceptance: `build_manifest.json` has `battery_reconstruction` with few unusable intervals, and raw
-   minus gross equals the metered charge minus discharge on a sampled week.
+   minus gross equals the metered charge minus discharge on a sampled week. `build-features --dataset`
+   (with `sensor.venus_ac_offgrid_power` extracted) shows no new `servers + heat pump > main` violations
+   in discharging slots after the servers' move.
 
 ## Status
 
@@ -65,4 +72,5 @@ and the data volume are deployed from the homelab repository.
 check passes, the reconstruction is untested on real counters. Reconstruction and refusal are in the code
 (climate plan item 6). 2026-11-03: the build's reconstruction had the
 sign reversed (`raw + charge - discharge`, the service always used `raw - charge + discharge`); corrected
-before go-live, so no dataset was built with it.
+before go-live, so no dataset was built with it. 2026-11-03: the servers moved to the battery backup
+port; the `servers` feature switches source at that instant (feature-set ids change).

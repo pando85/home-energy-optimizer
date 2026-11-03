@@ -240,7 +240,8 @@ indefinitely. Upstream: issue ffunes/Omnibattery#660, fixed by ffunes/Omnibatter
 
 **Workaround in place:** `number.venus_backup_offgrid_threshold` = **500 W** (Omnibattery default 50 W). A
 threshold of 200 W cleared the state within 5 minutes in the test; the owner set 500 W the same evening. It
-must stay above the backup-port load, so re-check it when the servers move to the backup port.
+must stay above the backup-port load: the servers moved there on 2026-11-03 and draw about 225 to 255 W
+(`sensor.venus_ac_offgrid_power`), below the 500 W threshold.
 
 Side effects while the high threshold is in place:
 
