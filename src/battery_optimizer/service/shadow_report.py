@@ -8,9 +8,11 @@ Method (stated in every report as ``assumptions``):
 
 1. **Coverage** — expected slots are the local days' real quarter-hours (92 /
    96 / 100 on DST days); a slot is *covered* when a valid, unexpired shadow
-   intent was in force at its start and the inputs were fresh.
+   intent was in force at its start and the inputs were fresh.  A slot that
+   adopted an intent later (``late_intent``) is not covered.
 2. **Planned vs actual** — requested battery energy per slot (intent power x
-   slot length) against the energy the native controller actually moved
+   the time it was in force: the slot, or its rest after a late adoption)
+   against the energy the native controller actually moved
    (battery counters, else integrated battery power, labelled), plus the mean
    absolute and mean signed difference of slot-average power.
 3. **Cost** — the native cost is ``price x measured grid import`` per slot.  The
@@ -66,15 +68,26 @@ ASSUMPTIONS = (
     "counter edge is unknown and is labelled power_integral.",
     "Battery efficiency, SOC window and power are the tariff.yaml values (provisional, not "
     "measured on the installed unit); idle self-discharge is not modelled.",
-    "Slots without a decision replay as idle; slots without measured load or price are excluded "
-    "from the cost comparison and counted.",
+    "Slots without a decision replay as idle; a slot that adopted an intent late replays it for "
+    "the rest of the slot only (its average power); slots without measured load or price are "
+    "excluded from the cost comparison and counted.",
 )
+#: Slot decisions that carry an intent the battery was asked to follow.
+_INTENT_DECISIONS = ("intent", "late_intent")
 
 
 @dataclass(frozen=True)
 class _Slot:
     start: datetime
     row: dict[str, Any]
+
+
+def _intent_share(row: dict[str, Any], interval_seconds: int) -> float:
+    """The share of the slot its intent was in force (``adopted_after_s`` of a late intent)."""
+    after = _f(row.get("adopted_after_s"))
+    if after is None:
+        return 1.0
+    return min(1.0, max(0.0, 1.0 - after / interval_seconds))
 
 
 def _f(value: Any) -> float | None:
@@ -210,9 +223,10 @@ def build_shadow_report(
 
         decision = str(row.get("decision") or "not_observed")
         d["decisions"][decision] += 1
-        intent = row.get("intent") if decision == "intent" else None
+        intent = row.get("intent") if decision in _INTENT_DECISIONS else None
+        share = _intent_share(row, interval_seconds)
         mode = intent.get("mode") if intent else None
-        target = _f(intent.get("target_power_w")) if intent else 0.0
+        target = (_f(intent.get("target_power_w")) or 0.0) * share if intent else 0.0
         planned_c, planned_d = intent_energy_kwh(mode, target or 0.0, interval_seconds)
         d["planned_charge_kwh"] += planned_c
         d["planned_discharge_kwh"] += planned_d
@@ -226,7 +240,7 @@ def build_shadow_report(
             d["actual_battery_slots"] += 1
         actual_w = _f(measured.get("battery_power_avg_w"))
         if intent is not None and actual_w is not None:
-            planned_w = _f(intent.get("signed_power_w")) or 0.0
+            planned_w = (_f(intent.get("signed_power_w")) or 0.0) * share
             d["power_abs_dev_sum_w"] += abs(planned_w - actual_w)
             d["power_dev_sum_w"] += planned_w - actual_w
             d["power_dev_slots"] += 1

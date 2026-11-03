@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from dataclasses import replace
 from datetime import date, timedelta
 
 import pytest
@@ -506,16 +507,219 @@ def test_scheduler_solves_before_the_boundary_and_opens_on_it(tmp_path, cleanup)
     service = make_service(tmp_path, clock)
     cleanup(service)
     feed(service, NOW)
+    # Started mid-slot: the 10:45 slot opens without a plan and one catch-up solve fills it.
     delay = run(service.scheduler_tick())
     assert delay == pytest.approx(8 * 60)
-    assert not service.plans
+    assert service.last_solve["trigger"] == "catch_up" and len(service.plans) == 1
+    assert service._slot_open[utc(2026, 10, 20, 10, 45)].decision == "late_intent"
     clock.advance(delay)
     feed(service, clock.now())
     delay = run(service.scheduler_tick())
-    assert service.last_solve["trigger"] == "scheduled" and len(service.plans) == 1
+    assert service.last_solve["trigger"] == "scheduled" and len(service.plans) == 2
     assert delay == pytest.approx(120)
     clock.advance(delay)
     feed(service, clock.now())
     run(service.scheduler_tick())
-    assert service._slot_open[utc(2026, 10, 20, 11, 0)].decision == "intent"
+    opened = service._slot_open[utc(2026, 10, 20, 11, 0)]
+    assert opened.decision == "intent" and opened.intent.plan_id == service.plans[-1].plan_id
     assert service.current_intent() is not None
+
+
+# ---------------------------------------------------------------------------
+# Late adoption: a slot that opened without an intent takes one later in the slot
+# ---------------------------------------------------------------------------
+
+SLOT = utc(2026, 10, 20, 11, 0)  # the first slot of a plan solved at NOW
+CURRENT = utc(2026, 10, 20, 10, 45)  # the slot in progress at NOW
+
+
+def _not_ready_open(tmp_path, cleanup, **overrides):
+    """A plan for SLOT, then SLOT opens while the day's history is missing."""
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, **overrides)
+    cleanup(service)
+    feed(service, NOW, energy=1000.0)
+    assert run(service.request_solve("scheduled")) == "ok"
+    plan = service.plans[-1]
+    clock.set(SLOT)
+    feed(service, SLOT, energy=1000.0)
+    history, service.history = service.history, None  # e.g. the local-midnight refresh
+    opened = run(service.open_slot(SLOT))
+    assert opened.decision == "not_ready" and opened.intent is None
+    assert "history_unavailable" in opened.reasons
+    return clock, service, plan, history
+
+
+def _open_without_intent(service, slot_start):
+    service.ha.stats.synced = False
+    opened = run(service.open_slot(slot_start))
+    service.ha.stats.synced = True
+    assert opened.intent is None
+    return opened
+
+
+def test_not_ready_slot_adopts_the_plan_once_inputs_are_ready(tmp_path, cleanup, caplog):
+    caplog.set_level("INFO", logger="battery_optimizer.service.runtime")
+    clock, service, plan, history = _not_ready_open(tmp_path, cleanup, **NO_BATTERY)
+    assert service.actuation_context(SLOT).intent is None
+    # Still not ready: nothing adopted, and the scheduler comes back soon to look again.
+    clock.set(SLOT + timedelta(seconds=30))
+    feed(service, clock.now(), energy=1000.0, history=False)
+    delay = run(service.scheduler_tick())
+    assert service._slot_open[SLOT].intent is None and delay <= 15
+    # Ready again a minute in: the plan made before the slot is adopted for the rest of it.
+    clock.set(SLOT + timedelta(seconds=60))
+    feed(service, clock.now(), energy=1000.0, history=False)
+    service.history = history
+    caplog.clear()
+    run(service.scheduler_tick())
+    opened = service._slot_open[SLOT]
+    intent = plan.intent_for_slot(SLOT)
+    assert opened.decision == "late_intent" and opened.decision_at_open == "not_ready"
+    assert opened.intent == intent and opened.adopted_at == SLOT + timedelta(seconds=60)
+    assert len(service.plans) == 1  # a covering plan existed: no extra solve
+    assert f"slot adopted start={SLOT.isoformat()} mode={intent.mode} " in caplog.text
+    assert f"plan_id={plan.plan_id} after_s=60 decision_at_open=not_ready" in caplog.text
+    ctx = service.actuation_context(clock.now())
+    assert ctx.intent == intent and ctx.plan_from_this_process
+    assert service.current_intent() == intent
+    # The slot record is honest about the late start: energy only for the 14 minutes left.
+    opened.intent = replace(intent, mode="charge", target_power_w=1200.0, signed_power_w=1200.0)
+    for minute in (5, 10, 15):
+        feed(service, SLOT + timedelta(minutes=minute), energy=1000.0 + 0.1 * minute / 15)
+    clock.set(SLOT + timedelta(minutes=15, seconds=20))
+    record = run(service.close_slot(SLOT))
+    assert record["decision"] == "late_intent" and record["decision_at_open"] == "not_ready"
+    assert record["adopted_at"] == (SLOT + timedelta(seconds=60)).isoformat()
+    assert record["adopted_after_s"] == 60.0
+    assert record["inputs_ready_at_open"] is False
+    assert record["not_ready_reasons"] == ["history_unavailable"]
+    assert record["intent"]["plan_id"] == plan.plan_id
+    assert record["intent"]["target_power_w"] == 1200.0  # the intent itself, not pro-rated
+    assert record["planned_charge_kwh"] == pytest.approx(0.3 * 14 / 15)  # 1.2 kW, 14 min
+    assert record["planned_discharge_kwh"] == 0.0
+    assert record["virtual"]["charge_kwh"] == pytest.approx(0.3 * 14 / 15)
+    assert service.metrics.shadow_slots.labels(decision="late_intent")._value.get() == 1
+
+
+def test_a_slot_with_its_intent_at_open_records_no_adoption(tmp_path, cleanup):
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, **NO_BATTERY)
+    cleanup(service)
+    feed(service, NOW, energy=1000.0)
+    assert run(service.request_solve("scheduled")) == "ok"
+    clock.set(SLOT)
+    feed(service, SLOT, energy=1000.0)
+    run(service.open_slot(SLOT))
+    clock.set(SLOT + timedelta(minutes=15, seconds=20))
+    record = run(service.close_slot(SLOT))
+    assert record["decision"] == record["decision_at_open"] == "intent"
+    assert record["adopted_at"] is None and record["adopted_after_s"] is None
+
+
+def test_not_ready_slot_is_not_adopted_while_inputs_stay_stale(tmp_path, cleanup):
+    clock, service, _, _ = _not_ready_open(tmp_path, cleanup)
+    clock.set(SLOT + timedelta(minutes=5))
+    feed(service, clock.now(), history=False)
+    assert not service.adopt_late()
+    assert run(service.scheduler_tick()) <= 15
+    assert service._slot_open[SLOT].intent is None
+    assert service.actuation_context(clock.now()).decision == "not_ready"
+
+
+def test_expired_plan_is_never_adopted(tmp_path, cleanup):
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock)
+    cleanup(service)
+    feed(service, NOW)
+    assert run(service.request_solve("scheduled")) == "ok"
+    late = SLOT + 2 * timedelta(minutes=15)  # the plan expired at this slot's start
+    clock.set(late + timedelta(seconds=30))
+    feed(service, clock.now())
+    _open_without_intent(service, late)
+    assert not service.adopt_late()
+    assert service._slot_open[late].intent is None
+
+
+def test_a_slot_that_opened_with_an_intent_is_never_replanned(tmp_path, cleanup):
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, entity_mode=True)
+    cleanup(service)
+    feed(service, NOW, soc=0.5)
+    assert run(service.request_solve("scheduled")) == "ok"
+    first = service.plans[-1]
+    clock.set(SLOT)
+    feed(service, SLOT, soc=0.5)
+    assert run(service.open_slot(SLOT)).decision == "intent"
+    # A mid-slot event solve plans from the next boundary and leaves the slot alone.
+    clock.set(SLOT + timedelta(minutes=3))
+    feed(service, clock.now(), soc=0.95)
+    assert run(service.request_solve("event:soc_change")) == "ok"
+    assert service.plans[-1].plan.horizon_start == SLOT + timedelta(minutes=15)
+    assert not service.adopt_late()
+    run(service.scheduler_tick())
+    opened = service._slot_open[SLOT]
+    assert opened.decision == "intent" and opened.adopted_at is None
+    assert opened.intent.plan_id == first.plan_id
+
+
+def test_restart_mid_slot_catches_up_with_a_plan_for_the_slot_in_progress(tmp_path, cleanup):
+    clock = FakeClock(NOW)  # a fresh process at 10:50, inside the 10:45 slot
+    service = make_service(tmp_path, clock, entity_mode=True)
+    cleanup(service)
+    service.ha.stats.synced = False  # the first tick runs before the HA sync
+    run(service.scheduler_tick())
+    assert service._slot_open[CURRENT].decision == "not_ready" and not service.plans
+    service.ha.stats.synced = True
+    feed(service, NOW)
+    # The resync's event solve is a catch-up plan that starts in the slot in progress.
+    assert run(service.request_solve("event:resync")) == "ok"
+    plan = service.plans[-1]
+    assert plan.plan.horizon_start == CURRENT
+    assert plan.plan.expires_at == CURRENT + timedelta(minutes=30)
+    opened = service._slot_open[CURRENT]
+    assert opened.decision == "late_intent" and opened.intent.plan_id == plan.plan_id
+    assert opened.adopted_at == NOW
+    ctx = service.actuation_context(NOW)
+    assert ctx.intent is not None and ctx.plan_from_this_process
+    # The next slot is served by the scheduled solve as before.
+    clock.set(utc(2026, 10, 20, 10, 58))
+    feed(service, clock.now())
+    run(service.scheduler_tick())
+    assert service.last_solve["trigger"] == "scheduled"
+    assert service.plans[-1].plan.horizon_start == SLOT
+
+
+def test_no_catch_up_plan_in_the_last_solve_lead_of_a_slot(tmp_path, cleanup):
+    clock = FakeClock(utc(2026, 10, 20, 10, 59))
+    service = make_service(tmp_path, clock)
+    cleanup(service)
+    feed(service, clock.now())
+    _open_without_intent(service, CURRENT)
+    assert run(service.request_solve("event:resync")) == "ok"
+    assert service.plans[-1].plan.horizon_start == SLOT
+    assert service._slot_open[CURRENT].intent is None
+
+
+def test_catch_up_plan_is_kept_inside_its_slot_and_discarded_after_it(tmp_path, cleanup):
+    clock = FakeClock(NOW)
+    solve_s = {"s": 60}
+
+    def slow(snapshot):
+        clock.advance(solve_s["s"])
+        return run_planner(snapshot)
+
+    service = make_service(tmp_path, clock, planner=slow)
+    cleanup(service)
+    feed(service, NOW)
+    _open_without_intent(service, CURRENT)
+    assert run(service.request_solve("event:resync")) == "ok"  # lands at 10:51
+    assert service._slot_open[CURRENT].adopted_at == NOW + timedelta(seconds=60)
+    # Another slot without an intent; this catch-up solve lands after its slot has ended.
+    later = utc(2026, 10, 20, 11, 30)
+    clock.set(later + timedelta(minutes=5))
+    feed(service, clock.now())
+    _open_without_intent(service, later)
+    solve_s["s"] = 15 * 60
+    assert run(service.request_solve("event:resync")) == "discarded:obsolete"
+    assert service._slot_open[later].intent is None

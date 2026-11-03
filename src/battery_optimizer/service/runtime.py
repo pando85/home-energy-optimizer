@@ -20,6 +20,14 @@ For every slot boundary ``B`` (UTC grid, ``interval_seconds``):
 * ``B``: the slot opens — the decision for ``[B, B + interval)`` is frozen: the
   intent valid at ``B`` from the newest unexpired plan, or no decision with a
   reason (no plan, plan expired, inputs not ready);
+* while a slot that opened **without** an intent runs, it is re-evaluated every
+  ``_ADOPT_RETRY_S`` and after every new plan: once the inputs are ready and an
+  unexpired plan of this process covers it, it adopts that intent for the rest of
+  the slot (``late_intent``) and is frozen from then on.  A solve made inside such a
+  slot (before ``B + interval - solve_lead_s``) plans from the slot in progress (a
+  catch-up plan), and the scheduler asks for one such solve per slot when the inputs
+  are ready but no plan covers it.  A slot that opened with an intent is never
+  re-decided;
 * ``B + slot_close_grace_s``: the previous slot closes — its measurements, its
   decision and the virtual-battery replay step are appended to the store.
 
@@ -54,8 +62,8 @@ In ``dry_run`` and ``live`` an :class:`~.actuator.Actuator` maps the intent froz
 current slot to the Omnibattery entities every ``actuation.tick_interval_s`` and at every
 slot open and new plan.  ``dry_run`` records what it would write and sends nothing; only
 ``live`` builds the HA client with an :class:`~.ha_guard.ActuationAllowlist`, the one path
-by which a write can leave the process.  Only plans solved by this process are acted on, and
-a graceful stop sets safe idle before the HA session closes.
+by which a write can leave the process.  Only plans solved by this process are acted on (a
+late-adopted intent included), and a graceful stop sets safe idle before the HA session closes.
 """
 
 from __future__ import annotations
@@ -118,6 +126,8 @@ _ACTUATION_TEXT = {
     "live": "Omnibattery entities through the ha_guard allowlist, gated by the kill switch",
 }
 _PLAN_MEMORY = 16
+#: How often a slot that opened without an intent is re-evaluated for a late adoption.
+_ADOPT_RETRY_S = 15.0
 #: Longest the startup catch-up of the climate shadow waits for the first Home Assistant sync.
 CLIMATE_SYNC_TIMEOUT_S = 60.0
 
@@ -179,6 +189,17 @@ class _SlotOpen:
     inputs_ready: bool
     reasons: tuple[str, ...]
     opened_at: datetime
+    #: The decision frozen at open; ``decision`` differs only after a late adoption.
+    decision_at_open: str = ""
+    #: When a slot that opened without an intent adopted one (``None``: it did not).
+    adopted_at: datetime | None = None
+
+    def intent_share(self, interval_seconds: int) -> float:
+        """The share of the slot the intent was in force: 1, or less once adopted late."""
+        if self.adopted_at is None:
+            return 1.0
+        end = self.slot_start + timedelta(seconds=interval_seconds)
+        return min(1.0, max(0.0, (end - self.adopted_at).total_seconds() / interval_seconds))
 
 
 class ShadowService:
@@ -286,6 +307,7 @@ class ShadowService:
         self._opened_slot: datetime | None = None
         self._closed_slot: datetime | None = None
         self._solved_for: datetime | None = None
+        self._caught_up_for: datetime | None = None
 
         self.virtual_soc: float | None = None
         self.virtual_soc_origin: str | None = None
@@ -748,7 +770,7 @@ class ShadowService:
             spec,
             soc_start_frac=self.virtual_soc,
             mode=opened.intent.mode,
-            target_power_w=opened.intent.target_power_w,
+            target_power_w=opened.intent.target_power_w * opened.intent_share(self._interval),
             load_kwh=load,
             interval_seconds=self._interval,
             import_limit_kw=limit,
@@ -842,6 +864,17 @@ class ShadowService:
             raise NotReadyError(blocking[0][0], blocking[0][1])
         assert self.tariff is not None and self.price_curve is not None and self.history is not None
         first = next_slot_boundary(now, self._interval)
+        current = floor_slot(now, self._interval)
+        lead = timedelta(seconds=self.config.planning.solve_lead_s)
+        if (
+            self._awaiting_slot(now) is not None
+            and now < first - lead
+            and self.price_curve.price_at(current) is not None
+        ):
+            # Catch-up plan: the slot in progress has no intent, so plan from it for a late
+            # adoption.  Its first slot is modelled whole; the intent is a power, held only for
+            # the rest of the slot, so the battery moves less than planned, never more.
+            first = current
         prices = self.price_curve.contiguous_from(first, self.config.planning.max_horizon_slots)
         step = timedelta(seconds=self._interval)
         starts = tuple(first + i * step for i in range(len(prices)))
@@ -983,9 +1016,13 @@ class ShadowService:
         if generation != self._generation:
             self.metrics.solves.labels(result="discarded").inc()
             return "discarded:stopped"
-        if snapshot.first_slot <= completed:
-            # The first slot has begun: the plan is obsolete, a partly elapsed slot
-            # cannot honour an intent sized for the whole slot.
+        deadline = snapshot.first_slot
+        if deadline <= snapshot.decision_time:
+            # A catch-up plan starts in the slot it was made in: obsolete when that slot ends.
+            deadline += timedelta(seconds=self._interval)
+        if deadline <= completed:
+            # The first slot has begun: the plan is obsolete.  A slot that opened with an
+            # intent keeps it; a partly elapsed slot is only ever filled by a catch-up plan.
             self.metrics.solves.labels(result="discarded").inc()
             log.warning(
                 "plan discarded plan_id=%s trigger=%s reason=obsolete solve_s=%.2f",
@@ -1009,6 +1046,7 @@ class ShadowService:
         self._wake_actuator()
         self._logged_skip = None
         _log_plan(result, trigger, elapsed)
+        self.adopt_late(completed)
         self.last_solve = {
             "at": now.isoformat(),
             "trigger": trigger,
@@ -1055,6 +1093,7 @@ class ShadowService:
             inputs_ready=not reasons,
             reasons=tuple(r for r, _ in reasons),
             opened_at=now,
+            decision_at_open=decision,
         )
         self._slot_open[slot_start] = opened
         self._opened_slot = slot_start
@@ -1069,6 +1108,44 @@ class ShadowService:
         for old in [s for s in self._slot_open if s < slot_start - timedelta(hours=2)]:
             del self._slot_open[old]
         return opened
+
+    def _awaiting_slot(self, now: datetime) -> _SlotOpen | None:
+        """The slot in progress when it opened without an intent and has not adopted one."""
+        opened = self._slot_open.get(floor_slot(now, self._interval))
+        return opened if opened is not None and opened.intent is None else None
+
+    def adopt_late(self, now: datetime | None = None) -> bool:
+        """Give the slot in progress an intent if it opened without one and can have one now.
+
+        The inputs must be ready now, and the intent comes from the newest unexpired plan of
+        this process that covers the slot, made before or after the slot opened (a catch-up
+        plan).  The slot is frozen from then on: a slot that opened with an intent, or already
+        adopted one, is never re-decided.  The actuator's guard still applies in full.
+        """
+        now = now or self.clock.now()
+        opened = self._awaiting_slot(now)
+        if opened is None or self.evaluate_inputs(now):
+            return False
+        intent = None
+        for plan in sorted(self.plans, key=lambda p: p.plan.plan_sequence, reverse=True):
+            if plan.plan.is_expired(now):
+                continue
+            candidate = plan.intent_for_slot(opened.slot_start)
+            if candidate is not None and candidate.is_current(now):
+                intent = candidate
+                break
+        if intent is None:
+            return False
+        opened.intent, opened.decision, opened.adopted_at = intent, "late_intent", now
+        log.info(
+            "slot adopted start=%s %s after_s=%.0f decision_at_open=%s",
+            opened.slot_start.isoformat(),
+            _intent_text(intent),
+            (now - opened.slot_start).total_seconds(),
+            opened.decision_at_open,
+        )
+        self._wake_actuator()
+        return True
 
     async def close_slot(self, slot_start: datetime) -> dict[str, Any]:
         slot_end = slot_start + timedelta(seconds=self._interval)
@@ -1118,7 +1195,9 @@ class ShadowService:
         self.metrics.shadow_slots.labels(decision=decision).inc()
 
         mode = intent.mode if intent else None
-        target = intent.target_power_w if intent else 0.0
+        # A late intent was in force for part of the slot only: its energy is pro-rated.
+        share = opened.intent_share(self._interval) if opened else 1.0
+        target = intent.target_power_w * share if intent else 0.0
         planned_c, planned_d = intent_energy_kwh(mode, target, self._interval)
         self.metrics.shadow_planned_energy.labels(direction="charge").inc(planned_c)
         self.metrics.shadow_planned_energy.labels(direction="discharge").inc(planned_d)
@@ -1186,6 +1265,11 @@ class ShadowService:
             "battery_mapped": battery_mapped,
             "price_eur_per_kwh": price,
             "decision": decision,
+            "decision_at_open": opened.decision_at_open if opened else None,
+            "adopted_at": opened.adopted_at.isoformat() if opened and opened.adopted_at else None,
+            "adopted_after_s": (opened.adopted_at - slot_start).total_seconds()
+            if opened and opened.adopted_at
+            else None,
             "inputs_ready_at_open": opened.inputs_ready if opened else None,
             "not_ready_reasons": list(opened.reasons) if opened else [],
             "intent": intent.to_dict() if intent else None,
@@ -1371,6 +1455,17 @@ class ShadowService:
                 await self.close_slot(previous)
             else:
                 self._closed_slot = previous
+        if (
+            self._awaiting_slot(now) is not None
+            and not self.adopt_late(now)
+            and now < boundary - lead
+            and self._caught_up_for != current
+            and not self.evaluate_inputs(now)
+        ):
+            # Inputs are ready but no plan covers the slot (e.g. right after a start): one
+            # catch-up solve per slot, whose intent is adopted when it lands.
+            self._caught_up_for = current
+            await self.request_solve("catch_up")
         retry_soon = False
         if now >= boundary - lead and self._solved_for != boundary:
             self._solved_for = boundary
@@ -1386,6 +1481,8 @@ class ShadowService:
             candidates.append(boundary - lead)
         if self._closed_slot is None or self._closed_slot < previous:
             candidates.append(current + grace)
+        if self._awaiting_slot(now) is not None:
+            candidates.append(now + timedelta(seconds=_ADOPT_RETRY_S))
         upcoming = [c for c in candidates if c > now]
         wake = min(upcoming) if upcoming else boundary
         delay = (wake - now).total_seconds()

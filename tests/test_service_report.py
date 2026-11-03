@@ -137,6 +137,23 @@ def test_report_hand_computed(store):
     assert "| 2026-10-20 |" in md
 
 
+def test_late_intent_replays_for_the_rest_of_the_slot_and_is_not_coverage(tmp_path):
+    sink = ShadowSink(tmp_path)
+    row = _row(
+        S0, price=0.10, grid=0.30, intent=_intent("charge", 2000), soc0=0.5, soc1=0.5, battery_w=900
+    )
+    # Adopted 5 minutes into the slot: the intent was in force for 10 of its 15 minutes.
+    sink.append_slot(S0, {**row, "decision": "late_intent", "adopted_after_s": 300.0})
+    report = build_shadow_report(tmp_path, since=S0, until=S0 + STEP, tariff=TARIFF, tz=TZ)
+    o = report["overall"]
+    assert o["decisions"] == {"late_intent": 1}
+    assert o["slots_with_intent"] == 0 and o["coverage"] == 0
+    assert o["planned_charge_kwh"] == pytest.approx(0.5 * 2 / 3)
+    assert o["power_bias_w"] == pytest.approx(2000 * 2 / 3 - 900)
+    # counterfactual: load 0.3 + charge 1/3 kWh at 0.10
+    assert o["counterfactual_cost_eur"] == pytest.approx(0.1 * (0.3 + 0.5 * 2 / 3))
+
+
 def test_report_counts_dst_day_slots(tmp_path):
     since, until = local_day_bounds_utc(date(2026, 10, 25), TZ)
     report = build_shadow_report(tmp_path, since=since, until=until, tariff=TARIFF, tz=TZ)

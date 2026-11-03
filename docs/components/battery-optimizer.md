@@ -116,3 +116,10 @@ the PD-target bound while the system power limits are on (pre-go-live: charge cu
 system max charge minus the house load; go-live: system caps 2500/2500 W and Marstek Premium mode for discharge
 above 800 W, matching `power_kw: 2.5`) and the [battery-model](battery-model.md) caps are open; the wear cost is set (0.01) and is
 re-checked on measured data.
+
+Slot decisions (2026-11-04, code only, regime log): a slot that opened without an intent adopts one later in
+the slot (`late_intent`, see [service](../service.md#scheduling-and-the-slot-cycle)), and a solve inside such a
+slot plans from the slot in progress. This changes when the actuator follows a plan, not what the plan is: the
+kernel, its inputs and the calibration above are untouched, so no recalibration and no dependent goes stale.
+Shadow-report windows that span the deploy mix the two slot rules (`late_intent` slots are not counted as
+coverage, and their counterfactual covers only the adopted share of the slot).

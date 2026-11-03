@@ -134,7 +134,8 @@ Two separate limits apply and both stay in force:
 7. **Restart never resumes.** Plans are held only in memory and the actuator acts only on an intent whose plan
    was solved by this process (`generated_at` at or after the process start). After a restart it holds safe idle
    until the first fresh solve's slot opens (ADR-0004 decision 5: "A new pod must never resume actuation just
-   because a prior plan was persisted").
+   because a prior plan was persisted"). *Amended 2026-11-04 (below): the slot in progress adopts the first
+   fresh solve.*
 
 8. **Owner kill switch, heartbeat, HA watchdog, graceful stop.**
    - The actuator writes only while `input_boolean.battery_optimizer_live` is `on` (missing, `unknown` or
@@ -381,3 +382,14 @@ Found in the commissioning test; each must hold before the kill switch is turned
   `config/tariff.yaml`) and `actuation.max_discharge_cap_w: 2500` already assume 2500 W both ways; with
   Premium off a discharge intent above 800 W would be under-delivered by the firmware without any clamp or
   guard reason, so enabling Premium is part of go-live, not a code change.
+
+## Amendment 2026-11-04
+
+Decision 7 is kept except its last clause. After a restart, or when a slot opens not ready, the slot in progress
+no longer stays in safe idle until the next boundary: once the inputs are ready and a plan **solved by this
+process** covers it (a plan made inside such a slot plans from that slot), the slot adopts that plan's intent for
+the rest of the slot (`late_intent`, [service](../service.md#scheduling-and-the-slot-cycle)). The rest is
+unchanged: a persisted plan, or one from an earlier process, is never acted on; a slot that opened with an intent
+is never re-decided; and a late intent passes the same guard (kill switch, liveness, plan expiry, inputs, import
+cap) as any other. Reason: every deploy cost up to 15 minutes of control, and the slot at local midnight usually
+opened not ready because the day's load history is fetched just after it.
