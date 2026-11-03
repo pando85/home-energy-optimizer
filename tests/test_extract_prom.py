@@ -1010,6 +1010,144 @@ class TestEmptyCases:
             run_extract(tmp_path, fake.client, config)
 
 
+class TestRetiredEntities:
+    """An entity that no longer exists is read only before its ``retired_at`` instant."""
+
+    PM_MINI = "sensor.shellypmmini_servers_power"
+    PLUG = "sensor.smart_plug_v2_terrace_power"
+    RETIRED = datetime(2026, 11, 3, 22, 23, tzinfo=UTC)
+    DAY = 86400
+
+    @staticmethod
+    def _at(text: str) -> float:
+        return datetime.fromisoformat(text).timestamp()
+
+    def _extract(self, tmp_path: Path, config: Path, fake: FakePrometheus, start: str, end: str):
+        path = run_extract(
+            tmp_path,
+            fake.client,
+            config,
+            entities=[self.PM_MINI],
+            start=start,
+            end=end,
+            chunk_seconds=self.DAY,
+        )
+        return manifest_of(path)
+
+    def _query_times(self, fake: FakePrometheus) -> list[datetime]:
+        return [
+            datetime.fromtimestamp(float(r.url.params["time"]), UTC)
+            for r in fake.requests
+            if self.PM_MINI in r.url.params["query"]
+        ]
+
+    def test_registry_instants_match_the_last_samples_and_the_features(self) -> None:
+        from battery_optimizer import features
+
+        pm_mini, plug = ENTITY_SPECS[self.PM_MINI], ENTITY_SPECS[self.PLUG]
+        # Prometheus: the PM mini's last sample under its old id is 22:22:42.186 UTC and its
+        # renamed id starts at 22:23:42.186; the plug's last sample is 22:45:42.186 UTC.
+        assert pm_mini.retired_at == self.RETIRED
+        assert plug.retired_at == features.WASHER_PLUG_REFLASHED_AT
+        # The features stop reading an entity no later than its retirement.
+        assert features.SERVERS_ON_BACKUP_PORT_SINCE <= pm_mini.retired_at
+        # The washer energy counter is a different, live device; defaults are live.
+        assert ENTITY_SPECS["sensor.terrace_lavadora_energy_today"].retired_at is None
+        assert all(ENTITY_SPECS[e].retired_at is None for e in DEFAULT_ENTITY_IDS)
+        # Still feature entities: historical windows read them.
+        assert {self.PM_MINI, self.PLUG} <= set(FEATURE_ENTITY_IDS)
+
+    def test_retired_at_must_be_aware(self) -> None:
+        with pytest.raises(ValueError, match="aware"):
+            EntitySpec("sensor.x", "hass_sensor_power_w", "W", retired_at=datetime(2026, 1, 1))
+
+    def test_chunks_after_retirement_are_neither_queried_nor_gaps(
+        self, tmp_path: Path, config: Path
+    ) -> None:
+        from battery_optimizer.coverage import coverage_gap_flags
+
+        samples = [
+            (self._at("2026-11-02T12:00:00+00:00"), 240.0),
+            (self._at("2026-11-03T22:22:42.186+00:00"), 179.4),  # the last real sample
+            (self._at("2026-11-04T09:00:00+00:00"), 99.0),  # a later device reusing the id
+        ]
+        fake = FakePrometheus(series_for(self.PM_MINI, samples))
+        manifest = self._extract(
+            tmp_path, config, fake, "2026-11-02T00:00:00Z", "2026-11-05T00:00:00Z"
+        )
+        assert coverage_gap_flags(manifest.quality_flags) == []
+        assert f"retired_entity_chunks_skipped:{self.PM_MINI}:1/3" in manifest.quality_flags
+        # The chunk holding the retirement is queried; the one after it is not.
+        assert self._query_times(fake) == [
+            datetime(2026, 11, 3, tzinfo=UTC),
+            datetime(2026, 11, 4, tzinfo=UTC),
+        ]
+        assert manifest.row_count == 2
+        stats = manifest.params["entity_stats"][0]
+        assert stats["chunks"] == 2 and stats["chunks_after_retirement"] == 1
+        assert stats["retired_at"] == "2026-11-03T22:23:00Z"
+        assert stats["last_ts"] == "2026-11-03T22:22:42.186000+00:00"
+
+    def test_a_sample_after_retirement_inside_its_chunk_is_not_kept(
+        self, tmp_path: Path, config: Path
+    ) -> None:
+        samples = [
+            (self._at("2026-11-03T22:22:42+00:00"), 179.4),
+            (self._at("2026-11-03T23:00:00+00:00"), 99.0),  # after retirement, same chunk
+        ]
+        fake = FakePrometheus(series_for(self.PM_MINI, samples))
+        manifest = self._extract(
+            tmp_path, config, fake, "2026-11-03T00:00:00Z", "2026-11-04T00:00:00Z"
+        )
+        assert manifest.row_count == 1
+        assert manifest.params["entity_stats"][0]["samples_outside_window"] == 1
+
+    def test_missing_data_before_retirement_is_still_a_gap(
+        self, tmp_path: Path, config: Path
+    ) -> None:
+        from battery_optimizer.coverage import coverage_gap_flags
+
+        # Nothing on 2026-11-02 nor on the day of the retirement: both queried chunks are gaps.
+        fake = FakePrometheus([])
+        manifest = self._extract(
+            tmp_path, config, fake, "2026-11-02T00:00:00Z", "2026-11-05T00:00:00Z"
+        )
+        gaps = coverage_gap_flags(manifest.quality_flags)
+        assert f"no_series_chunks:{self.PM_MINI}:2/2" in gaps
+        assert f"no_samples_extracted:{self.PM_MINI}" in gaps
+        assert "no_samples_extracted:all" in gaps
+
+    def test_a_window_wholly_after_retirement_sends_nothing_and_has_no_gap(
+        self, tmp_path: Path, config: Path
+    ) -> None:
+        fake = FakePrometheus([])
+        manifest = self._extract(
+            tmp_path, config, fake, "2026-11-04T00:00:00Z", "2026-11-06T00:00:00Z"
+        )
+        assert fake.requests == []
+        assert manifest.row_count == 0
+        assert manifest.quality_flags == [f"retired_entity_chunks_skipped:{self.PM_MINI}:2/2"]
+
+    def test_a_live_entity_in_the_same_run_keeps_its_gap_detection(
+        self, tmp_path: Path, config: Path
+    ) -> None:
+        live = "sensor.venus_ac_offgrid_power"
+        fake = FakePrometheus([])
+        path = run_extract(
+            tmp_path,
+            fake.client,
+            config,
+            entities=[self.PM_MINI, live],
+            start="2026-11-04T00:00:00Z",
+            end="2026-11-05T00:00:00Z",
+            chunk_seconds=self.DAY,
+        )
+        flags = manifest_of(path).quality_flags
+        assert f"no_series_chunks:{live}:1/1" in flags
+        assert "no_samples_extracted:all" in flags
+        assert not any(f.startswith(f"no_series_chunks:{self.PM_MINI}") for f in flags)
+
+
 # ---------------------------------------------------------------------------
 # 9. Schema contract and validate_raw
 # ---------------------------------------------------------------------------

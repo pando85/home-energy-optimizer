@@ -46,6 +46,10 @@ and the data volume are deployed from the homelab repository.
   0.08 kWh). So `grid - charge + discharge` keeps the servers in `gross_kwh` (no undercount).
 - `washer_plug` ends at `features.WASHER_PLUG_REFLASHED_AT` (2026-11-03 22:46 UTC, plug reflashed for
   another load) and is unknown from then on; it has had no data since 2024-07-08 anyway.
+- Extraction retires an entity that no longer exists (`EntitySpec.retired_at`, after its last sample):
+  `sensor.shellypmmini_servers_power` at 2026-11-03 22:23 UTC (renamed; last sample 22:22:42) and
+  `sensor.smart_plug_v2_terrace_power` at 22:46 UTC (last sample 22:45:42). Chunks from then on are
+  not queried and are no coverage gap; earlier chunks still are ([CLI](../cli.md#exit-codes-and-coverage-gaps)).
 - HA recorder history cannot be re-extracted; string states are not exported ([known issues](../known-issues.md)).
 - Heat-pump electricity: the branch meter (channel 2) reads about 1.28 times the HeishaMon counters and also feeds appliances ([climate plan](../planning/climate-optimizer-implementation.md)).
 
