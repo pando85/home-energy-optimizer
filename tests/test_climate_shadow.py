@@ -305,6 +305,13 @@ def test_the_gate_error_is_the_heat_driven_comfort_room_mean_with_zero_offset():
     assert rec["room_mean"]["h6"]["heat_plan_weather"] is not None
 
 
+def test_no_live_signal_switches_source():
+    # live_sources fetches Signal.entity only; a signal with successors (the servers since they
+    # moved to the battery backup port) would need every entity of its windows fetched.
+    assert not any(s.successors for s in shadow.LIVE_SIGNALS)
+    assert "servers" not in {s.alias for s in shadow.LIVE_SIGNALS}
+
+
 def test_a_decision_without_an_origin_is_not_scored():
     assert shadow.score(prior(), {"t0": MIDNIGHT.isoformat()}, None, MPC) is None
 

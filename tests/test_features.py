@@ -491,6 +491,160 @@ class TestBuildFeatures:
             )
 
 
+class TestSourceSwitch:
+    """A signal with successors reads each entity only inside its own window."""
+
+    NEW = "sensor.venus_ac_offgrid_power"
+    SWITCH = T0 + timedelta(hours=1)
+    SIGNAL = Signal(SERVERS, "servers", features.KIND_POWER, successors=((SWITCH, NEW),))
+    WINDOW = ("2026-01-05T00:00:00Z", "2026-01-05T02:00:00Z")
+
+    def _signals(self) -> tuple[Signal, ...]:
+        """The default set with this test's switch instead of the real one."""
+        return tuple(self.SIGNAL if s.alias == "servers" else s for s in features.SIGNALS)
+
+    def _archive(self, tmp_path: Path) -> Path:
+        directory = tmp_path / "data"
+        directory.mkdir()
+        # The old entity reads the servers (240 W) for an hour, then another load (150 W);
+        # the new one reads something else (40 W) before the switch and the servers (300 W)
+        # from it on.  Both sample every minute, 0.25 s past the minute.
+        rows = _raw_rows(SERVERS, "hass_sensor_power_w", "W", T0, [240.0] * 60 + [150.0] * 61)
+        rows += _raw_rows(self.NEW, "hass_sensor_power_w", "W", T0, [40.0] * 60 + [300.0] * 61)
+        _write_raw(directory, rows, entities=[SERVERS, self.NEW])
+        return directory
+
+    def test_entity_windows_split_at_each_switch(self) -> None:
+        later = self.SWITCH + timedelta(days=1)
+        sig = Signal(SERVERS, "servers", features.KIND_POWER, successors=((self.SWITCH, self.NEW),))
+        assert sig.entity_windows() == ((SERVERS, None, self.SWITCH), (self.NEW, self.SWITCH, None))
+        three = Signal("a", "x", features.KIND_POWER, successors=((self.SWITCH, "b"), (later, "c")))
+        assert [w[0] for w in three.entity_windows()] == ["a", "b", "c"]
+        assert three.entity_windows()[1] == ("b", self.SWITCH, later)
+        assert POWER_SIGNAL.entity_windows() == ((SERVERS, None, None),)
+
+    @pytest.mark.parametrize(
+        "successors",
+        [
+            ((datetime(2026, 1, 5, 1), "b"),),  # naive
+            ((T0 + timedelta(hours=2), "b"), (T0 + timedelta(hours=1), "c")),  # out of order
+            ((T0, "b"), (T0, "c")),  # repeated
+        ],
+    )
+    def test_bad_successors_are_refused(self, successors: Any) -> None:
+        with pytest.raises(ValueError, match="successors"):
+            Signal("a", "x", features.KIND_POWER, successors=successors)
+
+    def test_each_entity_feeds_the_alias_only_inside_its_window(self, tmp_path: Path) -> None:
+        data_dir = self._archive(tmp_path)
+        series, _parts, _ids = features.load_signal_samples(
+            data_dir,
+            (self.SIGNAL,),
+            window_start=datetime(2026, 1, 5, tzinfo=UTC),
+            window_end=datetime(2026, 1, 5, 2, tzinfo=UTC),
+        )
+        raw = series[SERVERS]
+        switch_us = int(self.SWITCH.timestamp() * 1_000_000)
+        assert set(raw.values[raw.t_us < switch_us]) == {240.0}
+        assert set(raw.values[raw.t_us >= switch_us]) == {300.0}
+        assert raw.t_us.size == 120  # the 02:00:00.25 sample is past the window
+        assert raw.entity == SERVERS and raw.series_keys == 2
+
+    def test_the_table_is_continuous_across_the_switch(self, tmp_path: Path) -> None:
+        data_dir = self._archive(tmp_path)
+        out = build_features(
+            data_dir=str(data_dir),
+            start=self.WINDOW[0],
+            end=self.WINDOW[1],
+            signals=self._signals(),
+        )
+        table, manifest = load_features(out)
+        kwh = table.column("servers_kwh").to_pylist()
+        # The last old reading (00:59:00.25) holds until the first new one (01:00:00.25).
+        assert kwh[:4] == pytest.approx([0.06] * 4)
+        assert kwh[4] == pytest.approx((240 * 0.25 + 300 * 899.75) / 3.6e6)
+        assert kwh[5:7] == pytest.approx([0.075] * 2)
+        # Slot 0 lacks the 0.25 s before the first sample; the switch costs no coverage.
+        assert table.column("servers_quality").to_pylist()[1:7] == ["measured"] * 6
+        assert manifest["signals"][0]["successors"] == [
+            {"since": "2026-01-05T01:00:00Z", "entity": self.NEW}
+        ]
+
+    def test_a_window_before_the_switch_reads_only_the_first_entity(self, tmp_path: Path) -> None:
+        data_dir = self._archive(tmp_path)
+        out = build_features(
+            data_dir=str(data_dir),
+            start="2026-01-05T00:00:00Z",
+            end="2026-01-05T00:45:00Z",
+            signals=self._signals(),
+        )
+        table, _ = load_features(out)
+        assert table.column("servers_kwh").to_pylist() == pytest.approx([0.06] * 3)
+
+    def test_the_successors_are_part_of_the_feature_set_id(self) -> None:
+        kwargs: dict[str, Any] = {
+            "part_hashes": [],
+            "code_ver": "v",
+            "window_start": T0,
+            "window_end": T0 + timedelta(hours=1),
+            "params": {},
+        }
+        later = Signal(
+            SERVERS, "servers", features.KIND_POWER, successors=((T0 + timedelta(hours=2), "b"),)
+        )
+        ids = {
+            features.compute_feature_set_id(**kwargs, signals=(s,))
+            for s in (POWER_SIGNAL, self.SIGNAL, later)
+        }
+        assert len(ids) == 3
+
+    def test_a_successor_without_an_entity_ends_the_signal(self, tmp_path: Path) -> None:
+        data_dir = self._archive(tmp_path)
+        ended = Signal(SERVERS, "servers", features.KIND_POWER, successors=((self.SWITCH, None),))
+        assert ended.entity_windows() == ((SERVERS, None, self.SWITCH), (None, self.SWITCH, None))
+        signals = tuple(ended if s.alias == "servers" else s for s in features.SIGNALS)
+        out = build_features(
+            data_dir=str(data_dir), start=self.WINDOW[0], end=self.WINDOW[1], signals=signals
+        )
+        table, manifest = load_features(out)
+        kwh = table.column("servers_kwh").to_pylist()
+        # The 150 W the old entity reads after the end never enters; the last 240 W reading is
+        # not held past it (nothing follows it).
+        assert kwh[:3] == pytest.approx([0.06] * 3)
+        assert kwh[4:] == [None] * 4
+        assert table.column("servers_quality").to_pylist()[4:] == ["unknown"] * 4
+        assert manifest["signals"][0]["successors"] == [
+            {"since": "2026-01-05T01:00:00Z", "entity": None}
+        ]
+
+    def test_the_washer_plug_ends_at_the_reflash(self) -> None:
+        sig = next(s for s in features.SIGNALS if s.alias == "washer_plug")
+        assert sig.entity_windows() == (
+            ("sensor.smart_plug_v2_terrace_power", None, features.WASHER_PLUG_REFLASHED_AT),
+            (None, features.WASHER_PLUG_REFLASHED_AT, None),
+        )
+        # After the plug's last report as the terrace plug (22:45:42 UTC).
+        assert features.WASHER_PLUG_REFLASHED_AT > datetime(2026, 11, 3, 22, 45, 42, tzinfo=UTC)
+
+    def test_the_servers_moved_to_the_battery_backup_port(self) -> None:
+        sig = features.SERVERS_SIGNAL
+        assert sig.alias == "servers"
+        assert sig.entity_windows() == (
+            (SERVERS, None, features.SERVERS_ON_BACKUP_PORT_SINCE),
+            (self.NEW, features.SERVERS_ON_BACKUP_PORT_SINCE, None),
+        )
+        # Inside the Prometheus scrape gap that brackets the rewiring.
+        assert (
+            datetime(2026, 11, 3, 22, 4, 31, tzinfo=UTC)
+            < features.SERVERS_ON_BACKUP_PORT_SINCE
+            <= datetime(2026, 11, 3, 22, 11, 43, tzinfo=UTC)
+        )
+        assert sig in features.SIGNALS and sig in features.CLIMATE_SIGNALS
+        assert self.NEW in FEATURE_ENTITY_IDS and self.NEW not in CLIMATE_ENTITY_IDS
+        assert ENTITY_SPECS[self.NEW].metric == "hass_sensor_power_w"
+        assert ENTITY_SPECS[self.NEW].unit == "W"
+
+
 class TestCli:
     def test_build_features_subcommand(
         self, data_dir: Path, capsys: pytest.CaptureFixture[str]
@@ -552,7 +706,9 @@ class TestDefaultSetIsPinned:
             ("sensor.terrace_lavadora_energy_today", "washer_energy_today_wh", "counter"),
         ]
         assert all(s.metric is None and s.source == s.entity for s in features.SIGNALS)
-        # Computed with the code before the climate set existed: a fixed input gives this id.
+        # A fixed input gives this id.  Last changed on 2026-11-03 when the servers signal gained
+        # its successor (battery backup port) and washer_plug its end (plug reflashed); before
+        # that it was 8cd8263e440a..., computed with the code before the climate set existed.
         fixed = features.compute_feature_set_id(
             part_hashes=[{"part": "p1", "sha256": "aa"}, {"part": "p2", "sha256": "bb"}],
             code_ver="test-version",
@@ -566,7 +722,7 @@ class TestDefaultSetIsPinned:
             },
             signals=features.SIGNALS,
         )
-        assert fixed == "8cd8263e440a5a970b0a9461e5dc546c18e72d4f9a570f09fae8b491e24d2236"
+        assert fixed == "da04b87f402e68ec68ce8de2d06c1c7748d6b7e938abe91ff4af37b9da89d89f"
 
     def test_the_selector_defaults_to_the_default_set(self) -> None:
         assert features.SIGNAL_SETS["default"] is features.SIGNALS

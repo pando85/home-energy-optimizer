@@ -101,7 +101,7 @@ flowchart LR
 
 | Component | Status | Since | One-line reason |
 |---|---|---|---|
-| [data-pipeline](data-pipeline.md) | stale | 2026-11-03 | Battery commissioned; counters and `battery.commissioned_at` set, the reconstruction's acceptance check needs a week of data |
+| [data-pipeline](data-pipeline.md) | stale | 2026-11-03 | Battery commissioned; counters and `battery.commissioned_at` set, the reconstruction's acceptance check needs a week of data; servers moved to the battery backup port (`servers` feature source switched); washer plug reflashed (`washer_plug` ended) |
 | [outdoor-temperature](outdoor-temperature.md) | valid | 2026-10-30 | Debiased house sensor, fused series only fills long gaps |
 | [heat-pump-controller](heat-pump-controller.md) | valid (legacy), being replaced | 2026-10-30 | Cheapest-hours rule is live; comfort controller designed 2026-10-31, merge gated on the battery ([design](../planning/comfort-controller-design.md)) |
 | [cop-model](cop-model.md) | provisional | 2026-10-30 | Daily error passes, season error fails; trained on 26 to 28 degC water only |
