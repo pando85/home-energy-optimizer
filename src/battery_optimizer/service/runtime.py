@@ -122,6 +122,38 @@ _PLAN_MEMORY = 16
 CLIMATE_SYNC_TIMEOUT_S = 60.0
 
 
+def _fmt(value: float | None, digits: int = 0) -> str:
+    """A number for a ``key=value`` log field (``-`` when unknown)."""
+    return "-" if value is None else f"{value:.{digits}f}"
+
+
+def _intent_text(intent: ShadowIntent | None) -> str:
+    if intent is None:
+        return "mode=- power_w=- plan_id=-"
+    return f"mode={intent.mode} power_w={intent.target_power_w:.0f} plan_id={intent.plan_id}"
+
+
+def _log_plan(result: PlanResult, trigger: str, elapsed: float) -> None:
+    snap = result.snapshot
+    first = result.intent_for_slot(snap.first_slot)
+    log.info(
+        "plan generated plan_id=%s trigger=%s status=%s solve_s=%.2f slots=%d first_slot=%s "
+        "first_mode=%s first_power_w=%s soc=%s soc_measured=%s soc_clamped=%s soc_source=%s",
+        result.plan_id,
+        trigger,
+        result.solver.get("status"),
+        elapsed,
+        len(snap.slot_starts),
+        snap.first_slot.isoformat(),
+        first.mode if first is not None else "-",
+        _fmt(first.target_power_w if first is not None else None),
+        _fmt(snap.soc_frac, 3),
+        _fmt(snap.soc_measured_frac, 3),
+        snap.soc_clamped,
+        snap.soc_source,
+    )
+
+
 class NotReadyError(Exception):
     """Planning refused: an input is missing or stale."""
 
@@ -239,6 +271,8 @@ class ShadowService:
         self.plans: deque[PlanResult] = deque(maxlen=_PLAN_MEMORY)
         self.last_solve: dict[str, Any] | None = None
         self._last_solve_started: datetime | None = None
+        #: The last skip reason logged at INFO: a skip repeating every slot is logged once.
+        self._logged_skip: str | None = None
         self._replan_task: asyncio.Task[None] | None = None
         self._tasks: list[asyncio.Task[Any]] = []
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -381,6 +415,11 @@ class ShadowService:
                 self.price_error = str(exc)
                 return
             if self.price_curve.tomorrow_published and not had_tomorrow:
+                log.info(
+                    "prices published reference_day=%s slots=%d",
+                    self.price_curve.reference_day.isoformat(),
+                    len(self.price_curve.prices),
+                )
                 self._spawn(self._record_event("prices_published", self.price_curve.summary()))
                 self._request_replan("prices_published")
         elif role == "battery_soc" and result is UpdateResult.ACCEPTED:
@@ -466,6 +505,13 @@ class ShadowService:
         )
         self.metrics.weather_forecast_fetches.labels(result="ok" if ok else "failed").inc()
         self.weather_error = None if ok else "store write failed"
+        if ok:
+            log.info(
+                "weather forecast archived entity=%s type=%s entries=%d",
+                cfg.entity_id,
+                cfg.type,
+                len(forecast),
+            )
         return ok
 
     async def _weather_archive_loop(self) -> None:
@@ -563,6 +609,12 @@ class ShadowService:
             log.exception("climate shadow run failed")
             return None
         self.climate_error = None
+        log.info(
+            "climate shadow run t0=%s status=%s regime=%s",
+            summary.get("t0"),
+            summary.get("status"),
+            summary.get("regime", "-"),
+        )
         return summary
 
     async def _climate_loop(self) -> None:
@@ -848,6 +900,14 @@ class ShadowService:
         # Runs on the loop thread once the planner thread has really ended.
         self._worker_busy = False
 
+    def _log_skip(self, trigger: str, reason: str, detail: str) -> None:
+        """INFO the first skip of a run of identical reasons, DEBUG the repeats."""
+        level = logging.DEBUG if reason == self._logged_skip else logging.INFO
+        self._logged_skip = reason
+        log.log(
+            level, "solve skipped trigger=%s reason=%s detail=%s", trigger, reason, detail or "-"
+        )
+
     async def request_solve(self, trigger: str) -> str:
         """Run one solve if the worker is free and the inputs are ready.
 
@@ -857,12 +917,14 @@ class ShadowService:
         now = self.clock.now()
         if self._worker_busy:
             self.metrics.skipped.labels(reason="busy").inc()
+            self._log_skip(trigger, "busy", "")
             await self._record_event("solve_skipped", {"trigger": trigger, "reason": "busy"})
             return "skipped:busy"
         try:
             snapshot = self.build_snapshot(now, trigger)
         except NotReadyError as exc:
             self.metrics.skipped.labels(reason=exc.reason).inc()
+            self._log_skip(trigger, exc.reason, exc.detail)
             self.last_solve = {
                 "at": now.isoformat(),
                 "trigger": trigger,
@@ -893,6 +955,7 @@ class ShadowService:
             )
         except TimeoutError:
             self.metrics.solves.labels(result="timeout").inc()
+            log.warning("solve timed out trigger=%s timeout_s=%s", trigger, timeout)
             self.last_solve = {
                 "at": now.isoformat(),
                 "trigger": trigger,
@@ -906,6 +969,7 @@ class ShadowService:
         except Exception as exc:  # noqa: BLE001 - solver/contract errors are reported, not fatal
             self.metrics.solves.labels(result="error").inc()
             detail = f"{type(exc).__name__}: {exc}"[:500]
+            log.error("solve failed trigger=%s error=%s", trigger, detail)
             self.last_solve = {
                 "at": now.isoformat(),
                 "trigger": trigger,
@@ -923,6 +987,12 @@ class ShadowService:
             # The first slot has begun: the plan is obsolete, a partly elapsed slot
             # cannot honour an intent sized for the whole slot.
             self.metrics.solves.labels(result="discarded").inc()
+            log.warning(
+                "plan discarded plan_id=%s trigger=%s reason=obsolete solve_s=%.2f",
+                result.plan_id,
+                trigger,
+                elapsed,
+            )
             self.last_solve = {
                 "at": now.isoformat(),
                 "trigger": trigger,
@@ -937,6 +1007,8 @@ class ShadowService:
         self.metrics.solve_duration.observe(elapsed)
         self.plans.append(result)
         self._wake_actuator()
+        self._logged_skip = None
+        _log_plan(result, trigger, elapsed)
         self.last_solve = {
             "at": now.isoformat(),
             "trigger": trigger,
@@ -986,6 +1058,13 @@ class ShadowService:
         )
         self._slot_open[slot_start] = opened
         self._opened_slot = slot_start
+        log.info(
+            "slot opened start=%s decision=%s %s not_ready=%s",
+            slot_start.isoformat(),
+            decision,
+            _intent_text(intent),
+            ",".join(opened.reasons) or "-",
+        )
         self._wake_actuator()
         for old in [s for s in self._slot_open if s < slot_start - timedelta(hours=2)]:
             del self._slot_open[old]
@@ -1001,6 +1080,17 @@ class ShadowService:
             price = self._recorded_price(slot_start)
         record = self._slot_record(slot_start, slot_end, measured, opened, price)
         self._closed_slot = slot_start
+        log.info(
+            "slot closed start=%s decision=%s grid_kwh=%s battery_charge_kwh=%s "
+            "battery_discharge_kwh=%s soc_start=%s soc_end=%s",
+            slot_start.isoformat(),
+            record["decision"],
+            _fmt(measured.grid_kwh, 3),
+            _fmt(measured.battery_charge_kwh, 3),
+            _fmt(measured.battery_discharge_kwh, 3),
+            _fmt(measured.soc_start_frac, 3),
+            _fmt(measured.soc_end_frac, 3),
+        )
         await self._write(self.sink.append_slot, slot_start, record)
         return record
 
@@ -1198,12 +1288,27 @@ class ShadowService:
         except Exception as exc:  # noqa: BLE001 - reported as not-ready, retried later
             self.history_error = f"{type(exc).__name__}: {exc}"[:500]
             self.metrics.history_refresh.labels(result="error").inc()
+            log.warning(
+                "history refresh failed day=%s error=%s (retry in %.0f s)",
+                today.isoformat(),
+                self.history_error,
+                _HISTORY_RETRY_S,
+            )
             await self._record_event("history_error", {"error": self.history_error})
             return False
         self.history = history
         self.history_error = None
         self.forecast_error = None
         self.metrics.history_refresh.labels(result="ok").inc()
+        log.info(
+            "history refreshed cutoff_day=%s window_days=%d slots=%d usable_slots=%d "
+            "price_samples=%d",
+            history.cutoff_day.isoformat(),
+            history.window_days,
+            len(history.starts),
+            history.usable_slots,
+            history.price_samples,
+        )
         await self._record_event("history_refreshed", history.summary())
         return True
 

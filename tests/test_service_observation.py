@@ -291,6 +291,38 @@ def test_serve_passes_the_commissioning_instant_to_the_history(tmp_path, monkeyp
     assert fetcher._charge == "sensor.venus_total_charging_energy"
 
 
+@pytest.mark.parametrize("mode", ["shadow", "dry_run"])
+def test_serve_logs_the_real_mode_at_startup(tmp_path, monkeypatch, caplog, mode):
+    import uvicorn
+    from service_fakes import REPO, write_service_config
+
+    from battery_optimizer.service.serve import build_service, run_server
+
+    for var in ("HA_URL", "HA_TOKEN", "HA_TOKEN_FILE", "PROMETHEUS_URL"):
+        monkeypatch.delenv(f"BATTERY_OPTIMIZER_{var}", raising=False)
+
+    class NoServer:
+        def __init__(self, config):
+            pass
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(uvicorn, "Server", NoServer)
+    config = write_service_config(tmp_path, mode=mode, **{"actuation.battery_ac_power_sign": -1})
+    service, _ = build_service(
+        service_config=str(config),
+        tariff_config=str(REPO / "config" / "tariff.yaml"),
+        data_dir=str(tmp_path / "data"),
+    )
+    caplog.set_level("INFO", logger="battery_optimizer.service.serve")
+    run_server(service, host="127.0.0.1", port=8080)
+    (line,) = [r.getMessage() for r in caplog.records if r.name.endswith(".serve")]
+    assert line.startswith(f"serving mode={mode} soc_source=entity version=")
+    assert f"code_version={service.code_version} on 127.0.0.1:8080" in line
+    assert "shadow service" not in line
+
+
 # ---------------------------------------------------------------------------
 # Virtual battery
 # ---------------------------------------------------------------------------

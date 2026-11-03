@@ -412,6 +412,43 @@ def test_not_ready_at_slot_start_means_no_decision(tmp_path, cleanup):
     assert service.current_intent(first) is None
 
 
+def test_plans_slots_and_repeated_skips_are_logged_once(tmp_path, cleanup, caplog):
+    caplog.set_level("INFO", logger="battery_optimizer.service.runtime")
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, **NO_BATTERY)
+    cleanup(service)
+    assert run(service.request_solve("scheduled")).startswith("skipped:")
+    assert run(service.request_solve("scheduled")).startswith("skipped:")
+    skips = [r.getMessage() for r in caplog.records if r.getMessage().startswith("solve skipped")]
+    assert len(skips) == 1  # the same reason again is not repeated at INFO
+    feed(service, NOW)
+    assert run(service.request_solve("test")) == "ok"
+    plan = service.plans[-1]
+    first = plan.plan.horizon_start
+    intent = plan.intent_for_slot(first)
+    lines = [r.getMessage() for r in caplog.records]
+    assert any(
+        m.startswith(f"plan generated plan_id={plan.plan_id} trigger=test status=")
+        and f"first_slot={first.isoformat()} first_mode={intent.mode}" in m
+        and "soc_source=simulated" in m
+        for m in lines
+    )
+    clock.set(first)
+    feed(service, first)
+    caplog.clear()
+    run(service.open_slot(first))
+    assert [r.getMessage() for r in caplog.records] == [
+        f"slot opened start={first.isoformat()} decision=intent mode={intent.mode} "
+        f"power_w={intent.target_power_w:.0f} plan_id={plan.plan_id} not_ready=-"
+    ]
+    caplog.clear()
+    service.ha.stats.connected = False
+    run(service.open_slot(first + timedelta(minutes=15)))
+    (line,) = [r.getMessage() for r in caplog.records]
+    assert "decision=not_ready mode=- power_w=- plan_id=-" in line
+    assert "not_ready=ha_disconnected" in line
+
+
 def test_scheduler_solves_before_the_boundary_and_opens_on_it(tmp_path, cleanup):
     clock = FakeClock(NOW)  # 10:50, boundary 11:00, solve due at 10:58
     service = make_service(tmp_path, clock)

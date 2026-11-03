@@ -616,6 +616,16 @@ class Actuator:
             else:
                 result = "dry_run" if self.mode == "dry_run" else "ok" if ok else "failed"
             done.append({**write.to_dict(), "result": result})
+            log.log(
+                logging.WARNING if result == "failed" else logging.INFO,
+                "actuator %s role=%s service=%s.%s value=%s result=%s",
+                "dry_run write" if self.mode == "dry_run" else "write",
+                write.role,
+                write.domain,
+                write.service,
+                "-" if write.value is None else f"{write.value:g}",
+                result,
+            )
             if not ok:
                 return False, done
         self._applied_mode = desired.mode
@@ -663,6 +673,7 @@ class Actuator:
         )
         readings = self._read(now)
         self.readings = readings
+        before = (self.kill_switch, self.in_control, self.reasons, self.desired, self.alert)
         self.kill_switch = self._kill_switch_on()
         writes: list[dict[str, Any]] = []
         desired: Desired | None = None
@@ -714,9 +725,62 @@ class Actuator:
             self._count("actuator_safe_idles", reason=desired.reason)
         self.reasons = tuple(reasons)
         self.desired = desired
+        self._log_transitions(*before, readings)
         record = self._tick_record(ctx, readings, desired, writes, heartbeat)
         await self._maybe_record(now, record, bool(writes))
         return record
+
+    def _log_transitions(
+        self,
+        kill_switch: bool | None,
+        in_control: bool,
+        reasons: tuple[str, ...],
+        desired: Desired | None,
+        alert: str | None,
+        readings: Mapping[str, Any],
+    ) -> None:
+        """One line per state change since the previous tick; nothing on an unchanged tick."""
+
+        def onoff(value: bool | None) -> str:
+            return "unknown" if value is None else "on" if value else "off"
+
+        if self.kill_switch != kill_switch:
+            log.info(
+                "actuator kill_switch=%s previous=%s", onoff(self.kill_switch), onoff(kill_switch)
+            )
+        if self.in_control != in_control:
+            log.info("actuator in_control=%s", self.in_control)
+        if set(self.reasons) != set(reasons):
+            log.info("actuator guard reasons=%s", ",".join(self.reasons) or "ok")
+        tripped, was_tripped = "import_over_cap" in self.reasons, "import_over_cap" in reasons
+        if tripped and not was_tripped:
+            log.warning(
+                "actuator import trip grid_power_w=%s cap_w=%.0f margin_w=%.0f hold_until=%s",
+                readings.get("grid_power_w"),
+                self.settings.import_cap_w,
+                self.settings.import_guard_margin_w,
+                self.trip_until.isoformat() if self.trip_until is not None else "-",
+            )
+        elif was_tripped and not tripped:
+            log.warning("actuator import trip ended")
+        new = self.desired
+        if new is not None and (
+            desired is None or (new.mode, new.reason) != (desired.mode, desired.reason)
+        ):
+            log.info(
+                "actuator desired mode=%s reason=%s pd_target_w=%s max_discharge_w=%s clamped_w=%g",
+                new.mode,
+                new.reason,
+                "-" if new.pd_target_w is None else f"{new.pd_target_w:g}",
+                "-" if new.max_discharge_w is None else f"{new.max_discharge_w:g}",
+                new.clamped_w,
+            )
+        if self.alert != alert:
+            if self.alert is None:
+                log.info("actuator alert cleared previous=%s", alert)
+            else:
+                level = logging.ERROR if self.alert == "safe_idle_failed" else logging.WARNING
+                log.log(level, "actuator alert=%s last_error=%s", self.alert, self.last_error)
 
     async def shutdown(self) -> bool:
         """Safe idle before the process exits (when in control); ``False`` if it failed."""
@@ -730,6 +794,12 @@ class Actuator:
                 self.in_control = not ok
                 self.desired = desired
                 self._count("actuator_safe_idles", reason="shutdown")
+                log.log(
+                    logging.INFO if ok else logging.ERROR,
+                    "actuator shutdown safe_idle ok=%s writes=%d",
+                    ok,
+                    len(writes),
+                )
                 record = self._tick_record(None, self.readings, desired, writes, None)
                 await self._maybe_record(now, record, True)
                 return ok

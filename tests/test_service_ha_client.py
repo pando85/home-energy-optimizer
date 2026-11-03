@@ -101,6 +101,27 @@ def test_disconnect_reconnect_and_full_resync():
     ]
 
 
+def test_connect_sync_and_disconnect_are_logged(caplog):
+    caplog.set_level("INFO", logger="battery_optimizer.service.ha_client")
+    server = FakeHAServer([ha_state("sensor.grid", 100, T0)])
+    client, _ = _client(server)
+
+    async def body():
+        await wait_until(lambda: client.stats.synced)
+        server.connections[0].drop()
+        await wait_until(lambda: client.stats.resyncs == 2)
+
+    asyncio.run(_run(client, body))
+    lines = [(r.levelname, r.getMessage()) for r in caplog.records]
+    assert ("INFO", "home assistant connected connects=1 reconnects=0") in lines
+    assert ("INFO", "home assistant synced states=1 tracked_seen=1 resyncs=1") in lines
+    assert any(
+        level == "WARNING" and m.startswith("home assistant disconnected: disconnect:")
+        for level, m in lines
+    )
+    assert not any("access_token" in m for _, m in lines)
+
+
 def test_snapshot_older_than_event_is_rejected_out_of_order():
     """Subscribe-then-snapshot: an event arriving before the get_states result wins."""
     server = FakeHAServer([ha_state("sensor.grid", 100, T0)])
