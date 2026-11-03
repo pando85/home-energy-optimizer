@@ -197,6 +197,10 @@ def test_committed_service_config_loads(monkeypatch):
     assert config.entities.has_battery
     assert config.planning.soc_source == "entity"
     assert config.freshness_for("battery_soc") is None
+    # The counters are reported on change only too: availability only, not grid_energy's 900 s.
+    assert config.freshness_for("battery_charge_energy") is None
+    assert config.freshness_for("battery_discharge_energy") is None
+    assert config.freshness_for("grid_energy") == 900.0
     assert (
         config.actuation.entities.battery_liveness == "sensor.omnibattery_non_responsive_batteries"
     )
@@ -229,6 +233,8 @@ def test_token_file(tmp_path, monkeypatch):
         ),
         ({"planning.solve_timeout_s": 500}, "solve_timeout_s"),
         ({"freshness_s.grid_power": None}, "freshness_s.grid_power"),
+        ({"freshness_s.grid_energy": None}, "freshness_s.grid_energy"),
+        ({"freshness_s.battery_charge_energy": 0}, "freshness_s.battery_charge_energy"),
         ({"entities.bogus": "sensor.x"}, "unknown entity roles"),
         ({"entities.grid_power": None}, "grid_power is required"),
         (

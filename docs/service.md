@@ -151,7 +151,7 @@ roles mapped at commissioning on 2026-11-03:
 | `grid_energy` | `sensor.shellyem_main_channel_1_energy` | present (kWh import counter) |
 | `price` | `sensor.esios_pvpc` | present (`pvpc_updated`; `price_HHh`, `price_next_day_HHh` after ~20:00, `_d` on the repeated hour) |
 | `battery_soc` | `sensor.venus_battery_soc` | present (%; reported on change only) |
-| `battery_charge_energy` / `battery_discharge_energy` | `sensor.venus_total_charging_energy` / `sensor.venus_total_discharging_energy` | present (kWh, AC side, 0.01 kWh resolution; the discharge counter excludes the backup port) |
+| `battery_charge_energy` / `battery_discharge_energy` | `sensor.venus_total_charging_energy` / `sensor.venus_total_discharging_energy` | present (kWh, AC side, 0.01 kWh resolution; reported on change only; the discharge counter includes the battery's supply to the backup port) |
 | `battery_power` | — | not mapped: `sensor.venus_ac_power` is + while discharging, this role is + charge |
 | observed | `sensor.shellyem_main_channel_2_power` | present (aerotherm branch, context only) |
 
@@ -159,7 +159,12 @@ The committed config uses `soc_source: entity`. The SOC is reported only on chan
 the actuator checks it: availability only (`freshness_s.battery_soc: null`, the default; a number restores
 an age test), and `actuation.entities.battery_liveness` (`sensor.omnibattery_non_responsive_batteries`, read
 in every mode with `soc_source: entity`) must be exactly `None`; otherwise planning is refused with
-`soc_stale` ([known issues](known-issues.md#planning-from-the-soc-entity-checks-availability-and-liveness-not-age)). With the
+`soc_stale` ([known issues](known-issues.md#planning-from-the-soc-entity-checks-availability-and-liveness-not-age)). The
+two battery energy counters are reported on change only too, so `freshness_s.battery_charge_energy` and
+`freshness_s.battery_discharge_energy` are also `null` by default (availability only; previously they
+inherited `freshness_s.grid_energy`, 900 s): an idle battery no longer shows them stale in `/status` (`max_age_s`
+null) and `input_stale`. They gate neither planning nor actuation, so no liveness test is added; a number
+restores the age test. With the
 counters mapped, the load history is `grid - charge + discharge` per slot, except slots that end at or before
 `battery.commissioned_at`, which are the grid counter alone (the counters need not reach back that far).
 

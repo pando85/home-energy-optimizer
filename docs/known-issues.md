@@ -204,9 +204,13 @@ restores the age test. The committed config now uses `soc_source: entity`.
 With the battery mapped, a slot record's gross load needs both AC energy counters at both slot edges, each
 no older than `observation.counter_max_age_s` (300 s). If the counters behave like the SOC (reported on
 change only), an idle battery leaves them older than that and the slot's gross load and counterfactual cost
-are `null` (not wrong). Unverified; check the first days of `service/v1/slots/`. The Prometheus history is
-not affected (it samples on every scrape), and slots that end before `battery.commissioned_at` use the grid
-counter alone.
+are `null` (not wrong). The counters do behave like the SOC (seen at go-live, 2026-11-03: an idle battery's
+counters keep an old `last_reported`), so expect this; check the first days of `service/v1/slots/`. The
+Prometheus history is not affected (it samples on every scrape), and slots that end before
+`battery.commissioned_at` use the grid counter alone. The same behaviour made the counters look stale in
+`/status` and `battery_optimizer_input_stale` under the 900 s they inherited from `freshness_s.grid_energy`;
+resolved: `freshness_s.battery_charge_energy` / `battery_discharge_energy` are `null` (availability only) by
+default, and a number restores the age test. `observation.counter_max_age_s` is unchanged.
 
 ### The PD loop oscillates; the discharge margin was too small
 

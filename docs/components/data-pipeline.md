@@ -33,15 +33,17 @@ and the data volume are deployed from the homelab repository.
 - From it: `gross = raw - charge + discharge` per interval, as `service/history.py` (which also keeps the grid
   counter alone for slots ending at or before it). The counters `sensor.venus_total_charging_energy` /
   `_discharging_energy` are AC side (commissioning test 2026-11-03: charge 0.180 kWh against 0.182 kWh of
-  integrated AC power and 0.165 kWh DC), 0.01 kWh resolution; the discharge counter excludes the backup port. An unknown counter or
+  integrated AC power and 0.165 kWh DC), 0.01 kWh resolution; the discharge counter includes the backup port (below). An unknown counter or
   a negative result nulls `gross_kwh` (`battery_counters_missing`, `battery_gross_negative`); counters
   not configured or absent from the archive refuse the build. Any counter decrease nulls its interval
   (stricter than the `counter_rates` rollback rule).
 - The `servers` feature is the Shelly PM mini before `features.SERVERS_ON_BACKUP_PORT_SINCE` (2026-11-03
   22:05 UTC) and the battery's backup-port output `sensor.venus_ac_offgrid_power` from it on; each entity is
   read only inside its window ([regime log](regime-log.md)). In Bypass the servers stay inside channel 1.
-  **Unverified:** whether a discharge feeds the backup port from the battery; the discharge counter excludes
-  the backup port, so that energy would be missing from `gross_kwh` and show as `servers + heat pump > main`.
+  While discharging the battery feeds the backup port, and that supply is in the discharge counter
+  (measured 2026-11-03 22:44 to 23:01 UTC, first live discharge: `sensor.venus_ac_power`, which includes the
+  backup-port supply, integrates to 0.074 kWh, 0.072 kWh of it to the backup port; the discharge counter rose
+  0.08 kWh). So `grid - charge + discharge` keeps the servers in `gross_kwh` (no undercount).
 - `washer_plug` ends at `features.WASHER_PLUG_REFLASHED_AT` (2026-11-03 22:46 UTC, plug reflashed for
   another load) and is unknown from then on; it has had no data since 2024-07-08 anyway.
 - HA recorder history cannot be re-extracted; string states are not exported ([known issues](../known-issues.md)).
@@ -76,4 +78,6 @@ check passes, the reconstruction is untested on real counters. Reconstruction an
 sign reversed (`raw + charge - discharge`, the service always used `raw - charge + discharge`); corrected
 before go-live, so no dataset was built with it. 2026-11-03: the servers moved to the battery backup
 port; the `servers` feature switches source at that instant, and `washer_plug` ends at the terrace
-plug's reflash the same night (feature-set ids change).
+plug's reflash the same night (feature-set ids change). Measured the same night: the discharge counter includes
+the battery's supply to the backup port (Assumptions). Live control since 2026-11-03 23:45 local: the
+reconstruction now carries real charge and discharge.
