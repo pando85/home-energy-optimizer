@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.5.0](https://github.com/pando85/home-energy-optimizer/tree/v0.5.0) - 2026-11-03
+
+### Added
+
+- config: Commission the Venus E V3 battery in the service config ([81236e0](https://github.com/pando85/home-energy-optimizer/commit/81236e0dbf8adb732d3951df4d72ea78b6c9038c))
+- service: Add dry_run and live battery control through Omnibattery ([1836691](https://github.com/pando85/home-energy-optimizer/commit/1836691867d8355fd45e1db68c8667df84bd08e8))
+- service: Plan from the battery SOC entity and expose clamped actuation ([181488c](https://github.com/pando85/home-energy-optimizer/commit/181488c5fb3e3b35c4aaa523195369e8477627e6))
+
 ## [v0.4.2](https://github.com/pando85/home-energy-optimizer/tree/v0.4.2) - 2026-11-03
 
 ### Fixed
