@@ -238,7 +238,11 @@ ACTUATION_DOMAINS: dict[str, str] = {
     "integration_status": "sensor",
     "battery_ac_power": "sensor",
     "battery_soc": "sensor",
+    "battery_liveness": "sensor",
 }
+
+#: Entities that may stay ``null`` even outside shadow mode.
+_OPTIONAL_ACTUATION_ENTITIES = frozenset({"battery_liveness"})
 
 
 @dataclass(frozen=True)
@@ -247,7 +251,9 @@ class ActuationEntities:
 
     Written (live mode only, through :mod:`.ha_guard`): the two direction switches, the PD
     grid target, the system power-limit switch, the system discharge cap and the heartbeat.
-    Only read: the kill switch, the integration status, battery AC power and SOC.
+    Only read: the kill switch, the integration status, battery AC power and SOC, and the
+    optional ``battery_liveness`` sensor (Omnibattery's non-responsive-batteries count, whose
+    healthy state is the text ``None``).
     """
 
     kill_switch: str | None = "input_boolean.battery_optimizer_live"
@@ -260,6 +266,7 @@ class ActuationEntities:
     integration_status: str | None = None
     battery_ac_power: str | None = None
     battery_soc: str | None = None
+    battery_liveness: str | None = None
 
     def all(self) -> tuple[str, ...]:
         return tuple(e for k in ACTUATION_DOMAINS if (e := getattr(self, k)))
@@ -292,8 +299,11 @@ class ActuationSettings:
     min_command_interval_s: float = 30.0
     shutdown_timeout_s: float = 15.0
     grid_power_max_age_s: float = 30.0
-    battery_soc_max_age_s: float = 300.0
-    battery_ac_power_max_age_s: float = 60.0
+    #: ``None`` = availability only (present, not unavailable/unknown, numeric), no age test:
+    #: Omnibattery's coordinator entities report only on change, so an idle battery's SOC and
+    #: AC power keep their old ``last_reported``; they turn ``unavailable`` when Modbus fails.
+    battery_soc_max_age_s: float | None = None
+    battery_ac_power_max_age_s: float | None = None
 
     def command_policy(self) -> Any:
         """The writer knobs as the validated :class:`~battery_optimizer.dispatch.CommandPolicy`.
@@ -631,7 +641,7 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
             raise ValueError(
                 f"service config: {name}.entities.{key} must be a {domain}.* entity ID or null"
             )
-        if value is None and mode != "shadow":
+        if value is None and mode != "shadow" and key not in _OPTIONAL_ACTUATION_ENTITIES:
             raise ValueError(f"service config: mode={mode} needs {name}.entities.{key}")
         ents[key] = value
     named = [e for e in ents.values() if e]
@@ -658,6 +668,13 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
         default = getattr(defaults, attr or key)
         label = f"{name}.{prefix}{key}"
         return _positive(section.get(key, default), label, allow_zero=allow_zero)
+
+    def optional_age(key: str, attr: str) -> float | None:
+        """A max age in seconds, or ``null`` for an availability-only check."""
+        value = fresh_raw.get(key, getattr(defaults, attr))
+        if value is None:
+            return None
+        return _positive(value, f"{name}.freshness_s.{key}")
 
     sign = raw.get("battery_ac_power_sign")
     if sign is not None and (isinstance(sign, bool) or sign not in (1, -1)):
@@ -702,15 +719,8 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
         grid_power_max_age_s=num(
             "grid_power", section=fresh_raw, prefix="freshness_s.", attr="grid_power_max_age_s"
         ),
-        battery_soc_max_age_s=num(
-            "battery_soc", section=fresh_raw, prefix="freshness_s.", attr="battery_soc_max_age_s"
-        ),
-        battery_ac_power_max_age_s=num(
-            "battery_ac_power",
-            section=fresh_raw,
-            prefix="freshness_s.",
-            attr="battery_ac_power_max_age_s",
-        ),
+        battery_soc_max_age_s=optional_age("battery_soc", "battery_soc_max_age_s"),
+        battery_ac_power_max_age_s=optional_age("battery_ac_power", "battery_ac_power_max_age_s"),
     )
     cap = settings.import_cap_w
     for key in ("neutral_pd_target_w", "discharge_margin_w"):

@@ -57,6 +57,7 @@ ENTS = ActuationEntities(
     integration_status="sensor.omnibattery_integration_status",
     battery_ac_power="sensor.venus_ac_power",
     battery_soc="sensor.venus_battery_soc",
+    battery_liveness="sensor.omnibattery_non_responsive_batteries",
 )
 SETTINGS = ActuationSettings(entities=ENTS, battery_ac_power_sign=1)
 SLOT = floor_slot(NOW, 900)  # 10:45Z; NOW = 10:50Z
@@ -157,6 +158,7 @@ def world(
     limits="off",
     pd=0.0,
     cap=0.0,
+    liveness="None",
     at=None,
 ):
     store = EntityStore.for_entities((GRID, *ENTS.all()))
@@ -172,6 +174,7 @@ def world(
         (ENTS.power_limits, limits, {}),
         (ENTS.pd_target, pd, NUMBER_ATTRS),
         (ENTS.max_discharge_power, cap, CAP_ATTRS),
+        (ENTS.battery_liveness, liveness, {}),
     ):
         if value is not None:
             store.apply(entity_state(entity, value, at, attributes=attrs))
@@ -469,6 +472,67 @@ def test_missing_sensors_are_stale():
     assert ha.writes() == []
 
 
+def test_an_idle_battery_with_hours_old_readings_can_start_a_charge():
+    # Omnibattery reports SOC and AC power only on change: hours old but available is healthy.
+    clock = FakeClock(NOW)
+    store = world(clock, grid=400, ac=0, at=NOW - timedelta(hours=5))
+    store.apply(entity_state(GRID, 400, clock.now()))  # the Shelly meter reports every 2 s
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("charge", 1000)))
+    assert actuator.reasons == ()
+    assert ha.writes() == [
+        ("number.set_value", "omnibattery_pd_target_grid_power", 1400.0),
+        ("switch.turn_on", "venus_battery_allow_charge", None),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entity", "state", "reason"),
+    [
+        (ENTS.battery_soc, "unavailable", "battery_soc_stale"),
+        (ENTS.battery_ac_power, "unavailable", "battery_power_stale"),
+        (ENTS.battery_liveness, "1", "battery_unresponsive"),
+        (ENTS.battery_liveness, "venus", "battery_unresponsive"),
+        (ENTS.battery_liveness, "unavailable", "battery_unresponsive"),
+        (ENTS.battery_liveness, "none", "battery_unresponsive"),  # the healthy text is exact
+    ],
+)
+def test_unavailable_battery_or_unresponsive_liveness_holds_safe_idle(entity, state, reason):
+    clock = FakeClock(NOW)
+    store = world(clock, charge="on", pd=1400)
+    clock.advance(1)
+    store.apply(entity_state(entity, state, clock.now()))
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("charge", 1000)))
+    assert actuator.reasons == (reason,)
+    assert ha.writes() == [("switch.turn_off", "venus_battery_allow_charge", None)]
+
+
+def test_a_missing_liveness_sensor_is_unresponsive_and_an_unset_one_is_not_checked():
+    clock = FakeClock(NOW)
+    store = world(clock, liveness=None)
+    actuator, _, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("idle")))
+    assert actuator.reasons == ("battery_unresponsive",)
+    unchecked = replace(SETTINGS, entities=replace(ENTS, battery_liveness=None))
+    actuator, _, _ = make(clock, store, settings=unchecked)
+    tick(actuator, ctx(clock, intent("idle")))
+    assert actuator.reasons == ()
+
+
+def test_a_configured_battery_age_is_still_enforced():
+    clock = FakeClock(NOW)
+    store = world(clock, at=NOW - timedelta(seconds=400))
+    store.apply(entity_state(GRID, 400, clock.now()))
+    aged = replace(SETTINGS, battery_soc_max_age_s=300.0, battery_ac_power_max_age_s=60.0)
+    actuator, _, _ = make(clock, store, settings=aged)
+    tick(actuator, ctx(clock, intent("charge", 1000)))
+    assert actuator.reasons == ("battery_soc_stale", "battery_power_stale")
+    actuator, _, _ = make(clock, store, settings=replace(aged, battery_soc_max_age_s=500.0))
+    tick(actuator, ctx(clock, intent("charge", 1000)))
+    assert actuator.reasons == ("battery_power_stale",)
+
+
 def test_import_over_cap_while_charging_trips_charge_off_and_holds_it():
     clock = FakeClock(NOW)
     store = world(clock, grid=4800, ac=1500, charge="on", pd=4500)
@@ -626,6 +690,10 @@ def test_committed_actuation_section_names_the_installation_entities():
     config = load_service_config(REPO / "config" / "service.yaml")
     assert config.actuation.entities == ENTS
     assert config.actuation.battery_ac_power_sign is None  # not measured yet
+    # availability only: Omnibattery reports SOC and AC power on change only
+    assert config.actuation.battery_soc_max_age_s is None
+    assert config.actuation.battery_ac_power_max_age_s is None
+    assert config.actuation.grid_power_max_age_s == 30
     assert config.actuation.import_cap_w == 4500
     policy = config.actuation.command_policy()
     assert (policy.max_attempts, policy.min_setpoint_change_w) == (3, 100)
@@ -655,6 +723,9 @@ def test_the_actuation_section_does_not_change_the_plan_identity(tmp_path):
         ({**LIVE, "actuation.healthy_states": []}, "healthy_states"),
         ({**LIVE, "actuation.bogus": 1}, "unknown actuation keys"),
         ({**LIVE, "actuation.freshness_s.price": 1}, "unknown actuation.freshness_s keys"),
+        ({**LIVE, "actuation.freshness_s.grid_power": None}, "freshness_s.grid_power"),
+        ({**LIVE, "actuation.freshness_s.battery_soc": 0}, "freshness_s.battery_soc"),
+        ({**LIVE, "actuation.entities.battery_liveness": "binary_sensor.x"}, "battery_liveness"),
     ],
 )  # fmt: skip
 def test_invalid_actuation_config_is_refused(tmp_path, override, message):
@@ -669,6 +740,18 @@ def test_dry_run_and_live_configs_load(tmp_path):
     assert dry.mode == "dry_run" and dry.actuation.battery_ac_power_sign == -1
     live = load_service_config(write_service_config(tmp_path, **LIVE))
     assert live.mode == "live"
+    aged = load_service_config(
+        write_service_config(
+            tmp_path,
+            **{
+                **LIVE,
+                "actuation.freshness_s.battery_soc": 600,
+                "actuation.entities.battery_liveness": None,  # optional even in live
+            },
+        )
+    )
+    assert aged.actuation.battery_soc_max_age_s == 600
+    assert aged.actuation.entities.battery_liveness is None
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +790,7 @@ def _live_world(service, clock):
     for entity, value, attrs in (
         (ENTS.battery_ac_power, 0, {}),
         (ENTS.battery_soc, 50, {}),
+        (ENTS.battery_liveness, "None", {}),
         (ENTS.integration_status, "balanced", {}),
         (ENTS.kill_switch, "on", {}),
         (ENTS.allow_charge, "off", {}),
@@ -834,6 +918,7 @@ def test_live_service_end_to_end_through_the_guarded_websocket(tmp_path):
             ha_state(ENTS.integration_status, "balanced", now),
             ha_state(ENTS.battery_ac_power, 0, now),
             ha_state(ENTS.battery_soc, 50, now),
+            ha_state(ENTS.battery_liveness, "None", now),
             ha_state(ENTS.allow_charge, "on", now),  # left on, and no plan yet: switched off
             ha_state(ENTS.allow_discharge, "off", now),
             ha_state(ENTS.power_limits, "off", now),

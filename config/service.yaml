@@ -167,6 +167,9 @@ actuation:
     integration_status: sensor.omnibattery_integration_status
     battery_ac_power: sensor.venus_ac_power
     battery_soc: sensor.venus_battery_soc                       # %
+    # Optional: its state must be exactly `None` (Omnibattery's healthy text); anything else,
+    # missing or unavailable holds safe idle (guard reason battery_unresponsive).
+    battery_liveness: sensor.omnibattery_non_responsive_batteries
   # +1 when sensor.venus_ac_power is positive while CHARGING, -1 when positive while
   # discharging.  NOT MEASURED YET: dry_run / live refuse to start while it is null.
   battery_ac_power_sign: null
@@ -193,11 +196,15 @@ actuation:
     min_command_interval_s: 30    # nor a numeric rewrite of the same entity within this
   readback_timeout_s: 10          # per send: the entity must read back the new value
   shutdown_timeout_s: 15          # safe idle at SIGTERM (uvicorn grace is 20 s)
-  # Maximum age (s since HA last reported) of the guard's inputs.
+  # Maximum age (s since HA last reported) of the guard's inputs; null = availability only
+  # (present, not unavailable/unknown, numeric; SOC within 0-100), no age test.
   freshness_s:
     grid_power: 30
-    battery_soc: 300
-    battery_ac_power: 60
+    # null: Omnibattery's coordinator entities report only on change (last_reported is not
+    # refreshed for an unchanged value, verified 2026-11-03), so an idle battery's SOC and AC
+    # power look hours old while healthy; they turn `unavailable` when Modbus polling fails.
+    battery_soc: null
+    battery_ac_power: null
 
 # Climate shadow (track B2): B0's thermal model and the price-blind comfort MPC on live data,
 # every `replan_every_minutes` of the MPC config (hourly), `offset_minutes` after the boundary.

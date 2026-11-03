@@ -553,7 +553,11 @@ mode a numeric setpoint is resent only after a change of `min_setpoint_change_w`
 `import_cap_w + import_guard_margin_w` while charge is on: charge off at once, and charge refused for
 `import_trip_hold_s`), `ha_not_synced`, `kill_switch_off`, `no_plan`, `plan_expired`, `inputs_not_ready`,
 `intent_expired`, `plan_not_from_this_process`, `grid_power_stale`, `battery_soc_stale`,
-`battery_power_stale`, `price_stale`, `integration_unhealthy` (status not in `healthy_states`). With
+`battery_power_stale`, `battery_unresponsive` (`entities.battery_liveness` not exactly `None`),
+`price_stale`, `integration_unhealthy` (status not in `healthy_states`). Battery SOC and AC power are
+checked for availability only by default (present, not `unavailable`/`unknown`, numeric; SOC within 0..100):
+Omnibattery reports them only on change and HA does not refresh `last_reported` for an unchanged value, so an
+idle battery's readings look hours old while healthy. With
 `ha_not_synced` nothing can be sent; with `kill_switch_off` nothing is written except one safe idle on the
 `on → off` edge.
 
@@ -572,14 +576,16 @@ cancels the actuator loop and sets safe idle before the HA session closes (`shut
 under `actuation/` and in `actuator_writes_total{result="dry_run"}`; nothing is sent, because the HA client
 has no write allowlist outside `live`.
 
-Configuration keys (`actuation:` in `config/service.yaml`; defaults in parentheses): `entities.*` (the ten
-entity IDs; all required outside shadow), `battery_ac_power_sign` (none: required outside shadow),
+Configuration keys (`actuation:` in `config/service.yaml`; defaults in parentheses): `entities.*` (ten
+entity IDs, all required outside shadow, plus the optional `battery_liveness`, deployed as
+`sensor.omnibattery_non_responsive_batteries`), `battery_ac_power_sign` (none: required outside shadow),
 `tick_interval_s` (30), `import_cap_w` (4500), `import_guard_margin_w` (200), `import_trip_hold_s` (300),
 `neutral_pd_target_w` (0), `discharge_margin_w` (50), `min_discharge_cap_w` (100), `max_discharge_cap_w`
 (2500), `healthy_states` (`balanced`, `charging`, `discharging`), `command_policy.max_attempts` (3),
 `command_policy.min_setpoint_change_w` (100), `command_policy.min_command_interval_s` (30),
 `readback_timeout_s` (10), `shutdown_timeout_s` (15), `freshness_s.grid_power` (30),
-`freshness_s.battery_soc` (300), `freshness_s.battery_ac_power` (60). `mode: live` also requires
+`freshness_s.battery_soc` (null = availability only), `freshness_s.battery_ac_power` (null; a number of
+seconds enables an age test). `mode: live` also requires
 `planning.soc_source: entity`. The section is excluded from the plan's config hash.
 
 ## Safety

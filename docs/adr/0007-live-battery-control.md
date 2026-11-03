@@ -91,13 +91,23 @@ Two separate limits apply and both stay in force:
 6. **Safety guard before every tick and every write** (`Actuator.guard`). Any failing check selects safe idle
    and is recorded with its reason: no intent for the current slot (`no_plan`, `plan_expired`,
    `inputs_not_ready`), the intent not covering now or expired (`intent_expired`), the intent from a plan this
-   process did not solve (`plan_not_from_this_process`), grid power older than 30 s, battery SOC older than
-   300 s or outside 0..100 %, battery AC power older than 60 s, no PVPC price for the current slot,
+   process did not solve (`plan_not_from_this_process`), grid power older than 30 s, battery SOC or battery
+   AC power missing, `unavailable`/`unknown` or non-numeric (SOC also outside 0..100 %; no age test by default,
+   see below), `sensor.omnibattery_non_responsive_batteries` not exactly `None` (`battery_unresponsive`;
+   optional `actuation.entities.battery_liveness`), no PVPC price for the current slot,
    `sensor.omnibattery_integration_status` outside `healthy_states` (`balanced`, `charging`, `discharging`; any
    other value — `manual`, `grid_charging`, `backup_mode`, `initializing`, a competing Omnibattery strategy,
    `unavailable` — holds safe idle). **Hard rule:** measured import above `import_cap_w + import_guard_margin_w`
    (4700 W) while charge is on switches charge off at once, regardless of the plan, and refuses charge intents for
    `import_trip_hold_s` (300 s); a grid reading above that level wakes the actuator without waiting for the tick.
+
+   *Battery freshness (verified on the installation 2026-11-03):* Omnibattery's coordinator entities report only
+   on change, and HA does not refresh `last_reported` for an unchanged value on this install (`get_states` and
+   REST included), so an idle battery's SOC and AC power keep a `last_reported` hours old while healthy. An age
+   test would hold safe idle forever and the battery could never leave idle to charge. So
+   `freshness_s.battery_soc` and `freshness_s.battery_ac_power` are `null` (availability only); those entities
+   turn `unavailable` when Modbus polling fails, and the liveness sensor covers a non-responsive battery. A
+   number of seconds still enables an age test. The Shelly grid power reports every ~2 s and stays age-checked.
 
 7. **Restart never resumes.** Plans are held only in memory and the actuator acts only on an intent whose plan
    was solved by this process (`generated_at` at or after the process start). After a restart it holds safe idle
@@ -148,6 +158,13 @@ Two separate limits apply and both stay in force:
   disabled by the owner; the guard only notices them through `integration_status`.
 - Partial writes after a crash: the last state persists in Omnibattery; the next process starts in safe idle once
   the kill switch is on and HA is synced.
+
+## Follow-ups
+
+- Slot and plan records keep `"shadow": true` in `dry_run` and `live` for now (unchanged record schema); the
+  `actuation/` records are the authority for what was sent. Relabel them in a later change.
+- The watchdog deliberately does **not** latch the kill switch off: after a recovery the service retakes control
+  only with a plan it has solved itself (decision 7), which is the intended behaviour for unattended running.
 
 ## Home Assistant helpers and watchdog (homelab, proposed; not in this repository)
 

@@ -87,6 +87,7 @@ GUARD_REASONS: tuple[str, ...] = (
     "grid_power_stale",
     "battery_soc_stale",
     "battery_power_stale",
+    "battery_unresponsive",
     "price_stale",
     "integration_unhealthy",
 )
@@ -107,6 +108,8 @@ _DECISION_REASON = {
     "plan_expired": "plan_expired",
     "not_ready": "inputs_not_ready",
 }
+#: The healthy state of Omnibattery's non-responsive-batteries sensor (verbatim, case included).
+LIVENESS_OK_STATE = "None"
 _READBACK_POLL_S = 0.25
 _READBACK_REFRESH_EVERY = 8  # polls: one REST GET of the entity every 2 s while waiting
 _RETRY_PAUSE_S = 1.0
@@ -275,7 +278,11 @@ class Actuator:
 
     # ------------------------------------------------------------------ inputs
 
-    def _fresh(self, entity: str | None, max_age_s: float, now: datetime) -> float | None:
+    def _fresh(self, entity: str | None, max_age_s: float | None, now: datetime) -> float | None:
+        """Numeric value; with no *max_age_s* only availability counts (no age test)."""
+        if max_age_s is None:
+            state = self._store.get(entity)
+            return state.numeric() if state is not None else None
         return self._store.fresh_value(entity, now, max_age_s)
 
     def _switch_state(self, entity: str | None) -> bool | None:
@@ -297,6 +304,7 @@ class Actuator:
         if soc is not None and not 0.0 <= soc <= 100.0:
             soc = None
         status = self._store.get(e.integration_status)
+        liveness = self._store.get(e.battery_liveness)
 
         def number(entity: str | None) -> float | None:
             state = self._store.get(entity)
@@ -308,6 +316,7 @@ class Actuator:
             "battery_soc_pct": soc,
             "house_load_w": None if grid is None or ac is None else grid - ac,
             "integration_status": status.state if status is not None else None,
+            "battery_liveness": liveness.state if liveness is not None else None,
             "allow_charge": self._switch_state(e.allow_charge),
             "allow_discharge": self._switch_state(e.allow_discharge),
             "power_limits": self._switch_state(e.power_limits),
@@ -360,6 +369,9 @@ class Actuator:
             reasons.append("battery_soc_stale")
         if readings.get("battery_ac_power_w") is None:
             reasons.append("battery_power_stale")
+        # Raw state on purpose: the healthy text "None" is what EntityState.available rejects.
+        if s.entities.battery_liveness and readings.get("battery_liveness") != LIVENESS_OK_STATE:
+            reasons.append("battery_unresponsive")
         if not ctx.price_fresh:
             reasons.append("price_stale")
         status = readings.get("integration_status")
@@ -555,7 +567,14 @@ class Actuator:
         e = self.settings.entities
         self.last_tick_at = now
         await self._refresh_entities(
-            (self._grid, e.battery_ac_power, e.battery_soc, e.integration_status, e.kill_switch)
+            (
+                self._grid,
+                e.battery_ac_power,
+                e.battery_soc,
+                e.battery_liveness,
+                e.integration_status,
+                e.kill_switch,
+            )
         )
         readings = self._read(now)
         self.readings = readings
