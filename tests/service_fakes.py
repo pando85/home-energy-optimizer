@@ -213,7 +213,8 @@ class FakeHAServer:
 
     Keys: ``refuse`` (connect raises), ``auth_invalid``, ``subscribe_fail``,
     ``get_states_silent`` (never answers), ``no_pong``, ``events_before_states``
-    (payloads pushed as events before the get_states result); for the weather archive
+    (payloads pushed as events before the get_states result); ``actuation_silent`` (a
+    live write is acknowledged but its state never changes); for the weather archive
     ``weather_forecast`` (the list returned), ``weather_response`` (the whole response
     object), ``weather_error`` (``success: false``), ``weather_silent`` (no answer).
     """
@@ -271,6 +272,25 @@ class FakeHAServer:
         elif kind == "ping":
             if not b.get("no_pong"):
                 conn.push({"id": message["id"], "type": "pong"})
+        elif kind == "call_service" and message.get("domain") != "weather":
+            # A live Omnibattery write: acknowledge it and echo the new state like HA does.
+            self.service_calls.append(message)
+            conn.push({"id": message["id"], "type": "result", "success": True, "result": None})
+            if b.get("actuation_silent"):
+                return
+            entity = message["target"]["entity_id"]
+            data = message.get("service_data") or {}
+            at = datetime.now(UTC)
+            if message["domain"] == "switch":
+                value: Any = "on" if message["service"] == "turn_on" else "off"
+            elif message["domain"] == "number":
+                value = data["value"]
+            else:
+                value = datetime.fromtimestamp(data["timestamp"], UTC).isoformat()
+            old = self.states.get(entity, {})
+            payload = ha_state(entity, value, at, attributes=old.get("attributes"))
+            self.states[entity] = payload
+            conn.push_state(payload)
         elif kind == "call_service":
             self.service_calls.append(message)
             if b.get("weather_error"):

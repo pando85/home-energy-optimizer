@@ -181,6 +181,78 @@ class _RuntimeCollector(Collector):
         climate = snap.get("climate_shadow")
         if climate is not None:
             yield from _climate_families(climate)
+        actuator = snap.get("actuator")
+        if actuator is not None:
+            yield from _actuator_families(actuator)
+
+
+def _actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
+    """The actuator's scrape-time gauges (prefix ``battery_optimizer_actuator_``; ADR-0007)."""
+    from .actuator import ACTUATOR_MODES, GUARD_REASONS
+
+    name = f"{PREFIX}_actuator"
+
+    def gauge(suffix: str, doc: str, value: float | None) -> GaugeMetricFamily:
+        family = GaugeMetricFamily(f"{name}_{suffix}", doc, labels=[])
+        if value is not None:
+            family.add_metric([], float(value))
+        return family
+
+    mode = GaugeMetricFamily(f"{name}_mode", "1 for the actuation mode", labels=["mode"])
+    for m in ACTUATOR_MODES:
+        mode.add_metric([m], 1.0 if m == a.get("mode") else 0.0)
+    yield mode
+    yield gauge("kill_switch_on", "1 while the owner's kill switch is on", a.get("kill_switch"))
+    yield gauge(
+        "in_control", "1 while the actuator owns the Omnibattery controls", a.get("in_control")
+    )
+    active = set(a.get("reasons") or ())
+    ok = GaugeMetricFamily(
+        f"{name}_guard_ok", "1 when the last tick applied the intent (no guard reason)", labels=[]
+    )
+    if a.get("ticked"):
+        ok.add_metric([], 0.0 if active else 1.0)
+    yield ok
+    reasons = GaugeMetricFamily(
+        f"{name}_guard_reason", "1 for each guard reason active at the last tick", labels=["reason"]
+    )
+    for reason in GUARD_REASONS:
+        reasons.add_metric([reason], 1.0 if reason in active else 0.0)
+    yield reasons
+    yield gauge(
+        "alert", "1 while writes fail (fell back to safe idle, or even that failed)", a["alert"]
+    )
+    for suffix, key, doc in (
+        ("desired_pd_target_watts", "desired_pd_target_w", "Requested PD grid-import target"),
+        ("desired_allow_charge", "desired_allow_charge", "Requested charge permission (1 = on)"),
+        (
+            "desired_allow_discharge",
+            "desired_allow_discharge",
+            "Requested discharge permission (1 = on)",
+        ),
+        (
+            "desired_max_discharge_watts",
+            "desired_max_discharge_w",
+            "Requested system discharge cap",
+        ),
+        (
+            "observed_pd_target_watts",
+            "observed_pd_target_w",
+            "PD grid-import target as Home Assistant reports it",
+        ),
+        (
+            "observed_battery_power_watts",
+            "observed_battery_ac_power_w",
+            "Measured battery AC power: + charge, - discharge (absent when stale)",
+        ),
+        (
+            "observed_grid_power_watts",
+            "observed_grid_power_w",
+            "Measured grid power: + import (absent when stale)",
+        ),
+        ("house_load_watts", "house_load_w", "Estimated house load: grid - battery AC power"),
+    ):
+        yield gauge(suffix, doc, a.get(key))
 
 
 #: Values of the ``status`` label of the gate state set.
@@ -264,7 +336,9 @@ def _climate_families(c: dict[str, Any]) -> Iterable[Metric]:
 
 
 class ServiceMetrics:
-    def __init__(self, snapshot: Callable[[], dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self, snapshot: Callable[[], dict[str, Any]] | None = None, *, actuation: bool = False
+    ) -> None:
         # ``*_created`` series double the exposition for no use here (process-wide switch).
         disable_created_metrics()
         self.registry = CollectorRegistry(auto_describe=False)
@@ -412,8 +486,54 @@ class ServiceMetrics:
         for direction in ("charge", "discharge"):
             self.shadow_planned_energy.labels(direction=direction)
             self.shadow_actual_energy.labels(direction=direction)
+        if actuation:  # dry_run / live only: the shadow exposition stays as it was
+            self._register_actuation()
         if snapshot is not None:
             r.register(_RuntimeCollector(snapshot))
+
+    def _register_actuation(self) -> None:
+        from .actuator import SAFE_IDLE_REASONS, WRITE_FAILURE_REASONS, WRITE_ROLES
+
+        r = self.registry
+        self.actuator_writes = Counter(
+            f"{PREFIX}_actuator_writes",
+            "Omnibattery writes by role and result (ok = sent and read back; dry_run = not sent)",
+            ["role", "result"],
+            registry=r,
+        )
+        self.actuator_write_failures = Counter(
+            f"{PREFIX}_actuator_write_failures",
+            "Failed write attempts by reason (each retry counts)",
+            ["reason"],
+            registry=r,
+        )
+        self.actuator_safe_idles = Counter(
+            f"{PREFIX}_actuator_safe_idles",
+            "Entries into safe idle (both direction switches off) by reason",
+            ["reason"],
+            registry=r,
+        )
+        self.actuator_heartbeats = Counter(
+            f"{PREFIX}_actuator_heartbeats",
+            "Heartbeats to the HA watchdog helper by result",
+            ["result"],
+            registry=r,
+        )
+        # 0 until the first write confirmed by readback.
+        self.actuator_last_write = Gauge(
+            f"{PREFIX}_actuator_last_successful_write_timestamp_seconds",
+            "Unix time of the last write confirmed by readback",
+            registry=r,
+        )
+        for role in WRITE_ROLES:
+            for result in ("ok", "failed", "dry_run"):
+                self.actuator_writes.labels(role=role, result=result)
+        for reason in WRITE_FAILURE_REASONS:
+            self.actuator_write_failures.labels(reason=reason)
+        for reason in SAFE_IDLE_REASONS:
+            self.actuator_safe_idles.labels(reason=reason)
+        for result in ("ok", "failed", "dry_run"):
+            self.actuator_heartbeats.labels(result=result)
 
     def render(self) -> bytes:
         return generate_latest(self.registry)

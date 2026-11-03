@@ -7,11 +7,15 @@ PROD-C1 to C3). It is a single resident process that reads Home Assistant and Pr
 same MPC kernel as the offline benchmarks every 15 minutes, records the resulting **shadow** plans,
 and compares them with what the native battery controller actually did.
 
-**There is no actuation path.** The Home Assistant adapters cannot write a state or call an actuating
-service (see [Safety](#safety)), there is no Modbus code, and plans are stored as intents that are never
-sent anywhere. The one service call they can make is the non-mutating `weather.get_forecasts` query used by
-the [weather-forecast archive](#passive-archives). Live actuation is Phase D and is neither built nor
-authorized.
+**In `mode: shadow` (the default) there is no actuation path.** The Home Assistant adapters cannot write a
+state or call an actuating service (see [Safety](#safety)), there is no Modbus code, and plans are stored as
+intents that are never sent anywhere. The one service call they can make is the non-mutating
+`weather.get_forecasts` query used by the [weather-forecast archive](#passive-archives).
+
+`mode: dry_run` and `mode: live` add the actuator of
+[ADR-0007](adr/0007-live-battery-control.md) (Accepted 2026-11-03): it maps the current slot's intent to
+Omnibattery's Home Assistant entities, `dry_run` only records the writes, `live` sends them through a narrow,
+mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 
 ## Architecture
 
@@ -42,8 +46,9 @@ authorized.
 
 | Module (`battery_optimizer.service`) | Role |
 |---|---|
-| `config` | `config/service.yaml` + environment; only `mode: shadow` is accepted |
-| `ha_guard` | Read-only allowlist for every WebSocket frame and REST request (plus the one `weather.get_forecasts` exception) |
+| `config` | `config/service.yaml` + environment; `mode: shadow` (default), `dry_run` or `live` |
+| `ha_guard` | Read-only allowlist for every WebSocket frame and REST request (plus the one `weather.get_forecasts` exception, and in `live` only the Omnibattery write allowlist) |
+| `actuator` | `dry_run`/`live` only: guard, intent → Omnibattery mapping, ordered writes with readback, kill switch, heartbeat ([ADR-0007](adr/0007-live-battery-control.md)) |
 | `ha_client` | WebSocket session (auth, subscribe, resync, heartbeat, reconnect) and GET-only REST |
 | `entity_store` | Latest state per entity, ordered by HA source time, freshness from `last_reported` |
 | `pvpc` | Publication-aware price curve from `sensor.esios_pvpc` attributes |
@@ -153,6 +158,9 @@ Omnibattery entities exist, map `battery_soc` plus either `battery_power` (signe
 control surface (`number.*_pd_target_grid_power`, `switch.*_battery_allow_charge/discharge`, system
 caps — where `0` means *unlimited*) to `observed`, and switch to `soc_source: entity`.
 
+The `actuation:` section is read only in `dry_run` and `live` (it is validated in every mode); see
+[Live control](#live-control-dry_run-and-live).
+
 The optional `archive:` section switches the two [passive archives](#passive-archives) on; without it
 both are off, so a deployed config must carry it. The `climate_shadow:` section (off by default) runs the
 [climate shadow](#climate-shadow-track-b2); its three Home Assistant helpers are those of the homelab
@@ -164,7 +172,7 @@ The variables the service reads (the complete table for every command is in
 | Variable | Purpose | Default |
 |---|---|---|
 | `BATTERY_OPTIMIZER_HA_URL` | Home Assistant base URL (the in-cluster Service URL, set by the homelab manifest) | unset → not ready |
-| `BATTERY_OPTIMIZER_HA_TOKEN` / `BATTERY_OPTIMIZER_HA_TOKEN_FILE` | Read-only, non-admin long-lived token (value or mounted file) | unset |
+| `BATTERY_OPTIMIZER_HA_TOKEN` / `BATTERY_OPTIMIZER_HA_TOKEN_FILE` | Non-admin long-lived token (value or mounted file): the read-only `battery-optimizer` user's in `shadow`/`dry_run`, the separate `battery-optimizer-live` user's in `live` | unset |
 | `BATTERY_OPTIMIZER_PROMETHEUS_URL` | The long-term Prometheus holding the `hass_*` series (in-cluster Service URL) | unset → not ready |
 | `BATTERY_OPTIMIZER_DATA_DIR` | Store root (`/data` on a PVC); must be outside a git tree | `~/data/energy-baseline` |
 | `BATTERY_OPTIMIZER_CONFIG` | `tariff.yaml` | `config/tariff.yaml` |
@@ -185,7 +193,7 @@ return 405). Bind address `0.0.0.0`, container port **8080**.
 |---|---|
 | `/health/live` | `{"status": "alive"}` — the process and its event loop are up |
 | `/health/ready` | `{ready, inputs_ready, reasons, details}`; 200 or 503 |
-| `/status` | Adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), code version, config hash |
+| `/status` | Mode, adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), code version, config hash; in `dry_run`/`live` also `actuator` (kill switch, in control, guard reasons, desired and observed state, alert, last error, import-trip hold, last tick / confirmed write / heartbeat) |
 | `/plan` | Latest plan with its snapshot summary, solver result and intents, plus the current intent (all flagged `shadow`) |
 | `/metrics` | Prometheus exposition |
 
@@ -239,6 +247,16 @@ ID, price, timestamp or household reading is a label.
 | `climate_shadow_rmse_kelvin`, `climate_shadow_skill_ratio`, `climate_shadow_abs_bias_kelvin`, `climate_shadow_origins` | gauge | `window` (`legacy`, `new`), `horizon` (`1h`, `6h`, `12h`, `24h`) |
 | `climate_shadow_daily_heat_mdape_ratio`, `climate_shadow_valid_weeks`, `climate_shadow_top_offset_share_ratio` | gauge | `window` |
 | `climate_shadow_gate` | gauge 0/1 (state set) | `window`, `criterion` (the six of the preregistration and `verdict`), `status` (`PASS`, `FAIL`, `UNDETERMINED`) |
+| `actuator_mode` | gauge 0/1 (`dry_run`/`live` only, like every `actuator_*`) | `mode` |
+| `actuator_kill_switch_on`, `actuator_in_control`, `actuator_guard_ok`, `actuator_alert` | gauge 0/1 | — |
+| `actuator_guard_reason` | gauge 0/1 | `reason` (the guard reasons of [Live control](#live-control-dry_run-and-live)) |
+| `actuator_desired_pd_target_watts`, `actuator_desired_allow_charge`, `actuator_desired_allow_discharge`, `actuator_desired_max_discharge_watts` | gauge (requested) | — |
+| `actuator_observed_pd_target_watts`, `actuator_observed_battery_power_watts` (+ charge), `actuator_observed_grid_power_watts`, `actuator_house_load_watts` | gauge (observed; absent when stale) | — |
+| `actuator_writes_total` | counter | `role` (`allow_charge`, `allow_discharge`, `max_discharge_power`, `power_limits`, `pd_target`, `heartbeat`), `result` (`ok`, `failed`, `dry_run`) |
+| `actuator_write_failures_total` | counter (each attempt) | `reason` (`ha_error`, `readback_timeout`, `forbidden`) |
+| `actuator_safe_idles_total` | counter | `reason` (guard reasons, `write_failed`, `shutdown`) |
+| `actuator_heartbeats_total` | counter | `result` (`ok`, `failed`, `dry_run`) |
+| `actuator_last_successful_write_timestamp_seconds` | gauge (0 until the first confirmed write) | — |
 
 Suggested alerts (homelab): `ready == 0` for 30 m; `ha_connected == 0` for 10 m;
 `input_stale{role="grid_power"} == 1` for 15 m; `plan_age_seconds > 1800`;
@@ -248,7 +266,10 @@ Suggested alerts (homelab): `ready == 0` for 30 m; `ha_connected == 0` for 10 m;
 `increase(weather_forecast_fetches_total{result="failed"}[3h]) > 2`. A PVPC snapshot only exists when the sensor
 changes, so alert on `increase(pvpc_snapshots_total{result="failed"}[1h]) > 0` rather than on staleness. Climate
 shadow (when enabled): `climate_shadow_up == 0` for 2 h, `time() - climate_shadow_last_run_timestamp_seconds
-> 7200`, or `increase(climate_shadow_runs_total{result="error"}[6h]) > 2`.
+> 7200`, or `increase(climate_shadow_runs_total{result="error"}[6h]) > 2`. Actuator (`live`): `actuator_alert == 1`
+for 2 m; `actuator_in_control == 1 and actuator_guard_ok == 0` for 30 m;
+`increase(actuator_heartbeats_total{result="failed"}[10m]) > 0`;
+`actuator_guard_reason{reason="import_over_cap"} == 1`.
 
 ## Store
 
@@ -264,6 +285,7 @@ files `0600`, directories `0700`:
 | `pvpc_snapshots/date=YYYY-MM-DD/pvpc_snapshots.jsonl` | One row per PVPC sensor state change (see [Passive archives](#passive-archives)) |
 | `weather_forecasts/date=YYYY-MM-DD/weather_forecasts.jsonl` | One row per fetched HA weather forecast (see [Passive archives](#passive-archives)) |
 | `climate_{decisions,scores,days,models}/date=YYYY-MM-DD/*.jsonl` | The [climate shadow](#climate-shadow-track-b2)'s records (only when it is enabled) |
+| `actuation/date=YYYY-MM-DD/actuation.jsonl` | `dry_run`/`live` only: one row per actuator tick that wrote (or would write) or changed state: kill switch, guard reasons, intent, desired and observed state, each write with its result, heartbeat, alert ([Live control](#live-control-dry_run-and-live)) |
 
 JSONL rows are appended with a single `O_APPEND` write plus `fsync`; readers skip a torn last line.
 The store is private household data: it never leaves the PVC and is never committed.
@@ -500,6 +522,86 @@ with no battery and the counterfactual is the virtual battery, which estimates t
 but does **not** satisfy exit gate C. `exit_gate.met` requires at least 14 local days with ≥ 90 %
 coverage on the `native_battery` basis.
 
+## Live control (dry_run and live)
+
+Decision and rationale: [ADR-0007](adr/0007-live-battery-control.md) (Accepted 2026-11-03). Module:
+`service/actuator.py`.
+
+Two limits stay separate: the battery's own maximum charge/discharge power (2500 W, Omnibattery's per-battery
+`number.venus_max_charge_power` / `number.venus_max_discharge_power`, minimum 800 W; never written by the
+service) and the house limit, grid import while charging at or below `import_cap_w` (4500 W; the 5 kW contract
+trips instantly).
+
+Every `actuation.tick_interval_s` (30 s), at every slot open, after every new plan and after every HA resync,
+the actuator takes the intent frozen for the current slot and maps it to Omnibattery's entities:
+
+| Intent | Direction switches | PD grid target (W, + import) | System power limits |
+|---|---|---|---|
+| `idle` | charge off, discharge off | `neutral_pd_target_w` (0) | untouched |
+| `charge` at P W | discharge off, charge on | `min(house load + P, import_cap_w, entity max)` (never negative) | untouched |
+| `discharge` at P W | charge off, discharge on | `discharge_margin_w` (+50) | on, discharge cap `max(P, min_discharge_cap_w)` (never 0 = unlimited) |
+| safe idle | charge off, discharge off | untouched | untouched |
+
+House load = grid power − battery AC power, charge positive (`battery_ac_power_sign` turns the sensor's sign
+into that convention). Writes go restrictive first (switches off, discharge cap, power limits on, PD target,
+switch on), one at a time, each confirmed by readback within `readback_timeout_s` and retried up to
+`command_policy.max_attempts`; a write that still fails drops to safe idle and sets `actuator_alert`. Only the
+charge-mode PD target's load tracking is rate limited (a change of `min_setpoint_change_w`, not within
+`min_command_interval_s` of the last write); switch edges, mode changes, a reconcile that switches a direction
+on, the discharge margin and the discharge cap are always written. Every write except a `turn_off` re-checks the
+kill switch first; if it went off mid-reconcile the actuator aborts to safe idle and hands control back.
+
+Omnibattery bounds the PD target by the batteries' summed charge limit (±2500 W on the installation), so the
+written charge target is `min(house load + P, import_cap_w, entity max)`; the desired state records the value
+actually written and `clamped` when it was cut. The charge is therefore at most 2500 W − house load (about
+2 kW at night): a known limitation, see [ADR-0007](adr/0007-live-battery-control.md#follow-ups).
+
+**Guard** (any failure → safe idle, recorded with the reason): `import_over_cap` (measured import above
+`import_cap_w + import_guard_margin_w` while charge is on: charge off at once, and charge refused for
+`import_trip_hold_s`), `ha_not_synced`, `kill_switch_off`, `no_plan`, `plan_expired`, `inputs_not_ready`,
+`intent_expired`, `plan_not_from_this_process`, `grid_power_stale`, `battery_soc_stale`,
+`battery_power_stale`, `battery_unresponsive` (`entities.battery_liveness` not exactly `None`),
+`price_stale`, `integration_unhealthy` (status not in `healthy_states`). Battery SOC and AC power are
+checked for availability only by default (present, not `unavailable`/`unknown`, numeric; SOC within 0..100):
+Omnibattery reports them only on change and HA does not refresh `last_reported` for an unchanged value, so an
+idle battery's readings look hours old while healthy. With
+`ha_not_synced` nothing can be sent; with `kill_switch_off` nothing is written except one safe idle on the
+`on → off` edge.
+
+**Kill switch and heartbeat.** Writes happen only while `actuation.entities.kill_switch`
+(`input_boolean.battery_optimizer_live`) is `on`; the service never writes it. Every reconciled `live` tick
+sets `input_datetime.battery_optimizer_heartbeat` to now; an HA watchdog (YAML in
+[ADR-0007](adr/0007-live-battery-control.md#home-assistant-helpers-and-watchdog-homelab-proposed-not-in-this-repository))
+turns both direction switches off when it is older than 5 minutes while the kill switch is on. A tick that
+cannot even confirm safe idle sends no heartbeat.
+
+**Restart and shutdown.** Plans live only in memory; the actuator acts only on intents of plans solved by
+this process, so after a restart it holds safe idle until a fresh plan's slot opens. A graceful stop (SIGTERM)
+cancels the actuator loop and sets safe idle before the HA session closes (`shutdown_timeout_s`).
+
+**`dry_run`** runs all of the above (kill switch included) and records every write with `result: dry_run`
+under `actuation/` and in `actuator_writes_total{result="dry_run"}`; nothing is sent, because the HA client
+has no write allowlist outside `live`. It plans each write against a simulated state of the entities it would
+already have written (the real ones never change), so a stable situation records no repeated writes.
+
+The actuator also wakes on a kill-switch change, and on a grid reading above
+`import_cap_w + import_guard_margin_w` while charging, at most once per `tick_interval_s`.
+
+Configuration keys (`actuation:` in `config/service.yaml`; defaults in parentheses): `entities.*` (eleven
+entity IDs, all required outside shadow, including `battery_liveness`, deployed as
+`sensor.omnibattery_non_responsive_batteries`: Omnibattery keeps the last SOC and AC power values when
+Modbus fails, so this is the check that catches a silent battery), `battery_ac_power_sign` (none: required outside shadow),
+`tick_interval_s` (30), `import_cap_w` (4500), `import_guard_margin_w` (200), `import_trip_hold_s` (300),
+`neutral_pd_target_w` (0), `discharge_margin_w` (50), `min_discharge_cap_w` (100), `max_discharge_cap_w`
+(2500), `healthy_states` (`balanced`, `charging`, `discharging`), `command_policy.max_attempts` (3),
+`command_policy.min_setpoint_change_w` (100), `command_policy.min_command_interval_s` (30),
+`readback_timeout_s` (10), `shutdown_timeout_s` (15), `freshness_s.grid_power` (30),
+`freshness_s.battery_soc` (null = availability only), `freshness_s.battery_ac_power` (null; a number of
+seconds enables an age test). Validation: `import_cap_w + import_guard_margin_w` < 5000 (the contract),
+`discharge_margin_w` > 0, `tick_interval_s` ≤ 120, `0 < min_discharge_cap_w ≤ max_discharge_cap_w ≤ 2500`.
+`mode: live` also requires
+`planning.soc_source: entity`. The section is excluded from the plan's config hash.
+
 ## Safety
 
 * WebSocket: every outgoing frame is checked against the allowlist `auth`, `ping`,
@@ -517,9 +619,22 @@ coverage on the `native_battery` basis.
   reaches the socket. It is non-mutating: the service only returns the forecast the weather entity already
   holds, it changes no state and operates no device. The only caller is the passive forecast archive, which
   builds the frame with `ha_guard.weather_forecast_request`. REST `POST` stays forbidden.
+* **Live write path (`mode: live` only).** The runtime hands the WebSocket client an `ActuationAllowlist`
+  only in `live`; `shadow` and `dry_run` pass none, so every write is refused as above. With it, a
+  `call_service` frame passes only as `{"id", "type": "call_service", "domain", "service", "target":
+  {"entity_id": "<one entity>"}, "service_data": {...}}` for `switch.turn_on`/`turn_off` on the two direction
+  switches and the power-limit switch, `number.set_value` on the PD grid target (`value` in `[0,
+  import_cap_w]`) and the system discharge cap (`value` in `[min_discharge_cap_w, max_discharge_cap_w]`, so
+  never the `0` that means unlimited), and `input_datetime.set_datetime` (`timestamp`) on the heartbeat. A list
+  of entities, another entity or service, an out-of-bounds or non-numeric value, `return_response` or any other
+  field raises `ForbiddenHACallError`. The kill switch is never writable. The only builder is
+  `ha_guard.actuation_request`.
 * The HTTP API has no writable route. Tests assert all of the above and statically keep Modbus/MQTT/
   HA libraries and HTTP write calls out of the package.
-* Use a **non-admin, read-only** HA user's token; the service never needs more.
+* Use a **non-admin** HA user's token. `shadow`/`dry_run` use the read-only `battery-optimizer` user's token.
+  `live` uses a separate token of the dedicated non-admin user `battery-optimizer-live` (group
+  `system-users`, local only), kept in its own Vault KV path when deployed. Home Assistant cannot restrict a
+  token to particular entities or services, so for that user the `ha_guard` allowlist is the restriction.
 
 ## Local run
 

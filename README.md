@@ -7,8 +7,10 @@
 PVPC-aware home battery dispatch optimizer for Home Assistant. It ships an offline extraction, dataset
 and benchmark pipeline ([ADR-0003](docs/adr/0003-phase1-measurement-and-baseline.md)) plus a resident
 **shadow** service that runs the same MPC live against read-only Home Assistant and Prometheus data
-([docs/service.md](docs/service.md)). It currently runs in shadow mode only: plans are recorded and
-compared with the native battery behaviour, and nothing is ever actuated.
+([docs/service.md](docs/service.md)). It is deployed in shadow mode: plans are recorded and compared with
+the native battery behaviour, and nothing is actuated. A `dry_run` and a `live` mode that drive the battery
+through Omnibattery's Home Assistant entities are built behind an explicit config switch and an owner kill
+switch ([ADR-0007](docs/adr/0007-live-battery-control.md), accepted 2026-11-03).
 
 ## Architecture
 
@@ -56,8 +58,8 @@ compared with the native battery behaviour, and nothing is ever actuated.
 | /metrics -> Prometheus, alerts, Grafana                                 |
 +------------------------------------------------------------------------+
 
-FUTURE ACT (NOT CONNECTED): DispatchIntent -> safety guard -> HA adapter
-                            -> Omnibattery PD -> Marstek Venus E
+ACT (built, OFF: mode shadow): DispatchIntent -> safety guard -> ha_guard allowlist
+                               -> Omnibattery PD -> Marstek Venus E (ADR-0007)
 Current SOC source: simulated; real battery/Omnibattery HA entities absent.
 ```
 
@@ -67,7 +69,8 @@ The first three supply independent inputs to the optimizer. The battery model is
 shared with simulation and backtesting; it does **not** consume the forecasts.
 **Price Outlook** currently reads published PVPC prices, not predicted prices.
 The shadow service uses **simulated SOC** until the battery entities are available.
-There is no path to live actuation; the ACT line is a future design only.
+The ACT line runs only with `mode: live` in the deployed `service.yaml` and the owner's kill switch on;
+`mode: dry_run` records the writes without sending them.
 
 See [planning component responsibilities](docs/architecture.md#planning-components) and the
 **individual component roadmaps** for scoped improvements and acceptance gates:
@@ -112,7 +115,8 @@ The minimal environment:
 
 - `BATTERY_OPTIMIZER_DATA_DIR`: private dataset store, **outside** any git worktree (default `~/data/energy-baseline`).
 - `BATTERY_OPTIMIZER_CONFIG`: tariff configuration file (default `config/tariff.yaml`).
-- `BATTERY_OPTIMIZER_HA_TOKEN`: read-only Home Assistant token, needed for HA extraction, `ha-states` and `serve`.
+- `BATTERY_OPTIMIZER_HA_TOKEN`: non-admin Home Assistant token, needed for HA extraction, `ha-states` and `serve`
+  (used read-only except by `serve` in `mode: live`).
 
 The full table, the data directory rules and the secrets policy are in
 [docs/configuration.md](docs/configuration.md).

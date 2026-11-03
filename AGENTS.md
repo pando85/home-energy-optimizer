@@ -57,11 +57,18 @@ just release           # cut a release (see the release skill)
 - The data directory (`BATTERY_OPTIMIZER_DATA_DIR`, default `~/data/energy-baseline`) must stay outside
   the repository; the code refuses a path inside a git tree. The default keeps the pre-rename name on
   purpose.
-- Shadow phase: the project reads and benchmarks only. Do not add write credentials, service calls to
-  Home Assistant, or any actuation of the battery or other devices. Home Assistant tokens must be
-  read-only. The single exception is the non-mutating `weather.get_forecasts` query (with
-  `return_response`) of the passive forecast archive, allowed only by the narrow check in
-  `service/ha_guard.py`; do not widen it.
+- Shadow by default: `serve` reads and benchmarks only unless the deployed `service.yaml` says `mode: live`
+  (`mode: dry_run` computes and records writes, sends nothing). The only write path is the live actuator of
+  [ADR-0007](docs/adr/0007-live-battery-control.md): in `mode: live` only, and only through
+  `service/ha_guard.py`'s `ActuationAllowlist` — `switch.turn_on/off` on the two Omnibattery direction switches
+  and the system power-limit switch, `number.set_value` on the PD grid target and the system discharge cap
+  (bounded values), `input_datetime.set_datetime` on the heartbeat helper, one entity per call, gated by the
+  owner's kill switch (never written). Do not widen it, do not add any other service call, Modbus, REST write
+  or device, and never make `live` a default. The other exception is the non-mutating
+  `weather.get_forecasts` query (with `return_response`) of the passive forecast archive, allowed only by the
+  narrow check in `service/ha_guard.py`; do not widen it. Home Assistant tokens belong to non-admin users:
+  the read-only `battery-optimizer` user's outside `mode: live`, the separate `battery-optimizer-live`
+  user's only in `mode: live`. Never commit a token value.
 - The container image holds no data and no git; `BATTERY_OPTIMIZER_GIT_SHA` is the build-time commit
   identity.
 

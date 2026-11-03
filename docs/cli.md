@@ -20,7 +20,7 @@ The modules that have no CLI surface are described in [Architecture](architectur
 | `report`       | **functional** | Generate monthly reconciliation report         |
 | `inspect-sql`  | **functional** | Inspect DuckDB SQL queries                     |
 | `ha-states`    | **functional** | Read Home Assistant enum state history (read-side, deduplicated, as-of) |
-| `serve`        | **functional** | Resident shadow service: read-only HA/Prometheus, live MPC, intents recorded never sent ([docs](service.md)) |
+| `serve`        | **functional** | Resident service: shadow by default (read-only HA/Prometheus, live MPC, intents recorded never sent); `dry_run`/`live` actuator behind `mode:` ([docs](service.md)) |
 | `shadow-report`| **functional** | Shadow plans vs native battery behaviour: coverage, energy, cost, SOC violations |
 | `climate-shadow-report` | **functional** | Private: the preregistered section-A gates of the climate shadow (B2) from the store |
 | `mirror`       | deferred     | Deferred — not implemented in Phase 1          |

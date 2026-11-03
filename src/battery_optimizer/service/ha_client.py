@@ -21,6 +21,12 @@ inside :class:`GuardedConnection`, and the REST client checks every request in a
 allowlist — whatever the caller asks for.  The single exception is
 :meth:`HAWebSocketClient.get_weather_forecast` (``weather.get_forecasts`` with a
 response, a query that changes nothing; see :mod:`~battery_optimizer.service.ha_guard`).
+
+In ``mode: live`` only, the WebSocket client is built with an
+:class:`~battery_optimizer.service.ha_guard.ActuationAllowlist` and
+:meth:`HAWebSocketClient.actuate` can send the allowlisted Omnibattery writes (ADR-0007);
+without one (shadow, dry_run) it raises before anything is sent.  The REST client stays
+GET-only in every mode.
 """
 
 from __future__ import annotations
@@ -42,7 +48,13 @@ import httpx
 from .clock import Clock
 from .config import HomeAssistantSettings, Secret
 from .entity_store import EntityStore, UpdateResult, parse_ha_state
-from .ha_guard import check_rest_request, check_ws_frame, weather_forecast_request
+from .ha_guard import (
+    ActuationAllowlist,
+    actuation_request,
+    check_rest_request,
+    check_ws_frame,
+    weather_forecast_request,
+)
 
 __all__ = [
     "GuardedConnection",
@@ -98,11 +110,12 @@ class WSTransport(Protocol):
 class GuardedConnection:
     """Wraps a connection so every outgoing frame is checked against the allowlist."""
 
-    def __init__(self, inner: WSConnection) -> None:
+    def __init__(self, inner: WSConnection, actuation: ActuationAllowlist | None = None) -> None:
         self._inner = inner
+        self._actuation = actuation
 
     async def send(self, text: str) -> None:
-        check_ws_frame(text)
+        check_ws_frame(text, self._actuation)
         await self._inner.send(text)
 
     async def recv(self) -> str:
@@ -205,6 +218,7 @@ class HAWebSocketClient:
         on_update: Callable[[UpdateResult], None] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         rng: random.Random | None = None,
+        actuation: ActuationAllowlist | None = None,
     ) -> None:
         if not settings.url or not settings.token:
             raise ValueError("Home Assistant URL and token are required")
@@ -219,6 +233,7 @@ class HAWebSocketClient:
         self._on_update = on_update
         self._sleep = sleep
         self._rng = rng or random.Random()
+        self._actuation = actuation
         self._ids = itertools.count(1)
         self._pending: dict[int, asyncio.Future[Mapping[str, Any]]] = {}
         self._subscription_id: int | None = None
@@ -246,7 +261,7 @@ class HAWebSocketClient:
             else:
                 synced_before = self.stats.resyncs
                 try:
-                    await self._session(GuardedConnection(conn))
+                    await self._session(GuardedConnection(conn, self._actuation))
                 except asyncio.CancelledError:
                     raise
                 except HAAuthError as exc:
@@ -421,6 +436,35 @@ class HAWebSocketClient:
         if not isinstance(forecast, list):
             raise HACommandError("weather_forecast", f"no forecast list for {entity_id}")
         return forecast
+
+    async def actuate(
+        self,
+        domain: str,
+        service: str,
+        entity_id: str,
+        service_data: Mapping[str, Any] | None = None,
+    ) -> None:
+        """One allowlisted live write over the synced session (``mode: live`` only).
+
+        Raises :class:`~battery_optimizer.service.ha_guard.ForbiddenHACallError` when the
+        frame is outside the allowlist (always, without one), :class:`HACommandError` when
+        there is no synced session or HA refuses or does not acknowledge the call, and
+        :class:`HAConnectionClosedError` when the session ends meanwhile.  Success means HA
+        executed the service, not that the entity (or the battery) reached the new state.
+        """
+        message = actuation_request(
+            next(self._ids), domain, service, entity_id, service_data, self._actuation
+        )
+        conn, reader = self._conn, self._reader_task
+        if conn is None or reader is None or not self.stats.synced:
+            raise HACommandError("actuation", "no synced Home Assistant session")
+        try:
+            await self._request(conn, message, stage="actuation", reader=reader)
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            raise HAConnectionClosedError("actuation: session ended") from None
 
     async def _reader(self, conn: GuardedConnection) -> None:
         while True:

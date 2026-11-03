@@ -7,11 +7,18 @@
 # BATTERY_OPTIMIZER_PROMETHEUS_URL.  Override this whole file with
 # BATTERY_OPTIMIZER_SERVICE_CONFIG.
 #
-# SHADOW ONLY: the service has no actuation path.  Its Home Assistant adapter refuses
+# mode: shadow (default) has no actuation path.  Its Home Assistant adapter refuses
 # every WebSocket message type outside a read-only allowlist and every REST method but
 # GET, so nothing in this file can make it write a state.  The one service call it can
 # make is the non-mutating `weather.get_forecasts` query (see `archive:` below); every
 # other service call is refused in code, whatever this file says.
+#
+# mode: dry_run computes and records (service/v1/actuation/) every Omnibattery write the
+# `actuation:` section below would make, and sends nothing.  mode: live sends them, and only
+# them: the guard admits switch.turn_on/off, number.set_value and input_datetime.set_datetime
+# on exactly the entities of `actuation.entities` (never the kill switch), with bounded values
+# (ADR-0007).  REST stays GET-only in every mode.  live uses the separate token of the non-admin
+# HA user battery-optimizer-live (own Vault KV path); shadow/dry_run the read-only one.
 version: 1
 mode: shadow
 timezone: Europe/Madrid
@@ -142,6 +149,64 @@ archive:
     type: hourly            # hourly | daily | twice_daily
     interval_minutes: 60
     offset_minutes: 5
+
+# Live battery control through Omnibattery (ADR-0007).  Read only in dry_run / live; shadow
+# ignores it (it is still validated).  mode: live also needs planning.soc_source: entity.
+actuation:
+  entities:
+    # Owner's kill switch (HA helper, created by hand; only read).  Nothing is written while
+    # it is not `on`; its on -> off edge sets safe idle once.
+    kill_switch: input_boolean.battery_optimizer_live
+    # Heartbeat helper (has_date + has_time) the HA watchdog automation checks (live only).
+    heartbeat: input_datetime.battery_optimizer_heartbeat
+    allow_charge: switch.venus_battery_allow_charge
+    allow_discharge: switch.venus_battery_allow_discharge
+    pd_target: number.omnibattery_pd_target_grid_power         # + = grid import target (W)
+    power_limits: switch.omnibattery_system_power_limits
+    max_discharge_power: number.omnibattery_system_max_discharge_power  # 0 = UNLIMITED
+    integration_status: sensor.omnibattery_integration_status
+    battery_ac_power: sensor.venus_ac_power
+    battery_soc: sensor.venus_battery_soc                       # %
+    # Optional: its state must be exactly `None` (Omnibattery's healthy text); anything else,
+    # missing or unavailable holds safe idle (guard reason battery_unresponsive).
+    battery_liveness: sensor.omnibattery_non_responsive_batteries
+  # +1 when sensor.venus_ac_power is positive while CHARGING, -1 when positive while
+  # discharging.  NOT MEASURED YET: dry_run / live refuse to start while it is null.
+  battery_ac_power_sign: null
+  tick_interval_s: 30             # <= 120: well inside the 5-minute heartbeat watchdog
+  # Highest grid-import target ever written: contracted import 5.0 kW and the meter trips
+  # instantly on overload.  The guard refuses any number.set_value above it.  Omnibattery
+  # bounds the PD target to its entity max (2500 W here), so the written target is
+  # min(house load + P, import_cap_w, entity max).
+  import_cap_w: 4500
+  # Measured import above import_cap_w + this while charging: charge off at once, and charge
+  # intents refused for import_trip_hold_s.  import_cap_w + this must stay below 5000.
+  import_guard_margin_w: 200
+  import_trip_hold_s: 300
+  neutral_pd_target_w: 0          # PD grid target in a planned idle
+  discharge_margin_w: 50          # > 0: small import while discharging, never export
+  min_discharge_cap_w: 100        # the discharge cap is never written below this (0 = unlimited)
+  # Venus E V3 limit: its own max charge/discharge is 2500 W (number.venus_max_charge_power /
+  # number.venus_max_discharge_power, min 800, never written here).  Separate from import_cap_w.
+  max_discharge_cap_w: 2500       # <= 2500
+  # Omnibattery integration_status values in which the intent may be applied; any other
+  # (manual, grid_charging, backup_mode, initializing, a competing strategy...) holds safe idle.
+  healthy_states: [balanced, charging, discharging]
+  command_policy:
+    max_attempts: 3               # sends per write, the first included
+    min_setpoint_change_w: 100    # smaller numeric changes within one mode are not sent
+    min_command_interval_s: 30    # nor a numeric rewrite of the same entity within this
+  readback_timeout_s: 10          # per send: the entity must read back the new value
+  shutdown_timeout_s: 15          # safe idle at SIGTERM (uvicorn grace is 20 s)
+  # Maximum age (s since HA last reported) of the guard's inputs; null = availability only
+  # (present, not unavailable/unknown, numeric; SOC within 0-100), no age test.
+  freshness_s:
+    grid_power: 30
+    # null: Omnibattery's coordinator entities report only on change (last_reported is not
+    # refreshed for an unchanged value, verified 2026-11-03), so an idle battery's SOC and AC
+    # power look hours old while healthy; they turn `unavailable` when Modbus polling fails.
+    battery_soc: null
+    battery_ac_power: null
 
 # Climate shadow (track B2): B0's thermal model and the price-blind comfort MPC on live data,
 # every `replan_every_minutes` of the MPC config (hourly), `offset_minutes` after the boundary.

@@ -213,7 +213,7 @@ def test_token_file(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     ("override", "message"),
     [
-        ({"mode": "live"}, "only 'shadow'"),
+        ({"mode": "autopilot"}, "is not one of"),
         ({"planning.soc_source": "entity"}, "needs entities.battery_soc"),
         ({"planning.solve_timeout_s": 500}, "solve_timeout_s"),
         ({"entities.bogus": "sensor.x"}, "unknown entity roles"),
