@@ -1123,7 +1123,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         "build: battery.commissioned_at="
         + (commissioned_at.isoformat() if commissioned_at else "null (no battery recorded)")
         + " (config/service.yaml); from that instant the assumption is refused and gross load is "
-        "grid + charge - discharge"
+        "grid - charge + discharge"
     )
     return 0
 

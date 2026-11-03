@@ -188,7 +188,7 @@ reconstruct gross load; without it the build refuses.
 `tariff.yaml`, whose hash is part of every dataset id). A window that ends at or before that instant
 (or with none recorded) is built exactly as before. A window that reaches it reads the counters, and
 every interval ending after that instant (one that merely touches it counts) gets
-`gross_kwh = raw_grid_kwh + charge - discharge` with `battery_absent=false`; `--assume-no-battery`
+`gross_kwh = raw_grid_kwh - charge + discharge` with `battery_absent=false`; `--assume-no-battery`
 never covers those intervals. An interval whose counter is unknown has `gross_kwh` null and
 `energy_quality` `battery_counters_missing` (or `battery_gross_negative` when the meters disagree). If
 the counters are not configured, or have fewer than two samples in the archive, the build exits 1

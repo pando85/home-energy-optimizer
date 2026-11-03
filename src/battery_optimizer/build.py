@@ -299,7 +299,7 @@ discharge would hide inside it.  A window that reaches the commissioning instant
 reads the battery AC charge and discharge energy counters (``entities.battery_charge_energy``
 and ``entities.battery_discharge_energy``, the names the live service already uses) and every
 interval ending after that instant (so one that merely touches it, when the instant is not on
-the 15-minute grid, counts too) gets ``gross = raw_grid + charge - discharge``
+the 15-minute grid, counts too) gets ``gross = raw_grid - charge + discharge``
 (:func:`reconstruct_gross_load`, the arithmetic of ``service/history.py``) with
 ``battery_absent=False``.  The no-battery assumption never covers such an interval: when a
 counter is unknown the interval is null with ``energy_quality="battery_counters_missing"``
@@ -2061,7 +2061,7 @@ def resolve_gross_load(raw_grid_kwh: float | None, *, battery_active: bool) -> f
     raw grid exactly.  That identity is a property of the installation before the
     battery is commissioned, not a general truth: once a battery dispatches,
     channel 1 measures net grid exchange and gross load is
-    ``raw_grid + charge - discharge`` from the battery AC counters, which is
+    ``raw_grid - charge + discharge`` from the battery AC counters, which is
     :func:`reconstruct_gross_load`'s job.  Rather than let the identity silently
     become wrong, this seam raises when asked for it under an active battery.
 
@@ -2087,7 +2087,7 @@ _ALLOCATION_RANK = {ALLOCATION_EXACT: 0, ALLOCATION_ESTIMATED_BOUNDARY: 1}
 def reconstruct_gross_load(
     grid: IntervalEnergy, charge: IntervalEnergy, discharge: IntervalEnergy
 ) -> tuple[float | None, str, str]:
-    """Gross load of one interval once the battery runs: ``raw_grid + charge - discharge``.
+    """Gross load of one interval once the battery runs: ``raw_grid - charge + discharge``.
 
     Same convention as ``service/history.py``: the grid counter is net exchange with the
     grid, the charge counter is AC energy that went into the battery (not house load) and
@@ -2108,7 +2108,7 @@ def reconstruct_gross_load(
         return None, grid.energy_quality, grid.allocation_quality
     if charge.raw_grid_kwh is None or discharge.raw_grid_kwh is None:
         return None, ENERGY_BATTERY_COUNTERS_MISSING, grid.allocation_quality
-    gross = grid.raw_grid_kwh + charge.raw_grid_kwh - discharge.raw_grid_kwh
+    gross = grid.raw_grid_kwh - charge.raw_grid_kwh + discharge.raw_grid_kwh
     if gross < 0.0:
         return None, ENERGY_BATTERY_GROSS_NEGATIVE, grid.allocation_quality
     inputs = (grid, charge, discharge)
@@ -3039,7 +3039,7 @@ def _battery_reconstruction_manifest(
     unusable = [i for i in after if gross[i] is None]
     reasons = Counter(quality[i] for i in unusable)
     return {
-        "rule": "gross_kwh = raw_grid_kwh + charge_kwh - discharge_kwh, per interval",
+        "rule": "gross_kwh = raw_grid_kwh - charge_kwh + discharge_kwh, per interval",
         "commissioned_at": iso_z(battery.commissioned_at),
         "charge_entity": telemetry.charge_entity,
         "discharge_entity": telemetry.discharge_entity,
@@ -3117,7 +3117,7 @@ def build_dataset(
             ignores it: the dataset, its id and its manifest are what they were before
             the battery code existed.  A window that reaches ``commissioned_at`` reads
             the counters, and every interval ending after that instant gets
-            ``gross = raw_grid + charge - discharge`` or is null with an explicit
+            ``gross = raw_grid - charge + discharge`` or is null with an explicit
             ``energy_quality`` reason; if the counters are not configured or not in the
             archive at all, the build is refused.
 
