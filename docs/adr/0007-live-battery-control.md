@@ -69,7 +69,7 @@ Two separate limits apply and both stay in force:
    | Intent | Direction switches | PD grid target (W, + import) | System power limits |
    |---|---|---|---|
    | `idle` | charge **off**, discharge **off** | `neutral_pd_target_w` (0) | untouched |
-   | `charge` at P W | discharge **off**, charge **on** | `min(house load + P, import_cap_w)`, floored, never negative | untouched |
+   | `charge` at P W | discharge **off**, charge **on** | `min(house load + P, import_cap_w, entity max)`, floored, never negative | untouched |
    | `discharge` at P W | charge **off**, discharge **on** | `discharge_margin_w` (+50: a small import, never export) | limits **on**, discharge cap `max(P, min_discharge_cap_w)` |
    | *safe idle* | charge **off**, discharge **off** | untouched | untouched |
 
@@ -78,15 +78,28 @@ Two separate limits apply and both stay in force:
    house load reduces the battery's charge rather than raising the import: the import never exceeds the target,
    and the target never exceeds `import_cap_w` (4500 W, 500 W below the contracted 5.0 kW).
 
+   **Effective ceiling (verified on the installation 2026-11-03):** Omnibattery bounds
+   `number.omnibattery_pd_target_grid_power` to the batteries' summed charge limit, here **min −2500 / max
+   2500 W**. The target actually written is therefore `min(house load + P, import_cap_w, entity max)`, and the
+   desired state records that value with `clamped` set when it was cut. So the charge is at most
+   2500 W − house load: with a low night load (~500 W) about **2 kW**, not the battery's 2.5 kW (known limitation,
+   see [Follow-ups](#follow-ups)). The grid import while charging is at most 2500 W today, well under the
+   4500 W house guard.
+
 5. **Ordering, one write in flight, readback.** Writes are ordered restrictive first: switch off the direction(s)
    being removed, set the discharge cap, enable the power limits, set the PD target, and only then switch on the
    direction being enabled. Each write is confirmed by reading the entity back from the entity store (WebSocket
    events, with a REST GET every 2 s while waiting) within `readback_timeout_s` (10 s, the `CommandPolicy` lease);
    a refused or unconfirmed write is retried up to `max_attempts` (3, the first included); a guard refusal
    (`forbidden`) is never retried. When a write still fails the actuator falls back to safe idle and raises the
-   alert metric. Within one mode a numeric setpoint is rewritten only when it moves by `min_setpoint_change_w`
-   (100 W) and not within `min_command_interval_s` (30 s) of the previous write to that entity; switch edges and
-   mode changes are never rate limited. `CommandPolicy` (`dispatch.py`) carries these values.
+   alert metric. Only the charge-mode PD target's load tracking is rate limited: it is rewritten only when it
+   moves by `min_setpoint_change_w` (100 W) and not within `min_command_interval_s` (30 s) of the previous write.
+   Switch edges, mode changes, any reconcile that switches a direction on, the discharge margin (an unrestored
+   margin could leave a 0 W target, i.e. export) and the discharge cap are never rate limited. `CommandPolicy`
+   (`dispatch.py`) carries these values. Every write except a `turn_off` re-checks the kill switch from the
+   entity store first (a reconcile with readbacks can take tens of seconds): when it is off the reconcile aborts,
+   sets safe idle and hands control back. In `dry_run` the writes are planned against a simulated state of the
+   entities it would have written, so a stable situation records no repeated writes and the churn is real.
 
 6. **Safety guard before every tick and every write** (`Actuator.guard`). Any failing check selects safe idle
    and is recorded with its reason: no intent for the current slot (`no_plan`, `plan_expired`,
@@ -99,7 +112,12 @@ Two separate limits apply and both stay in force:
    other value — `manual`, `grid_charging`, `backup_mode`, `initializing`, a competing Omnibattery strategy,
    `unavailable` — holds safe idle). **Hard rule:** measured import above `import_cap_w + import_guard_margin_w`
    (4700 W) while charge is on switches charge off at once, regardless of the plan, and refuses charge intents for
-   `import_trip_hold_s` (300 s); a grid reading above that level wakes the actuator without waiting for the tick.
+   `import_trip_hold_s` (300 s); a grid reading above that level while charging wakes the actuator without waiting
+   for the tick (at most once per tick interval). A kill-switch change also wakes it.
+
+   Config validation keeps the margins honest: `import_cap_w + import_guard_margin_w` < 5000 W (the contract),
+   `discharge_margin_w` > 0, `tick_interval_s` ≤ 120 s (well inside the 5-minute watchdog),
+   `0 < min_discharge_cap_w ≤ max_discharge_cap_w ≤ 2500` W (the battery's rating).
 
    *Battery freshness (verified on the installation 2026-11-03):* Omnibattery's coordinator entities report only
    on change, and HA does not refresh `last_reported` for an unchanged value on this install (`get_states` and
@@ -149,9 +167,14 @@ Two separate limits apply and both stay in force:
 - **HA host loss** (power, crash, network). Omnibattery, the watchdog and the heartbeat all live in HA; whether
   the Venus keeps its last power or idles on its own without HA is **untested** (implementation plan
   **TODO-5.4**). Until that test is done, unattended live operation relies on the device's own behaviour.
-- The import cap regulates on the meter feedback through Omnibattery's PD; a step in house load (the 3 kW heat-pump
-  heater, an oven) is absorbed by reducing the battery charge, but transients faster than the PD loop are not
-  bounded by this code.
+- **Load steps while charging.** The import while charging is bounded by the PD target (≤ 2500 W today, see
+  decision 4) through Omnibattery's PD loop on the meter feedback. A sudden step in house load (the 3 kW heat-pump
+  heater, an oven) is absorbed by reducing the battery charge, but not instantly: Omnibattery limits the change of
+  its output per cycle (`number.omnibattery_pd_controller_max_power_change`, currently 800 W per ~2 s cycle), so a
+  3 kW step while charging at 2 kW gives a few seconds of import up to roughly 5 kW before the charge is backed
+  off. The rollout therefore recommends that the **owner raises that setting to 2000 W**; it is an Omnibattery
+  tuning value, set by the owner and **never written by the service** (it is not in the allowlist). Transients
+  faster than the PD loop are not bounded by this code.
 - The sign of `sensor.venus_ac_power` has not been measured; `dry_run` and `live` refuse to start until it is set.
   A wrong sign makes the house-load estimate wrong by twice the battery power; the import cap still holds.
 - Competing Omnibattery features (predictive grid charging, time slots, price controls, hourly balance) must be
@@ -165,6 +188,11 @@ Two separate limits apply and both stay in force:
   `actuation/` records are the authority for what was sent. Relabel them in a later change.
 - The watchdog deliberately does **not** latch the kill switch off: after a recovery the service retakes control
   only with a plan it has solved itself (decision 7), which is the intended behaviour for unattended running.
+- **Charge power ceiling (known limitation).** Through the PD target the charge is at most 2500 W − house load
+  (about 2 kW at night), because Omnibattery bounds the target by the batteries' charge limit. Evaluate a
+  force-charge path (for example Omnibattery's charge features or a per-battery setpoint) that reaches the full
+  2.5 kW while keeping the 4500 W house guard; until then the planner's charge intents above that are clamped and
+  recorded as `clamped`.
 
 ## Home Assistant helpers and watchdog (homelab, proposed; not in this repository)
 
@@ -214,6 +242,7 @@ automation:
             - switch.venus_battery_allow_discharge
       - action: persistent_notification.create
         data:
+          notification_id: battery_optimizer_watchdog
           title: Battery optimizer watchdog
           message: >-
             Direction switches turned off ({{ 'kill switch off' if trigger.id == 'kill_switch_off'
@@ -221,7 +250,14 @@ automation:
 ```
 
 The `kill_switch_off` trigger repeats the service's own `on → off` safe idle inside HA, so the battery idles
-even when the service is down when the owner flips the switch.
+even when the service is down when the owner flips the switch. The fixed `notification_id` replaces the previous
+notification instead of stacking one per minute. The YAML uses the `triggers:` / `trigger:` / `actions:` /
+`action:` syntax and needs **Home Assistant 2024.10 or later**.
+
+Neither the watchdog nor the service's safe idle resets the PD grid target or the discharge cap: they may stay at
+the last written values (for example a 2500 W import target). That is fine because both direction switches are
+off, so Omnibattery neither charges nor discharges; the next charge or discharge always writes its target before
+switching its direction on.
 
 **Tokens.** `live` uses its own token, separate from the existing read-only `battery-optimizer` user's token
 (which `shadow` and `dry_run` keep using): the dedicated non-admin HA user **`battery-optimizer-live`** (group
@@ -235,10 +271,14 @@ restriction. No token value is ever written in this repository or its config.
    watchdog with the kill switch **off**. Measure the
    sign of `sensor.venus_ac_power` with a supervised charge from the Omnibattery UI and set
    `battery_ac_power_sign`; map `entities.battery_soc` (and the battery energy counters) and set
-   `planning.soc_source: entity`. Disable Omnibattery's competing economic strategies.
+   `planning.soc_source: entity`. Disable Omnibattery's competing economic strategies. Raise
+   `number.omnibattery_pd_controller_max_power_change` from 800 to 2000 W (owner setting, never written by the
+   service) so a load step while charging is backed off within one PD cycle (see [Not solved](#not-solved-by-this-adr)).
 2. **dry_run for 1–2 days:** `mode: dry_run`, kill switch **on** (nothing is sent in `dry_run`; the switch only
    makes the rehearsal faithful). Review `service/v1/actuation/` and the `actuator_*` metrics: guard reasons, the
-   mapping at every slot, setpoint churn, the house-load estimate against the meter.
+   mapping at every slot, setpoint churn (planned against the simulated written state, so a repeated write is
+   real churn), how often a charge is `clamped` by the 2500 W target bound, the house-load estimate against the
+   meter.
 3. **live, supervised:** kill switch **off**, `mode: live` with the `battery-optimizer-live` user's token (its
    own Vault KV path) mounted instead of the read-only one, roll out, then switch the kill switch **on** while
    watching the meter. Verify readback, heartbeat, a slot change in each direction, the watchdog (stop the pod
@@ -250,7 +290,9 @@ restriction. No token value is ever written in this repository or its config.
 Turn `input_boolean.battery_optimizer_live` off (immediate: safe idle once, then no writes; the watchdog repeats
 the safe idle in HA). Then set `mode: shadow` (or `dry_run`), mount the read-only `battery-optimizer` token again
 and roll out; a shadow pod has no write path.
-Restore Omnibattery's native configuration by hand (the optimizer never restores an earlier configuration).
+Restore Omnibattery's native configuration by hand (the optimizer never restores an earlier configuration). Safe
+idle leaves the PD target and the discharge cap at their last values (see above): set them back before switching a
+direction on for native control.
 
 ## Alternatives considered
 
