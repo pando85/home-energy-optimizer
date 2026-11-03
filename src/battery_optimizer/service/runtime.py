@@ -396,6 +396,7 @@ class ShadowService:
     # ------------------------------------------------------------------ HA hooks
 
     def _on_synced(self) -> None:
+        self.observer.mark_synced(self.clock.now())
         self._ha_synced.set()
         self._wake_actuator()
         self._spawn(
@@ -404,6 +405,11 @@ class ShadowService:
         self._request_replan("resync")
 
     def _on_disconnected(self) -> None:
+        # A silently dead session is only noticed by the heartbeat: back the end of the
+        # sync window off to the last moment the session was proven alive.
+        ha = self.config.home_assistant
+        unproven = timedelta(seconds=ha.heartbeat_interval_s + ha.heartbeat_timeout_s)
+        self.observer.mark_unsynced(self.clock.now() - unproven)
         detail = self.ha.stats.last_error if self.ha else None
         self._spawn(self._record_event("ha_disconnected", {"error": detail}))
 

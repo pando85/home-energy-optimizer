@@ -29,8 +29,12 @@ T0 = utc(2026, 10, 20, 10, 0)
 END = T0 + timedelta(minutes=15)
 
 
-def _observer(tmp_path):
-    return SlotObserver(
+CHARGE = "sensor.venus_total_charging_energy"
+DISCHARGE = "sensor.venus_total_discharging_energy"
+
+
+def _observer(tmp_path, synced_from=T0 - timedelta(hours=4)):
+    observer = SlotObserver(
         service_config(
             tmp_path,
             **ENTITY_MODE,
@@ -39,6 +43,9 @@ def _observer(tmp_path):
             },
         )
     )
+    if synced_from is not None:
+        observer.mark_synced(synced_from)
+    return observer
 
 
 def _feed(observer, entity, value, at, unit):
@@ -67,10 +74,10 @@ def test_counter_edges_power_average_and_soc(tmp_path):
     assert (m.soc_start_frac, m.soc_end_frac) == (pytest.approx(0.40), pytest.approx(0.42))
 
 
-def test_stale_counter_edge_falls_back_to_labelled_power_integral(tmp_path):
-    obs = _observer(tmp_path)
+def test_unsynced_counter_edge_falls_back_to_labelled_power_integral(tmp_path):
+    obs = _observer(tmp_path, synced_from=T0 + timedelta(seconds=60))  # started mid-slot
     energy = "sensor.shellyem_main_channel_1_energy"
-    _feed(obs, energy, 100.0, T0 - timedelta(seconds=600), "kWh")  # too old for the edge
+    _feed(obs, energy, 100.0, T0 - timedelta(seconds=600), "kWh")  # not vouched for at T0
     _feed(obs, energy, 100.3, T0 + timedelta(seconds=890), "kWh")
     for k in range(0, 900, 60):
         _feed(obs, "sensor.shellyem_main_channel_1_power", 800, T0 + timedelta(seconds=k), "W")
@@ -86,6 +93,68 @@ def test_counter_reset_is_unknown_not_negative(tmp_path):
     _feed(obs, energy, 0.1, T0 + timedelta(seconds=890), "kWh")
     m = obs.measure(T0, END)
     assert m.grid_kwh is None and m.grid_energy_source is None
+
+
+def test_unchanged_counters_keep_their_value_at_the_edges(tmp_path):
+    """Live discharge at ~260 W: the idle charge counter has not changed for hours."""
+    obs = _observer(tmp_path)
+    energy = "sensor.shellyem_main_channel_1_energy"
+    _feed(obs, energy, 50.0, T0 - timedelta(hours=2), "kWh")  # zero grid import for hours
+    _feed(obs, energy, 50.05, T0 + timedelta(seconds=700), "kWh")
+    _feed(obs, CHARGE, 3.21, T0 - timedelta(hours=3), "kWh")
+    for k in range(-400, 900, 140):  # 0.01 kWh about every 140 s
+        _feed(obs, DISCHARGE, 1.0 + 0.01 * ((k + 400) // 140), T0 + timedelta(seconds=k), "kWh")
+    m = obs.measure(T0, END)
+    assert m.grid_energy_source == "counter" and m.grid_kwh == pytest.approx(0.05)
+    assert m.battery_energy_source == "counter"
+    assert m.battery_charge_kwh == 0
+    assert m.battery_discharge_kwh == pytest.approx(0.07)
+    assert m.gross_load_kwh(battery_mapped=True) == pytest.approx(0.12)
+
+
+def test_edges_need_the_session_in_sync_and_the_entity_available(tmp_path):
+    obs = _observer(tmp_path, synced_from=None)
+    _feed(obs, CHARGE, 3.0, T0 - timedelta(hours=1), "kWh")
+    _feed(obs, DISCHARGE, 1.0, T0 - timedelta(hours=1), "kWh")
+    _feed(obs, "sensor.test_soc", 40, T0 - timedelta(hours=1), "%")
+    obs.mark_synced(T0 + timedelta(seconds=5))  # e.g. the service started just after T0
+    m = obs.measure(T0, END)
+    assert (m.battery_charge_kwh, m.battery_discharge_kwh) == (None, None)
+    assert (m.soc_start_frac, m.soc_end_frac) == (None, pytest.approx(0.40))
+
+    obs.mark_unsynced(END - timedelta(seconds=30))  # disconnected across the next start
+    obs.mark_synced(END + timedelta(seconds=30))
+    nxt = obs.measure(END, END + timedelta(minutes=15))
+    assert nxt.battery_charge_kwh is None and nxt.soc_start_frac is None
+    assert nxt.soc_end_frac == pytest.approx(0.40)
+
+    later = END + timedelta(minutes=15)
+    gone = entity_state(DISCHARGE, "unavailable", later - timedelta(minutes=1))
+    obs.on_state(gone, UpdateResult.ACCEPTED)
+    m = obs.measure(later, later + timedelta(minutes=15))
+    assert m.battery_charge_kwh is None and m.battery_discharge_kwh is None
+    assert m.soc_start_frac == pytest.approx(0.40)
+
+
+def test_soc_age_test_still_applies_when_configured(tmp_path):
+    obs = SlotObserver(service_config(tmp_path, **ENTITY_MODE, **{"freshness_s.battery_soc": 600}))
+    obs.mark_synced(T0 - timedelta(hours=4))
+    _feed(obs, "sensor.test_soc", 40, T0 - timedelta(hours=1), "%")
+    _feed(obs, "sensor.test_soc", 41, T0 + timedelta(seconds=600), "%")
+    m = obs.measure(T0, END)
+    assert (m.soc_start_frac, m.soc_end_frac) == (None, pytest.approx(0.41))
+
+
+def test_a_numeric_counter_freshness_restores_the_edge_age_test(tmp_path):
+    config = service_config(tmp_path, **ENTITY_MODE, **{"freshness_s.battery_charge_energy": 900})
+    obs = SlotObserver(config)
+    obs.mark_synced(T0 - timedelta(hours=4))
+    _feed(obs, CHARGE, 3.0, T0 - timedelta(hours=1), "kWh")  # older than 900 s at both edges
+    _feed(obs, DISCHARGE, 1.0, T0 - timedelta(hours=1), "kWh")  # default: availability only
+    assert obs._counter_delta("battery_discharge_energy", T0, END) == 0
+    assert obs._counter_delta("battery_charge_energy", T0, END) is None
+    m = obs.measure(T0, END)
+    assert (m.battery_charge_kwh, m.battery_discharge_kwh) == (None, None)
 
 
 def test_bounded_hold_limits_coverage(tmp_path):

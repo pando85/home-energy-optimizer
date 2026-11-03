@@ -4,18 +4,25 @@ The store's listener feeds every accepted or refreshed state here, in source-tim
 order.  When a slot closes, its row is computed from those samples:
 
 * **Energy from counters first.**  Grid import (and battery charge/discharge when
-  mapped) is the difference of the cumulative counter at the two slot edges, the
-  edge value being the last reading at or before the edge and no older than
-  ``counter_max_age_s``.  Only when a counter edge is unknown does the row fall
-  back to integrating power (sample-and-hold, each sample held at most its
-  freshness limit), and it says so in ``*_energy_source``.
-* **SOC at the edges** is the last fresh reading at or before each edge.
+  mapped) is the difference of the cumulative counter at the two slot edges.
+  Only when a counter edge is unknown does the row fall back to integrating power
+  (sample-and-hold, each sample held at most its freshness limit), and it says so
+  in ``*_energy_source``.
+* **SOC at the edges** likewise.  The SOC and the battery counters add their
+  ``freshness_s`` age test only when it is a number (``null``, their default,
+  is availability only); the grid counter has none.
+* **The value at an edge** is the last reading at or before it, used only when
+  it is available and the HA session was in sync at the edge (a sync window opens
+  when ``get_states`` has been applied and closes on disconnect).  Within a sync
+  window every change reaches the store, so an unchanged reading is still the
+  value at the edge however old it is: Omnibattery reports on change only, and an
+  idle counter or SOC keeps a ``last_updated`` hours old while healthy.  An edge
+  before the first sync or inside a disconnection is unknown.
 * Every value carries its coverage; nothing missing is filled with zero.
 """
 
 from __future__ import annotations
 
-import math
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -116,6 +123,24 @@ class SlotObserver:
         self._context: dict[str, EntityState] = {}
         self.late_samples = 0
         self._closed_until: datetime | None = None
+        #: ``[start, end)`` windows in which the HA session was in sync; ``end`` None = open.
+        self._sync_windows: list[tuple[datetime, datetime | None]] = []
+
+    # -- HA session --------------------------------------------------------------
+
+    def mark_synced(self, at: datetime) -> None:
+        """The HA session has applied ``get_states``: changes from *at* on all arrive."""
+        if self._sync_windows and self._sync_windows[-1][1] is None:
+            return
+        self._sync_windows.append((at, None))
+
+    def mark_unsynced(self, at: datetime) -> None:
+        """The HA session ended at *at*: changes may be missed until the next sync."""
+        if self._sync_windows and self._sync_windows[-1][1] is None:
+            self._sync_windows[-1] = (self._sync_windows[-1][0], at)
+
+    def synced_at(self, at: datetime) -> bool:
+        return any(start <= at and (end is None or at < end) for start, end in self._sync_windows)
 
     # -- intake ----------------------------------------------------------------
 
@@ -138,12 +163,22 @@ class SlotObserver:
         for series in self._samples.values():
             while len(series) > 1 and series[1][0] <= horizon:
                 series.popleft()
+        self._sync_windows = [
+            (start, end) for start, end in self._sync_windows if end is None or end > horizon
+        ]
 
     # -- reductions --------------------------------------------------------------
 
-    def _edge_value(self, role: str, edge: datetime, max_age_s: float) -> float | None:
+    def _edge_value(
+        self, role: str, edge: datetime, max_age_s: float | None = None
+    ) -> float | None:
+        """Last reading at or before *edge*; ``None`` if unavailable or not vouched for.
+
+        Age alone never voids it (see the module notes); *max_age_s* is the optional,
+        explicitly configured age test (a numeric ``freshness_s`` of the role).
+        """
         series = self._samples.get(role)
-        if not series:
+        if not series or not self.synced_at(edge):
             return None
         best: tuple[datetime, float | None] | None = None
         for at, value in series:
@@ -153,7 +188,7 @@ class SlotObserver:
                 break
         if best is None or best[1] is None:
             return None
-        if (edge - best[0]).total_seconds() > max_age_s:
+        if max_age_s is not None and (edge - best[0]).total_seconds() > max_age_s:
             return None
         return best[1]
 
@@ -182,7 +217,9 @@ class SlotObserver:
         return area / covered, covered / span
 
     def _counter_delta(self, role: str, start: datetime, end: datetime) -> float | None:
-        max_age = self._config.observation.counter_max_age_s
+        # The grid counter: no age test.  The battery counters: their freshness_s, None
+        # (availability only) by default.
+        max_age = None if role == "grid_energy" else self._config.freshness_for(role)
         v0 = self._edge_value(role, start, max_age)
         v1 = self._edge_value(role, end, max_age)
         if v0 is None or v1 is None or v1 < v0:
@@ -240,8 +277,7 @@ class SlotObserver:
             discharge_kwh = max(-batt_avg, 0.0) * span_h / 1000.0
             battery_source = "power_integral"
 
-        soc_limit = cfg.freshness_for("battery_soc")
-        soc_age = math.inf if soc_limit is None else soc_limit  # None: availability only
+        soc_age = cfg.freshness_for("battery_soc")  # None: availability only
         soc_start = soc_end = None
         if "battery_soc" in self._roles:
             soc_start = self._edge_value("battery_soc", slot_start, soc_age)

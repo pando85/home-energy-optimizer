@@ -140,8 +140,6 @@ planning:
 observation:
   # How long after a slot ends late events may still land in it.
   slot_close_grace_s: 20
-  # A counter reading older than this at a slot edge is not used for that edge.
-  counter_max_age_s: 300
 
 # Passive, append-only data collection under <data_dir>/service/v1/.  Never read by the
 # planner; a failure is counted (battery_optimizer_*) and never affects readiness.

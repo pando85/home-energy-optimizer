@@ -43,6 +43,7 @@ def make_service(tmp_path, clock, *, entity_mode=False, planner=run_planner, **o
     )
     service.ha.stats.connected = True
     service.ha.stats.synced = True
+    service.observer.mark_synced(clock.now())
     return service
 
 
@@ -448,6 +449,55 @@ def test_slot_cycle_records_decision_measurements_and_counterfactual(tmp_path, c
     rows = _slot_rows(tmp_path)
     assert len(rows) == 1 and rows[0]["slot_start"] == first.isoformat()
     assert rows[0]["shadow"] is True
+
+
+def test_slot_record_uses_unchanged_battery_counters_within_a_sync(tmp_path, cleanup):
+    """Report-on-change counters: an idle direction is still known while HA stays in sync."""
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, entity_mode=True)
+    cleanup(service)
+
+    def counter(entity, value, at):
+        kwh = {"unit_of_measurement": "kWh"}
+        service.store.apply(entity_state(entity, value, at, attributes=kwh))
+
+    charge, discharge = (
+        "sensor.venus_total_charging_energy",
+        "sensor.venus_total_discharging_energy",
+    )
+    first = next_slot_boundary(NOW)
+    counter(charge, 3.21, NOW - timedelta(hours=3))
+    counter(discharge, 1.0, first - timedelta(minutes=8))
+    feed(service, first - timedelta(minutes=5), energy=1000.0)
+    counter(discharge, 1.05, first + timedelta(minutes=12))
+    feed(service, first + timedelta(minutes=13), energy=1000.02)
+    clock.set(first + timedelta(minutes=15, seconds=20))
+    record = run(service.close_slot(first))
+    measured = record["measured"]
+    assert measured["battery_energy_source"] == "counter"
+    assert (measured["battery_charge_kwh"], measured["battery_discharge_kwh"]) == (
+        0,
+        pytest.approx(0.05),
+    )
+    assert record["gross_load_kwh"] == pytest.approx(0.07)
+    assert record["counterfactual_cost_eur"] is not None
+
+    # HA drops across the next edge: that edge is unknown, not the last value.
+    second = first + timedelta(minutes=15)
+    clock.set(second + timedelta(minutes=14))
+    service._on_disconnected()
+    clock.set(second + timedelta(minutes=16))
+    service._on_synced()
+    clock.set(second + timedelta(minutes=16, seconds=20))
+    record = run(service.close_slot(second))
+    assert record["measured"]["battery_charge_kwh"] is None
+    assert record["measured"]["soc_end_frac"] is None
+    assert record["gross_load_kwh"] is None
+    fourth = second + timedelta(minutes=30)  # both edges after the resync
+    clock.set(fourth + timedelta(minutes=15, seconds=20))
+    record = run(service.close_slot(fourth))
+    assert record["measured"]["battery_discharge_kwh"] == 0
+    assert record["gross_load_kwh"] == 0
 
 
 def test_not_ready_at_slot_start_means_no_decision(tmp_path, cleanup):
