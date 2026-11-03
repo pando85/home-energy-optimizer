@@ -241,6 +241,13 @@ ACTUATION_DOMAINS: dict[str, str] = {
     "battery_liveness": "sensor",
 }
 
+#: Contracted import (W); the meter trips instantly above it.
+CONTRACTED_IMPORT_W = 5000.0
+#: Venus E V3 rated power (W): the discharge cap is never written above it.
+BATTERY_RATED_POWER_W = 2500.0
+#: Longest tick: well inside the HA watchdog's 5-minute heartbeat window.
+MAX_TICK_INTERVAL_S = 120.0
+
 #: Entities that may stay ``null`` even outside shadow mode.
 _OPTIONAL_ACTUATION_ENTITIES = frozenset({"battery_liveness"})
 
@@ -726,6 +733,26 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
     for key in ("neutral_pd_target_w", "discharge_margin_w"):
         if getattr(settings, key) > cap:
             raise ValueError(f"service config: {name}.{key} must not exceed import_cap_w")
+    if settings.discharge_margin_w <= 0:
+        raise ValueError(
+            f"service config: {name}.discharge_margin_w must be > 0 (a positive import while "
+            "discharging, never export)"
+        )
+    if cap + settings.import_guard_margin_w >= CONTRACTED_IMPORT_W:
+        raise ValueError(
+            f"service config: {name}.import_cap_w + import_guard_margin_w must stay below the "
+            f"{CONTRACTED_IMPORT_W:.0f} W contract (the meter trips instantly)"
+        )
+    if settings.tick_interval_s > MAX_TICK_INTERVAL_S:
+        raise ValueError(
+            f"service config: {name}.tick_interval_s must be <= {MAX_TICK_INTERVAL_S:.0f} s, well "
+            "inside the 5-minute heartbeat watchdog"
+        )
+    if settings.max_discharge_cap_w > BATTERY_RATED_POWER_W:
+        raise ValueError(
+            f"service config: {name}.max_discharge_cap_w must not exceed the battery's "
+            f"{BATTERY_RATED_POWER_W:.0f} W"
+        )
     if settings.min_discharge_cap_w > settings.max_discharge_cap_w:
         raise ValueError(
             f"service config: {name}.min_discharge_cap_w must not exceed max_discharge_cap_w"

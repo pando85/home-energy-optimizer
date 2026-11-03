@@ -61,7 +61,8 @@ ENTS = ActuationEntities(
 )
 SETTINGS = ActuationSettings(entities=ENTS, battery_ac_power_sign=1)
 SLOT = floor_slot(NOW, 900)  # 10:45Z; NOW = 10:50Z
-NUMBER_ATTRS = {"min": -5000, "max": 5000, "step": 1}
+# As on the installation: Omnibattery bounds the PD target by the batteries' charge limit.
+NUMBER_ATTRS = {"min": -2500, "max": 2500, "step": 1}
 CAP_ATTRS = {"min": 0, "max": 2500, "step": 1}
 
 
@@ -108,9 +109,19 @@ class FakeHA:
         self.calls: list[tuple[str, str, str, dict | None]] = []
         self.silent, self.refuse, self.forbid = set(silent), set(refuse), set(forbid)
         self.refuse_once: set[str] = set()
+        #: entity -> callable run after a write to it lands (e.g. the owner flips a switch)
+        self.after: dict[str, object] = {}
 
     async def send(self, domain, service, entity, data):
         self.calls.append((domain, service, entity, data))
+        try:
+            await self._apply(domain, service, entity, data)
+        finally:
+            hook = self.after.pop(entity, None)
+            if hook is not None:
+                hook()
+
+    async def _apply(self, domain, service, entity, data):
         if entity in self.forbid:
             raise ForbiddenHACallError("nope")
         if entity in self.refuse:
@@ -281,7 +292,7 @@ def test_planned_idle_turns_both_directions_off_then_resets_the_target():
 @pytest.mark.parametrize(
     ("grid", "ac", "power", "target", "clamped"),
     [
-        (4000, 0, 2000, 4500.0, True),  # never above the import cap
+        (4000, 0, 2000, 2500.0, True),  # never above min(import cap, entity max)
         (-300, 0, 100, 0.0, False),  # never a negative (export) target
         (1234.7, 0, 1000, 2234.0, False),  # rounded down
     ],
@@ -293,6 +304,23 @@ def test_charge_target_is_clamped_to_the_import_cap(grid, ac, power, target, cla
     record = tick(actuator, ctx(clock, intent("charge", power)))
     assert ha.writes()[0] == ("number.set_value", "omnibattery_pd_target_grid_power", target)
     assert record["desired"]["clamped"] is clamped
+
+
+def test_the_entity_maximum_is_the_effective_charge_ceiling():
+    # Omnibattery's PD target is bounded to +-2500 W (the batteries' summed charge limit).
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0)
+    clock.advance(1)
+    store.apply(
+        entity_state(
+            ENTS.pd_target, 0, clock.now(), attributes={"min": -2500, "max": 2500, "step": 10}
+        )
+    )
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("charge", 2500)))
+    assert ha.writes()[0] == ("number.set_value", "omnibattery_pd_target_grid_power", 2500.0)
+    assert record["desired"]["pd_target_w"] == 2500.0  # the value actually written
+    assert record["desired"]["clamped"] is True
 
 
 def test_battery_power_sign_is_configuration():
@@ -347,6 +375,81 @@ def test_small_or_too_frequent_setpoint_changes_are_not_sent():
     readings(1700, 1000)
     tick(actuator, ctx(clock, intent("charge", 1000)))
     assert ha.writes()[-1] == ("number.set_value", "omnibattery_pd_target_grid_power", 1700.0)
+
+
+def test_switching_a_direction_on_always_restores_its_numbers():
+    # Discharge was switched off from outside (watchdog / owner) and the target reset to 0:
+    # the 50 W margin is below min_setpoint_change_w, but it must be written before turn_on.
+    clock = FakeClock(NOW)
+    store = world(clock, grid=600, ac=0, discharge="on", limits="on", pd=50, cap=500)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("discharge", 500)))
+    assert ha.writes() == []
+    clock.advance(10)
+    store.apply(entity_state(ENTS.allow_discharge, "off", clock.now()))
+    store.apply(entity_state(ENTS.pd_target, 0, clock.now(), attributes=NUMBER_ATTRS))
+    store.apply(entity_state(GRID, 600, clock.now()))
+    tick(actuator, ctx(clock, intent("discharge", 500)))
+    assert ha.writes() == [
+        ("number.set_value", "omnibattery_pd_target_grid_power", 50.0),
+        ("switch.turn_on", "venus_battery_allow_discharge", None),
+    ]
+
+
+def test_the_discharge_margin_and_cap_are_never_rate_limited():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=600, ac=0, discharge="on", limits="on", pd=50, cap=500)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("discharge", 500)))
+    clock.advance(5)  # within min_command_interval_s, changes below min_setpoint_change_w
+    store.apply(entity_state(ENTS.pd_target, 0, clock.now(), attributes=NUMBER_ATTRS))
+    store.apply(entity_state(ENTS.max_discharge_power, 450, clock.now(), attributes=CAP_ATTRS))
+    store.apply(entity_state(GRID, 600, clock.now()))
+    tick(actuator, ctx(clock, intent("discharge", 500)))
+    assert ha.writes() == [
+        ("number.set_value", "omnibattery_system_max_discharge_power", 500.0),
+        ("number.set_value", "omnibattery_pd_target_grid_power", 50.0),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Kill switch re-checked before every enabling write
+# ---------------------------------------------------------------------------
+
+
+def test_kill_switch_off_mid_reconcile_aborts_before_enabling():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    # the owner turns the kill switch off while the PD target write is being read back
+    ha.after[ENTS.pd_target] = lambda: store.apply(
+        entity_state(ENTS.kill_switch, "off", clock.now())
+    )
+    record = tick(actuator, ctx(clock, intent("charge", 1000)))
+    assert ha.writes() == [("number.set_value", "omnibattery_pd_target_grid_power", 1400.0)]
+    assert ha.heartbeats() == []
+    assert actuator.reasons == ("kill_switch_off",)
+    assert actuator.desired == safe_idle("kill_switch_off")
+    assert not actuator.in_control and actuator.alert is None
+    assert record["writes"][-1]["result"] == "aborted"
+    # off stays off: nothing more is written
+    clock.advance(30)
+    store.apply(entity_state(GRID, 400, clock.now()))
+    tick(actuator, ctx(clock, intent("charge", 1000)))
+    assert len(ha.writes()) == 1
+
+
+def test_kill_switch_off_mid_reconcile_still_turns_the_direction_off():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=600, ac=-500, charge="on", pd=1400, cap=500)
+    actuator, ha, _ = make(clock, store)
+    ha.after[ENTS.allow_charge] = lambda: store.apply(
+        entity_state(ENTS.kill_switch, "off", clock.now())
+    )
+    tick(actuator, ctx(clock, intent("discharge", 500)))
+    # turn_off is never blocked; the cap write after it is
+    assert ha.writes() == [("switch.turn_off", "venus_battery_allow_charge", None)]
+    assert store.get(ENTS.allow_discharge).state == "off"
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +758,26 @@ def test_dry_run_sends_nothing_but_records_every_write():
     assert ha.calls == []
 
 
+def test_dry_run_plans_against_its_simulated_state_so_it_does_not_repeat():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=400, ac=0)
+    records: list = []
+    actuator, ha, _ = make(clock, store, mode="dry_run", records=records)
+    first = tick(actuator, ctx(clock, intent("charge", 1000)))
+    assert [w["role"] for w in first["writes"]] == ["pd_target", "allow_charge"]
+    clock.advance(30)
+    store.apply(entity_state(GRID, 400, clock.now()))
+    second = tick(actuator, ctx(clock, intent("charge", 1000)))
+    assert second["writes"] == [] and ha.calls == []
+    assert store.get(ENTS.allow_charge).state == "off"  # the real entity is untouched
+    # the charge target follows the load, subject to the same hysteresis as live
+    clock.advance(30)
+    store.apply(entity_state(GRID, 800, clock.now()))
+    third = tick(actuator, ctx(clock, intent("charge", 1000)))
+    assert [(w["role"], w["value"]) for w in third["writes"]] == [("pd_target", 1800.0)]
+    assert len(records) == 2
+
+
 def test_unchanged_ticks_are_not_recorded_again():
     clock = FakeClock(NOW)
     store = world(clock)
@@ -724,6 +847,11 @@ def test_the_actuation_section_does_not_change_the_plan_identity(tmp_path):
         ({**LIVE, "actuation.bogus": 1}, "unknown actuation keys"),
         ({**LIVE, "actuation.freshness_s.price": 1}, "unknown actuation.freshness_s keys"),
         ({**LIVE, "actuation.freshness_s.grid_power": None}, "freshness_s.grid_power"),
+        ({**LIVE, "actuation.discharge_margin_w": 0}, "discharge_margin_w must be > 0"),
+        ({**LIVE, "actuation.import_cap_w": 4800}, "below the 5000 W contract"),
+        ({**LIVE, "actuation.import_guard_margin_w": 500}, "below the 5000 W contract"),
+        ({**LIVE, "actuation.tick_interval_s": 121}, "tick_interval_s must be <= 120"),
+        ({**LIVE, "actuation.max_discharge_cap_w": 3000}, "battery's 2500 W"),
         ({**LIVE, "actuation.freshness_s.battery_soc": 0}, "freshness_s.battery_soc"),
         ({**LIVE, "actuation.entities.battery_liveness": "binary_sensor.x"}, "battery_liveness"),
     ],
@@ -820,6 +948,35 @@ def test_shadow_service_has_no_actuator_and_an_unchanged_surface(tmp_path, clean
     assert status["mode"] == "shadow" and "actuator" not in status
     assert status["actuation"].startswith("none (read-only adapters")
     assert b"actuator" not in service.metrics.render()
+
+
+def test_actuator_wakes_on_kill_switch_changes_and_debounced_over_cap_import(tmp_path, cleanup):
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock)
+    cleanup(service)
+    wake = service._actuator_wake
+
+    def grid(value):
+        clock.advance(2)
+        service.store.apply(entity_state(GRID, value, clock.now()))
+
+    grid(4800)  # over the cap, but not charging: no wake
+    assert not wake.is_set()
+    service.actuator.readings = {"allow_charge": True}
+    grid(4800)
+    assert wake.is_set()
+    wake.clear()
+    grid(4900)  # 2 s later: debounced
+    assert not wake.is_set()
+    clock.advance(30)
+    grid(4900)  # a tick interval later: wakes again
+    assert wake.is_set()
+    wake.clear()
+    grid(1000)  # under the cap
+    assert not wake.is_set()
+    clock.advance(1)
+    service.store.apply(entity_state(ENTS.kill_switch, "off", clock.now()))
+    assert wake.is_set()
 
 
 def test_restart_needs_a_plan_solved_by_this_process(tmp_path, cleanup):

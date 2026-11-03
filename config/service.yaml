@@ -173,20 +173,22 @@ actuation:
   # +1 when sensor.venus_ac_power is positive while CHARGING, -1 when positive while
   # discharging.  NOT MEASURED YET: dry_run / live refuse to start while it is null.
   battery_ac_power_sign: null
-  tick_interval_s: 30
+  tick_interval_s: 30             # <= 120: well inside the 5-minute heartbeat watchdog
   # Highest grid-import target ever written: contracted import 5.0 kW and the meter trips
-  # instantly on overload.  The guard refuses any number.set_value above it.
+  # instantly on overload.  The guard refuses any number.set_value above it.  Omnibattery
+  # bounds the PD target to its entity max (2500 W here), so the written target is
+  # min(house load + P, import_cap_w, entity max).
   import_cap_w: 4500
   # Measured import above import_cap_w + this while charging: charge off at once, and charge
-  # intents refused for import_trip_hold_s.
+  # intents refused for import_trip_hold_s.  import_cap_w + this must stay below 5000.
   import_guard_margin_w: 200
   import_trip_hold_s: 300
   neutral_pd_target_w: 0          # PD grid target in a planned idle
-  discharge_margin_w: 50          # small import while discharging: never export
+  discharge_margin_w: 50          # > 0: small import while discharging, never export
   min_discharge_cap_w: 100        # the discharge cap is never written below this (0 = unlimited)
   # Venus E V3 limit: its own max charge/discharge is 2500 W (number.venus_max_charge_power /
   # number.venus_max_discharge_power, min 800, never written here).  Separate from import_cap_w.
-  max_discharge_cap_w: 2500
+  max_discharge_cap_w: 2500       # <= 2500
   # Omnibattery integration_status values in which the intent may be applied; any other
   # (manual, grid_charging, backup_mode, initializing, a competing strategy...) holds safe idle.
   healthy_states: [balanced, charging, discharging]

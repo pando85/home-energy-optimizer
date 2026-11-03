@@ -538,16 +538,23 @@ the actuator takes the intent frozen for the current slot and maps it to Omnibat
 | Intent | Direction switches | PD grid target (W, + import) | System power limits |
 |---|---|---|---|
 | `idle` | charge off, discharge off | `neutral_pd_target_w` (0) | untouched |
-| `charge` at P W | discharge off, charge on | `min(house load + P, import_cap_w)` (never negative) | untouched |
+| `charge` at P W | discharge off, charge on | `min(house load + P, import_cap_w, entity max)` (never negative) | untouched |
 | `discharge` at P W | charge off, discharge on | `discharge_margin_w` (+50) | on, discharge cap `max(P, min_discharge_cap_w)` (never 0 = unlimited) |
 | safe idle | charge off, discharge off | untouched | untouched |
 
 House load = grid power − battery AC power, charge positive (`battery_ac_power_sign` turns the sensor's sign
 into that convention). Writes go restrictive first (switches off, discharge cap, power limits on, PD target,
 switch on), one at a time, each confirmed by readback within `readback_timeout_s` and retried up to
-`command_policy.max_attempts`; a write that still fails drops to safe idle and sets `actuator_alert`. Within one
-mode a numeric setpoint is resent only after a change of `min_setpoint_change_w` and not within
-`min_command_interval_s` of the last write to it.
+`command_policy.max_attempts`; a write that still fails drops to safe idle and sets `actuator_alert`. Only the
+charge-mode PD target's load tracking is rate limited (a change of `min_setpoint_change_w`, not within
+`min_command_interval_s` of the last write); switch edges, mode changes, a reconcile that switches a direction
+on, the discharge margin and the discharge cap are always written. Every write except a `turn_off` re-checks the
+kill switch first; if it went off mid-reconcile the actuator aborts to safe idle and hands control back.
+
+Omnibattery bounds the PD target by the batteries' summed charge limit (±2500 W on the installation), so the
+written charge target is `min(house load + P, import_cap_w, entity max)`; the desired state records the value
+actually written and `clamped` when it was cut. The charge is therefore at most 2500 W − house load (about
+2 kW at night): a known limitation, see [ADR-0007](adr/0007-live-battery-control.md#follow-ups).
 
 **Guard** (any failure → safe idle, recorded with the reason): `import_over_cap` (measured import above
 `import_cap_w + import_guard_margin_w` while charge is on: charge off at once, and charge refused for
@@ -574,7 +581,11 @@ cancels the actuator loop and sets safe idle before the HA session closes (`shut
 
 **`dry_run`** runs all of the above (kill switch included) and records every write with `result: dry_run`
 under `actuation/` and in `actuator_writes_total{result="dry_run"}`; nothing is sent, because the HA client
-has no write allowlist outside `live`.
+has no write allowlist outside `live`. It plans each write against a simulated state of the entities it would
+already have written (the real ones never change), so a stable situation records no repeated writes.
+
+The actuator also wakes on a kill-switch change, and on a grid reading above
+`import_cap_w + import_guard_margin_w` while charging, at most once per `tick_interval_s`.
 
 Configuration keys (`actuation:` in `config/service.yaml`; defaults in parentheses): `entities.*` (ten
 entity IDs, all required outside shadow, plus the optional `battery_liveness`, deployed as
@@ -585,7 +596,9 @@ entity IDs, all required outside shadow, plus the optional `battery_liveness`, d
 `command_policy.min_setpoint_change_w` (100), `command_policy.min_command_interval_s` (30),
 `readback_timeout_s` (10), `shutdown_timeout_s` (15), `freshness_s.grid_power` (30),
 `freshness_s.battery_soc` (null = availability only), `freshness_s.battery_ac_power` (null; a number of
-seconds enables an age test). `mode: live` also requires
+seconds enables an age test). Validation: `import_cap_w + import_guard_margin_w` < 5000 (the contract),
+`discharge_margin_w` > 0, `tick_interval_s` ≤ 120, `0 < min_discharge_cap_w ≤ max_discharge_cap_w ≤ 2500`.
+`mode: live` also requires
 `planning.soc_source: entity`. The section is excluded from the plan's config hash.
 
 ## Safety

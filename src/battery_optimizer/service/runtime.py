@@ -262,6 +262,7 @@ class ShadowService:
         self.actuator: Actuator | None = None
         self._actuator_task: asyncio.Task[None] | None = None
         self._actuator_wake = asyncio.Event()
+        self._overcap_wake_at: datetime | None = None
         if acting:
             self.actuator = Actuator(
                 settings=config.actuation,
@@ -357,11 +358,8 @@ class ShadowService:
 
     def _on_state(self, state: EntityState, result: UpdateResult) -> None:
         role = self.config.entities.role_of(state.entity_id)
-        if self.actuator is not None and role == "grid_power":
-            value = state.numeric()
-            act = self.config.actuation
-            if value is not None and value > act.import_cap_w + act.import_guard_margin_w:
-                self._wake_actuator()  # the import hard rule must not wait for the next tick
+        if self.actuator is not None:
+            self._actuation_wake_on(state, role)
         if (
             role == "price"
             and result is UpdateResult.ACCEPTED
@@ -1286,6 +1284,32 @@ class ShadowService:
     def _wake_actuator(self) -> None:
         if self.actuator is not None:
             self._actuator_wake.set()
+
+    def _actuation_wake_on(self, state: EntityState, role: str | None) -> None:
+        """Wake the actuator on a kill-switch change, and on over-cap import while charging.
+
+        The over-cap wake fires at most once per tick interval, so a long high load does not
+        turn into a tick (and its REST refreshes) every 2 s.
+        """
+        assert self.actuator is not None
+        act = self.config.actuation
+        if state.entity_id == act.entities.kill_switch:
+            self._wake_actuator()
+            return
+        if role != "grid_power":
+            return
+        value = state.numeric()
+        if value is None or value <= act.import_cap_w + act.import_guard_margin_w:
+            return
+        desired = self.actuator.desired
+        charging = self.actuator.readings.get("allow_charge") or (
+            desired is not None and desired.mode == "charge"
+        )
+        now = self.clock.now()
+        last = self._overcap_wake_at
+        if charging and (last is None or (now - last).total_seconds() >= act.tick_interval_s):
+            self._overcap_wake_at = now
+            self._wake_actuator()  # the import hard rule must not wait for the next tick
 
     def actuation_context(self, now: datetime) -> ActuationContext:
         """The intent frozen for the current slot and what the guard needs about it."""

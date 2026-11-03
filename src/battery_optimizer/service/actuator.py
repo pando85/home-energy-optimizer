@@ -24,9 +24,16 @@ discharge cap, enable the power limits, set the PD target, and only then switch 
 direction being enabled.  One write is in flight at a time and each is confirmed by reading
 the entity back from the entity store (WebSocket events, refreshed by REST GET) within
 ``readback_timeout_s``; a failed send or readback is retried up to ``max_attempts``, then the
-actuator falls back to safe idle and raises an alert.  Numeric setpoints within a mode are
-only rewritten when they move by ``min_setpoint_change_w`` and not more often than every
-``min_command_interval_s``; switch edges and mode changes are never rate limited.
+actuator falls back to safe idle and raises an alert.  Only the charge-mode PD target, while
+no direction is being switched on, is rate limited: it is rewritten when it moves by
+``min_setpoint_change_w`` and not more often than every ``min_command_interval_s``.  Switch
+edges, mode changes, the discharge margin and the discharge cap are always written.  Every
+write but a ``turn_off`` re-checks the kill switch first and aborts to safe idle when it is off.
+
+Numeric targets are bounded by the entity's own ``min``/``max`` as well as ours: Omnibattery
+bounds the PD target by the batteries' summed charge limit (±2500 W here), so the effective
+charge ceiling is ``min(import_cap_w, entity max)``; ``Desired`` carries the value actually
+written and ``clamped`` says when it was cut.
 
 The owner's kill switch gates everything: while it is off nothing is written, except one
 safe idle when it goes from on to off.  Each live tick that ends reconciled publishes a
@@ -51,7 +58,7 @@ from typing import TYPE_CHECKING, Any
 
 from .clock import Clock
 from .config import ActuationSettings
-from .entity_store import EntityState, EntityStore
+from .entity_store import EntityState, EntityStore, parse_ha_state
 from .ha_guard import ForbiddenHACallError
 
 if TYPE_CHECKING:
@@ -267,6 +274,9 @@ class Actuator:
         self.desired: Desired | None = None
         self._applied_mode: str | None = None
         self._last_write_at: dict[str, datetime] = {}
+        #: dry_run only: the state each would-be write leaves, so writes are planned against it.
+        self._simulated: dict[str, EntityState] = {}
+        self._aborted: str | None = None
         self.readings: dict[str, Any] = {}
         self.alert: str | None = None
         self.last_error: str | None = None
@@ -284,6 +294,21 @@ class Actuator:
             state = self._store.get(entity)
             return state.numeric() if state is not None else None
         return self._store.fresh_value(entity, now, max_age_s)
+
+    def _observed(self, entity: str | None) -> EntityState | None:
+        """The state writes are planned against: the store, or in dry_run the simulated one."""
+        if entity is not None and entity in self._simulated:
+            return self._simulated[entity]
+        return self._store.get(entity)
+
+    def _number_target(
+        self, entity: str | None, value: float, low: float, high: float
+    ) -> tuple[float, bool]:
+        """``(value to write, clamped)`` inside our ``[low, high]`` and the entity's own bounds."""
+        state = self._observed(entity)
+        ceiling = min(high, _attr(state, "max") if _attr(state, "max") is not None else high)
+        written = _quantize(value, state, low, high)
+        return written, value > ceiling + 1e-9
 
     def _switch_state(self, entity: str | None) -> bool | None:
         state = self._store.get(entity)
@@ -381,58 +406,77 @@ class Actuator:
 
     def desired_for(self, intent: ShadowIntent, readings: Mapping[str, Any]) -> Desired:
         """The mapping table of the module docstring (call only after a passing guard)."""
-        s = self.settings
+        s, e = self.settings, self.settings.entities
         load = readings.get("house_load_w")
         power = float(intent.target_power_w)
         if intent.mode == "charge":
             if load is None:
                 return safe_idle("battery_power_stale")
-            raw = load + power
-            target = min(max(raw, 0.0), s.import_cap_w)
+            # Effective ceiling min(import_cap_w, entity max): Omnibattery bounds the target by
+            # the batteries' charge limit, so the charge is at most that ceiling - house load.
+            target, clamped = self._number_target(
+                e.pd_target, float(math.floor(max(load + power, 0.0))), 0.0, s.import_cap_w
+            )
             return Desired(
                 mode="charge",
                 reason="intent",
                 allow_charge=True,
-                pd_target_w=float(math.floor(target)),
+                pd_target_w=target,
                 house_load_w=load,
-                clamped=raw > s.import_cap_w,
+                clamped=clamped,
             )
         if intent.mode == "discharge":
-            cap = min(max(power, s.min_discharge_cap_w), s.max_discharge_cap_w)
+            cap, clamped = self._number_target(
+                e.max_discharge_power,
+                max(power, s.min_discharge_cap_w),
+                s.min_discharge_cap_w,
+                s.max_discharge_cap_w,
+            )
+            margin, _ = self._number_target(e.pd_target, s.discharge_margin_w, 0.0, s.import_cap_w)
             return Desired(
                 mode="discharge",
                 reason="intent",
                 allow_discharge=True,
-                pd_target_w=s.discharge_margin_w,
+                pd_target_w=margin,
                 power_limits=True,
                 max_discharge_w=cap,
                 house_load_w=load,
-                clamped=power > s.max_discharge_cap_w,
+                clamped=clamped,
             )
-        return Desired(
-            mode="idle", reason="intent", pd_target_w=s.neutral_pd_target_w, house_load_w=load
-        )
+        neutral, _ = self._number_target(e.pd_target, s.neutral_pd_target_w, 0.0, s.import_cap_w)
+        return Desired(mode="idle", reason="intent", pd_target_w=neutral, house_load_w=load)
 
     def plan_writes(self, desired: Desired, now: datetime) -> list[Write]:
         """The writes that take the observed state to *desired*, restrictive first."""
         s, e = self.settings, self.settings.entities
         mode_changed = desired.mode != self._applied_mode
+        # A reconcile that switches a direction on always writes its numbers first, in full.
+        enabling = any(
+            on and self._switch_state_observed(entity) is not True
+            for on, entity in (
+                (desired.allow_charge, e.allow_charge),
+                (desired.allow_discharge, e.allow_discharge),
+            )
+        )
         writes: list[Write] = []
 
         def switch(role: str, entity: str | None, on: bool) -> None:
             assert entity is not None
             write = Write(role, entity, "switch", "turn_on" if on else "turn_off")
-            if not write.matches(self._store.get(entity)):
+            if not write.matches(self._observed(entity)):
                 writes.append(write)
 
         def number(role: str, entity: str | None, value: float, low: float, high: float) -> None:
             assert entity is not None
-            state = self._store.get(entity)
+            state = self._observed(entity)
             write = Write(role, entity, "number", "set_value", _quantize(value, state, low, high))
             if write.matches(state, _tolerance(state)):
                 return
             current = state.numeric() if state is not None else None
-            if not mode_changed and current is not None and write.value is not None:
+            # Only the charge target's load tracking is rate limited: never the discharge margin
+            # (export risk) or cap, and never while a direction is being switched on.
+            limited = role == "pd_target" and desired.mode == "charge"
+            if limited and not mode_changed and not enabling and current is not None:
                 if not self.policy.change_is_worth_sending(current, write.value):
                     return
                 last = self._last_write_at.get(entity)
@@ -462,6 +506,26 @@ class Actuator:
         if desired.allow_charge:
             switch("allow_charge", e.allow_charge, True)
         return writes
+
+    def _switch_state_observed(self, entity: str | None) -> bool | None:
+        state = self._observed(entity)
+        if state is None or not state.available:
+            return None
+        return state.state.strip().lower() == "on"
+
+    def _simulate(self, write: Write) -> None:
+        """dry_run: remember the state this write would leave (attributes kept)."""
+        old = self._observed(write.entity_id)
+        value = write.value if write.domain == "number" else write.service.removeprefix("turn_")
+        now = self._clock.now()
+        self._simulated[write.entity_id] = parse_ha_state(
+            {
+                "entity_id": write.entity_id,
+                "state": str(value),
+                "attributes": dict(old.attributes) if old is not None else {},
+                "last_updated": now.isoformat(),
+            }
+        )
 
     # ------------------------------------------------------------------ writing
 
@@ -497,9 +561,18 @@ class Actuator:
             self._metrics.actuator_last_write.set(now.timestamp())
 
     async def _execute(self, write: Write) -> bool:
-        """Send one write and confirm it, within the retry budget; ``dry_run`` only counts."""
+        """Send one write and confirm it, within the retry budget; ``dry_run`` only counts.
+
+        Every write that is not a ``turn_off`` re-checks the kill switch from the store first: a
+        reconcile can take tens of seconds of readbacks, and the owner may switch it off meanwhile.
+        """
+        if write.service != "turn_off" and not self._kill_switch_on():
+            self._aborted = "kill_switch_off"
+            return False
         if self.mode == "dry_run":
             self._count("actuator_writes", role=write.role, result="dry_run")
+            self._simulate(write)
+            self._last_write_at[write.entity_id] = self._clock.now()
             return True
         for attempt in range(self.policy.max_attempts):
             if attempt:
@@ -527,9 +600,13 @@ class Actuator:
     ) -> tuple[bool, list[dict[str, Any]]]:
         """Apply the planned writes in order; stop at the first one that fails."""
         done: list[dict[str, Any]] = []
+        self._aborted = None
         for write in self.plan_writes(desired, now):
             ok = await self._execute(write)
-            result = "dry_run" if self.mode == "dry_run" else "ok" if ok else "failed"
+            if not ok and self._aborted:
+                result = "aborted"
+            else:
+                result = "dry_run" if self.mode == "dry_run" else "ok" if ok else "failed"
             done.append({**write.to_dict(), "result": result})
             if not ok:
                 return False, done
@@ -600,7 +677,16 @@ class Actuator:
                 assert ctx.intent is not None
                 desired = self.desired_for(ctx.intent, readings)
             ok, writes = await self._reconcile(desired, now)
-            if ok:
+            if self._aborted:  # the kill switch went off mid-reconcile: idle and hand off
+                reasons = [self._aborted]
+                self.kill_switch = False
+                desired = safe_idle(self._aborted)
+                ok, more = await self._reconcile(desired, now)
+                writes += more
+                self.in_control = not ok
+                self.alert = None if ok else "safe_idle_failed"
+                ok = False  # no heartbeat: control is handed back
+            elif ok:
                 self.alert = None
             elif desired.mode != "safe_idle":
                 desired = safe_idle("write_failed")
