@@ -148,8 +148,10 @@ extract call and is never persisted.
 
 - No secrets are written to files by this package
 - The HA token belongs to a non-admin user. HA cannot restrict a token to entities or services, so outside
-  `mode: live` the code (`service/ha_guard.py`) is what keeps it read-only; in `live` a dedicated user's token
-  is used and the same guard admits only the allowlisted Omnibattery writes and the heartbeat
+  `mode: live` the code (`service/ha_guard.py`) is what keeps the `battery-optimizer` user's token read-only.
+  `mode: live` uses a separate token of the dedicated non-admin user `battery-optimizer-live` (group
+  `system-users`, local only; its own Vault KV path when deployed), and the same guard admits only the
+  allowlisted Omnibattery writes and the heartbeat. No token value is ever committed
 - `BATTERY_OPTIMIZER_HA_TOKEN` is read from env or passed explicitly; never logged
 - HA extraction writes no endpoint identity: the manifest records
   `endpoint: "home-assistant-history-api"` plus a 16-char SHA-256 digest of the

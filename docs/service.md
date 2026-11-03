@@ -13,7 +13,7 @@ intents that are never sent anywhere. The one service call they can make is the 
 `weather.get_forecasts` query used by the [weather-forecast archive](#passive-archives).
 
 `mode: dry_run` and `mode: live` add the actuator of
-[ADR-0007](adr/0007-live-battery-control.md) (status: Proposed): it maps the current slot's intent to
+[ADR-0007](adr/0007-live-battery-control.md) (Accepted 2026-11-03): it maps the current slot's intent to
 Omnibattery's Home Assistant entities, `dry_run` only records the writes, `live` sends them through a narrow,
 mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 
@@ -172,7 +172,7 @@ The variables the service reads (the complete table for every command is in
 | Variable | Purpose | Default |
 |---|---|---|
 | `BATTERY_OPTIMIZER_HA_URL` | Home Assistant base URL (the in-cluster Service URL, set by the homelab manifest) | unset → not ready |
-| `BATTERY_OPTIMIZER_HA_TOKEN` / `BATTERY_OPTIMIZER_HA_TOKEN_FILE` | Non-admin long-lived token (value or mounted file); read-only in `shadow`/`dry_run` | unset |
+| `BATTERY_OPTIMIZER_HA_TOKEN` / `BATTERY_OPTIMIZER_HA_TOKEN_FILE` | Non-admin long-lived token (value or mounted file): the read-only `battery-optimizer` user's in `shadow`/`dry_run`, the separate `battery-optimizer-live` user's in `live` | unset |
 | `BATTERY_OPTIMIZER_PROMETHEUS_URL` | The long-term Prometheus holding the `hass_*` series (in-cluster Service URL) | unset → not ready |
 | `BATTERY_OPTIMIZER_DATA_DIR` | Store root (`/data` on a PVC); must be outside a git tree | `~/data/energy-baseline` |
 | `BATTERY_OPTIMIZER_CONFIG` | `tariff.yaml` | `config/tariff.yaml` |
@@ -524,7 +524,13 @@ coverage on the `native_battery` basis.
 
 ## Live control (dry_run and live)
 
-Decision and rationale: [ADR-0007](adr/0007-live-battery-control.md) (Proposed). Module: `service/actuator.py`.
+Decision and rationale: [ADR-0007](adr/0007-live-battery-control.md) (Accepted 2026-11-03). Module:
+`service/actuator.py`.
+
+Two limits stay separate: the battery's own maximum charge/discharge power (2500 W, Omnibattery's per-battery
+`number.venus_max_charge_power` / `number.venus_max_discharge_power`, minimum 800 W; never written by the
+service) and the house limit, grid import while charging at or below `import_cap_w` (4500 W; the 5 kW contract
+trips instantly).
 
 Every `actuation.tick_interval_s` (30 s), at every slot open, after every new plan and after every HA resync,
 the actuator takes the intent frozen for the current slot and maps it to Omnibattery's entities:
@@ -605,9 +611,10 @@ entity IDs; all required outside shadow), `battery_ac_power_sign` (none: require
   `ha_guard.actuation_request`.
 * The HTTP API has no writable route. Tests assert all of the above and statically keep Modbus/MQTT/
   HA libraries and HTTP write calls out of the package.
-* Use a **non-admin** HA user's token. In `shadow`/`dry_run` the service never needs more than reading; Home
-  Assistant cannot restrict a token to particular entities or services, so in `live` the `ha_guard`
-  allowlist is the restriction — use a dedicated non-admin user for the live token.
+* Use a **non-admin** HA user's token. `shadow`/`dry_run` use the read-only `battery-optimizer` user's token.
+  `live` uses a separate token of the dedicated non-admin user `battery-optimizer-live` (group
+  `system-users`, local only), kept in its own Vault KV path when deployed. Home Assistant cannot restrict a
+  token to particular entities or services, so for that user the `ha_guard` allowlist is the restriction.
 
 ## Local run
 

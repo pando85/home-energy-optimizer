@@ -1,10 +1,10 @@
 # ADR-0007: Live battery control through Omnibattery's public Home Assistant entities
 
-- **Status:** Proposed (2026-11-03; owner approval pending). The code ships with `mode: shadow` as the
+- **Status:** Accepted (2026-11-03; decided by the owner). The code ships with `mode: shadow` as the
   default; nothing changes on the installation until the owner switches the deployed config to `dry_run`
-  and later to `live`.
+  and later to `live` (see [Rollout](#rollout)).
 - **Date:** 2026-11-03
-- **Decision owners:** Homelab maintainers
+- **Decision owners:** Homelab maintainers (the owner approved this ADR on 2026-11-03)
 - **Extends:** [ADR-0004](0004-battery-optimizer-production-architecture.md) (sections "Omnibattery
   integration contract" and "Provisional mapping from MPC intent to public HA entities"), which it turns into a
   built adapter; [ADR-0001](0001-home-battery-economic-dispatch.md) (single writer, safe dispatch).
@@ -24,6 +24,15 @@ live control.
 Site constraint: contracted import 5.0 kW and the smart meter cuts supply **instantaneously** on overload
 ([battery-optimizer](../components/battery-optimizer.md#assumptions)). A trip is a safety and availability
 failure, never a cost trade-off.
+
+Two separate limits apply and both stay in force:
+
+- **Battery limit:** the Venus's own maximum charge and discharge power is 2500 W, set on the device through
+  Omnibattery's per-battery `number.venus_max_charge_power` and `number.venus_max_discharge_power` (minimum
+  800 W, currently 2500 W). The optimizer does **not** write them; `actuation.max_discharge_cap_w` (2500)
+  matches the discharge one.
+- **House limit:** grid import while charging stays at or below 4500 W (`actuation.import_cap_w`), 500 W under
+  the 5 kW contract, whatever the battery limit allows; this is the guard of decisions 3, 4 and 6.
 
 ## Decision
 
@@ -195,20 +204,26 @@ automation:
 ```
 
 The `kill_switch_off` trigger repeats the service's own `on → off` safe idle inside HA, so the battery idles
-even when the service is down when the owner flips the switch. The service's HA user needs permission to call
-`switch`, `number` and `input_datetime` services: Home Assistant has no per-entity permissions for a token, so
-the allowlist in `ha_guard` is the restriction; use a dedicated **non-admin** user for the live token.
+even when the service is down when the owner flips the switch.
+
+**Tokens.** `live` uses its own token, separate from the existing read-only `battery-optimizer` user's token
+(which `shadow` and `dry_run` keep using): the dedicated non-admin HA user **`battery-optimizer-live`** (group
+`system-users`, local only) and its long-lived token, stored in its own Vault KV path when deployed. Home
+Assistant cannot restrict a token to entities or services, so for that user the allowlist in `ha_guard` is the
+restriction. No token value is ever written in this repository or its config.
 
 ## Rollout
 
-1. **Shadow** (now): unchanged. Create the two helpers and the watchdog with the kill switch **off**. Measure the
+1. **Shadow** (now): unchanged, with the read-only `battery-optimizer` token. Create the two helpers and the
+   watchdog with the kill switch **off**. Measure the
    sign of `sensor.venus_ac_power` with a supervised charge from the Omnibattery UI and set
    `battery_ac_power_sign`; map `entities.battery_soc` (and the battery energy counters) and set
    `planning.soc_source: entity`. Disable Omnibattery's competing economic strategies.
 2. **dry_run for 1–2 days:** `mode: dry_run`, kill switch **on** (nothing is sent in `dry_run`; the switch only
    makes the rehearsal faithful). Review `service/v1/actuation/` and the `actuator_*` metrics: guard reasons, the
    mapping at every slot, setpoint churn, the house-load estimate against the meter.
-3. **live, supervised:** kill switch **off**, `mode: live`, roll out, then switch the kill switch **on** while
+3. **live, supervised:** kill switch **off**, `mode: live` with the `battery-optimizer-live` user's token (its
+   own Vault KV path) mounted instead of the read-only one, roll out, then switch the kill switch **on** while
    watching the meter. Verify readback, heartbeat, a slot change in each direction, the watchdog (stop the pod
    and see the switches go off after 5 minutes) and SIGTERM safe idle. Only then leave it unattended, with the
    TODO-5.4 caveat above.
@@ -216,7 +231,8 @@ the allowlist in `ha_guard` is the restriction; use a dedicated **non-admin** us
 ## Rollback
 
 Turn `input_boolean.battery_optimizer_live` off (immediate: safe idle once, then no writes; the watchdog repeats
-the safe idle in HA). Then set `mode: shadow` (or `dry_run`) and roll out; a shadow pod has no write path.
+the safe idle in HA). Then set `mode: shadow` (or `dry_run`), mount the read-only `battery-optimizer` token again
+and roll out; a shadow pod has no write path.
 Restore Omnibattery's native configuration by hand (the optimizer never restores an earlier configuration).
 
 ## Alternatives considered

@@ -66,8 +66,9 @@ just release           # cut a release (see the release skill)
   owner's kill switch (never written). Do not widen it, do not add any other service call, Modbus, REST write
   or device, and never make `live` a default. The other exception is the non-mutating
   `weather.get_forecasts` query (with `return_response`) of the passive forecast archive, allowed only by the
-  narrow check in `service/ha_guard.py`; do not widen it. Home Assistant tokens belong to a non-admin user and
-  are used read-only outside `mode: live`.
+  narrow check in `service/ha_guard.py`; do not widen it. Home Assistant tokens belong to non-admin users:
+  the read-only `battery-optimizer` user's outside `mode: live`, the separate `battery-optimizer-live`
+  user's only in `mode: live`. Never commit a token value.
 - The container image holds no data and no git; `BATTERY_OPTIMIZER_GIT_SHA` is the build-time commit
   identity.
 

@@ -17,7 +17,8 @@
 # `actuation:` section below would make, and sends nothing.  mode: live sends them, and only
 # them: the guard admits switch.turn_on/off, number.set_value and input_datetime.set_datetime
 # on exactly the entities of `actuation.entities` (never the kill switch), with bounded values
-# (ADR-0007).  REST stays GET-only in every mode.
+# (ADR-0007).  REST stays GET-only in every mode.  live uses the separate token of the non-admin
+# HA user battery-optimizer-live (own Vault KV path); shadow/dry_run the read-only one.
 version: 1
 mode: shadow
 timezone: Europe/Madrid
@@ -180,7 +181,9 @@ actuation:
   neutral_pd_target_w: 0          # PD grid target in a planned idle
   discharge_margin_w: 50          # small import while discharging: never export
   min_discharge_cap_w: 100        # the discharge cap is never written below this (0 = unlimited)
-  max_discharge_cap_w: 2500       # Venus E V3 rated power
+  # Venus E V3 limit: its own max charge/discharge is 2500 W (number.venus_max_charge_power /
+  # number.venus_max_discharge_power, min 800, never written here).  Separate from import_cap_w.
+  max_discharge_cap_w: 2500
   # Omnibattery integration_status values in which the intent may be applied; any other
   # (manual, grid_charging, backup_mode, initializing, a competing strategy...) holds safe idle.
   healthy_states: [balanced, charging, discharging]

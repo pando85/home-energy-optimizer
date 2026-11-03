@@ -7,7 +7,7 @@ One MILP kernel (`oracle.solve_oracle`, HiGHS) serves the benchmark policies (`p
 `rolling_horizon.py`) and the live shadow planner (`service/planner.py` `run_planner`, free terminal mode,
 re-solved every 15 minutes). Owner: this repository. Roadmap:
 [Dispatch Optimizer](../planning/components/dispatch-optimizer.md). Go-live is through OmniBattery, driven
-by this optimizer, under [ADR-0007](../adr/0007-live-battery-control.md) (Proposed): `mode: shadow` (default)
+by this optimizer, under [ADR-0007](../adr/0007-live-battery-control.md) (accepted 2026-11-03): `mode: shadow` (default)
 has no writer; `dry_run` records the Omnibattery writes it would make; `live` sends them
 (`service/actuator.py`).
 
@@ -47,7 +47,9 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
   actuator ADR, and at go-live the cap is **required**, not optional. ADR-0007 implements it as the PD
   grid-import target `min(house load + P, 4500 W)` (Omnibattery reduces the charge when house load rises), a
   guard that refuses any written target above the cap, and a hard rule that switches charge off when the
-  measured import exceeds 4700 W.
+  measured import exceeds 4700 W. This house limit is separate from the battery's own 2500 W charge/discharge
+  limit (`number.venus_max_charge_power` / `number.venus_max_discharge_power`, minimum 800 W), which the
+  optimizer does not write.
 - **Heater inputs to the import limit** (Panasonic service manual; details in
   [heat-pump-controller](heat-pump-controller.md#heater-facts-import-limit-inputs)): the heat pump alone draws
   at most 3.47 kW, and its integrated 3.00 kW electric heater brings the worst case to about 6.5 kW, above the
@@ -96,8 +98,8 @@ explained before go-live; the floor-hit share on expensive cold-day slots stays 
 
 ## Status
 
-**valid, shadow only** (2026-10-31). The actuator ([ADR-0007](../adr/0007-live-battery-control.md), Proposed,
+**valid, shadow only** (2026-10-31). The actuator ([ADR-0007](../adr/0007-live-battery-control.md), accepted
 2026-11-03) and its import-cap adapter are built but not deployed (`mode: shadow` in the committed config): a code
 change, not a plant change, so no regime-log row and no recalibration. Not go-live ready: idle draw, measured SOC
-(`soc_source: entity`), the sign of the battery AC power sensor and the ADR approval are open; the wear cost is set
+(`soc_source: entity`) and the sign of the battery AC power sensor are open; the wear cost is set
 (0.01) and is re-checked on measured data after commissioning.

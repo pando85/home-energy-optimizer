@@ -10,7 +10,7 @@ and benchmark pipeline ([ADR-0003](docs/adr/0003-phase1-measurement-and-baseline
 ([docs/service.md](docs/service.md)). It is deployed in shadow mode: plans are recorded and compared with
 the native battery behaviour, and nothing is actuated. A `dry_run` and a `live` mode that drive the battery
 through Omnibattery's Home Assistant entities are built behind an explicit config switch and an owner kill
-switch ([ADR-0007](docs/adr/0007-live-battery-control.md), Proposed).
+switch ([ADR-0007](docs/adr/0007-live-battery-control.md), accepted 2026-11-03).
 
 ## Architecture
 
