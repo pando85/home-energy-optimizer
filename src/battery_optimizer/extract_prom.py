@@ -294,7 +294,8 @@ ENTITY_SPECS: dict[str, EntitySpec] = {
             "h",
         ),
         EntitySpec("switch.aquarea_force_dhw_mode", "hass_switch_state", "bool"),
-        # Washer submeter candidate (audit only; the owner has not confirmed it).
+        # Washer submeter candidate (audit only; the owner has not confirmed it).  The plug was
+        # reflashed for another load on 2026-11-03 (``features.WASHER_PLUG_REFLASHED_AT``).
         EntitySpec("sensor.smart_plug_v2_terrace_power", "hass_sensor_power_w", "W"),
         EntitySpec("sensor.terrace_lavadora_energy_today", "hass_sensor_energy_wh", "Wh"),
         *_CLIMATE_SPECS,

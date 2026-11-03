@@ -42,6 +42,8 @@ and the data volume are deployed from the homelab repository.
   read only inside its window ([regime log](regime-log.md)). In Bypass the servers stay inside channel 1.
   **Unverified:** whether a discharge feeds the backup port from the battery; the discharge counter excludes
   the backup port, so that energy would be missing from `gross_kwh` and show as `servers + heat pump > main`.
+- `washer_plug` ends at `features.WASHER_PLUG_REFLASHED_AT` (2026-11-03 22:46 UTC, plug reflashed for
+  another load) and is unknown from then on; it has had no data since 2024-07-08 anyway.
 - HA recorder history cannot be re-extracted; string states are not exported ([known issues](../known-issues.md)).
 - Heat-pump electricity: the branch meter (channel 2) reads about 1.28 times the HeishaMon counters and also feeds appliances ([climate plan](../planning/climate-optimizer-implementation.md)).
 
@@ -73,4 +75,5 @@ check passes, the reconstruction is untested on real counters. Reconstruction an
 (climate plan item 6). 2026-11-03: the build's reconstruction had the
 sign reversed (`raw + charge - discharge`, the service always used `raw - charge + discharge`); corrected
 before go-live, so no dataset was built with it. 2026-11-03: the servers moved to the battery backup
-port; the `servers` feature switches source at that instant (feature-set ids change).
+port; the `servers` feature switches source at that instant, and `washer_plug` ends at the terrace
+plug's reflash the same night (feature-set ids change).

@@ -598,6 +598,34 @@ class TestSourceSwitch:
         }
         assert len(ids) == 3
 
+    def test_a_successor_without_an_entity_ends_the_signal(self, tmp_path: Path) -> None:
+        data_dir = self._archive(tmp_path)
+        ended = Signal(SERVERS, "servers", features.KIND_POWER, successors=((self.SWITCH, None),))
+        assert ended.entity_windows() == ((SERVERS, None, self.SWITCH), (None, self.SWITCH, None))
+        signals = tuple(ended if s.alias == "servers" else s for s in features.SIGNALS)
+        out = build_features(
+            data_dir=str(data_dir), start=self.WINDOW[0], end=self.WINDOW[1], signals=signals
+        )
+        table, manifest = load_features(out)
+        kwh = table.column("servers_kwh").to_pylist()
+        # The 150 W the old entity reads after the end never enters; the last 240 W reading is
+        # not held past it (nothing follows it).
+        assert kwh[:3] == pytest.approx([0.06] * 3)
+        assert kwh[4:] == [None] * 4
+        assert table.column("servers_quality").to_pylist()[4:] == ["unknown"] * 4
+        assert manifest["signals"][0]["successors"] == [
+            {"since": "2026-01-05T01:00:00Z", "entity": None}
+        ]
+
+    def test_the_washer_plug_ends_at_the_reflash(self) -> None:
+        sig = next(s for s in features.SIGNALS if s.alias == "washer_plug")
+        assert sig.entity_windows() == (
+            ("sensor.smart_plug_v2_terrace_power", None, features.WASHER_PLUG_REFLASHED_AT),
+            (None, features.WASHER_PLUG_REFLASHED_AT, None),
+        )
+        # After the plug's last report as the terrace plug (22:45:42 UTC).
+        assert features.WASHER_PLUG_REFLASHED_AT > datetime(2026, 11, 3, 22, 45, 42, tzinfo=UTC)
+
     def test_the_servers_moved_to_the_battery_backup_port(self) -> None:
         sig = features.SERVERS_SIGNAL
         assert sig.alias == "servers"
@@ -678,9 +706,9 @@ class TestDefaultSetIsPinned:
             ("sensor.terrace_lavadora_energy_today", "washer_energy_today_wh", "counter"),
         ]
         assert all(s.metric is None and s.source == s.entity for s in features.SIGNALS)
-        # A fixed input gives this id.  Last changed when the servers signal gained its
-        # successor (servers on the battery backup port from 2026-11-03); before that it was
-        # 8cd8263e440a..., computed with the code before the climate set existed.
+        # A fixed input gives this id.  Last changed on 2026-11-03 when the servers signal gained
+        # its successor (battery backup port) and washer_plug its end (plug reflashed); before
+        # that it was 8cd8263e440a..., computed with the code before the climate set existed.
         fixed = features.compute_feature_set_id(
             part_hashes=[{"part": "p1", "sha256": "aa"}, {"part": "p2", "sha256": "bb"}],
             code_ver="test-version",
@@ -694,7 +722,7 @@ class TestDefaultSetIsPinned:
             },
             signals=features.SIGNALS,
         )
-        assert fixed == "89ba8f272b22fb9ee2b6472557aa10dbc97d95ae26361d7aa2b70f63338047fe"
+        assert fixed == "da04b87f402e68ec68ce8de2d06c1c7748d6b7e938abe91ff4af37b9da89d89f"
 
     def test_the_selector_defaults_to_the_default_set(self) -> None:
         assert features.SIGNAL_SETS["default"] is features.SIGNALS

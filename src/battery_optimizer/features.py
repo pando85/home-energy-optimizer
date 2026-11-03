@@ -63,8 +63,9 @@ Source switch
 A signal whose quantity moved to another meter (a plant change in the regime log) names its later
 sources in :attr:`Signal.successors`: the first entity is read before the first switch instant and
 each successor from its instant on, so a renamed or reassigned entity never feeds the alias outside
-its window.  The pieces join into one series under the same rules: a span that crosses a switch
-holds the last reading of the earlier source until the first one of the next, unless it is a gap.
+its window.  A successor without an entity (``None``) ends the signal: it is unknown from then on.
+The pieces join into one series under the same rules: a span that crosses a switch holds the last
+reading of the earlier source until the first one of the next, unless it is a gap.
 
 Leakage note: every feature of slot ``k`` uses samples from inside slot ``k``.  A forecaster may
 use only ``*_at_start`` of the slot it forecasts, or any feature of an earlier slot.
@@ -151,15 +152,15 @@ class Signal:
     metric: str | None = None
     #: Later sources of the same quantity, ``(since, entity)`` in time order (aware instants):
     #: :attr:`entity` is read before the first ``since``, each successor from its ``since`` until
-    #: the next one.  The series keeps :attr:`source` as its key.
-    successors: tuple[tuple[datetime, str], ...] = ()
+    #: the next one; a ``None`` entity means no source.  The series keeps :attr:`source` as its key.
+    successors: tuple[tuple[datetime, str | None], ...] = ()
 
     def __post_init__(self) -> None:
         instants = [since for since, _ in self.successors]
         if any(t.tzinfo is None for t in instants) or instants != sorted(set(instants)):
             raise ValueError(f"{self.alias}: successors need strictly increasing aware instants")
 
-    def entity_windows(self) -> tuple[tuple[str, datetime | None, datetime | None], ...]:
+    def entity_windows(self) -> tuple[tuple[str | None, datetime | None, datetime | None], ...]:
         """``(entity, since, until)`` of every source in time order; ``None`` is unbounded."""
         bounds: list[datetime | None] = [None, *(since for since, _ in self.successors), None]
         entities = (self.entity, *(entity for _, entity in self.successors))
@@ -210,6 +211,11 @@ SERVERS_SIGNAL = Signal(
     successors=((SERVERS_ON_BACKUP_PORT_SINCE, "sensor.venus_ac_offgrid_power"),),
 )
 
+#: The terrace plug behind ``washer_plug`` was reflashed as another device's plug on 2026-11-03
+#: (regime log): no washer source from then on.  Its last samples before that night are of
+#: 2024-07-08; it reconnected at 22:34:42 UTC with the relay off (0 W), last reporting at 22:45:42.
+WASHER_PLUG_REFLASHED_AT = datetime(2026, 11, 3, 22, 46, tzinfo=UTC)
+
 SIGNALS: tuple[Signal, ...] = (
     SERVERS_SIGNAL,
     Signal("sensor.aquarea_heat_power_consumed", "hp_heat", KIND_POWER),
@@ -219,7 +225,12 @@ SIGNALS: tuple[Signal, ...] = (
     Signal("sensor.aquarea_dhw_power_produced", "hp_dhw_out", KIND_POWER),
     Signal("sensor.aquarea_cool_power_produced", "hp_cool_out", KIND_POWER),
     Signal("sensor.aquarea_power_consumed", "hp_total_reported", KIND_POWER),
-    Signal("sensor.smart_plug_v2_terrace_power", "washer_plug", KIND_POWER),
+    Signal(
+        "sensor.smart_plug_v2_terrace_power",
+        "washer_plug",
+        KIND_POWER,
+        successors=((WASHER_PLUG_REFLASHED_AT, None),),
+    ),
     Signal("sensor.aquarea_outside_ambient_temperature", "outdoor_temp", KIND_TEMPERATURE),
     Signal("input_boolean.appdaemon_climate_enable", "climate_enable", KIND_STATE),
     Signal("input_boolean.appdaemon_dhw_enable", "dhw_enable", KIND_STATE),
@@ -509,7 +520,7 @@ def load_signal_samples(
     """
     import datetime as _dt
 
-    wanted = {entity for s in signals for entity, _since, _until in s.entity_windows()}
+    wanted = {e for s in signals for e, _since, _until in s.entity_windows() if e is not None}
     manifests = [
         m
         for m in _iter_prometheus_manifests(data_dir)
