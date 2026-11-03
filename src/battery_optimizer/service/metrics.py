@@ -251,6 +251,12 @@ def _actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
             "Measured grid power: + import (absent when stale)",
         ),
         ("house_load_watts", "house_load_w", "Estimated house load: grid - battery AC power"),
+        (
+            "clamped_watts",
+            "clamped_w",
+            "Planned battery power the last tick could not request: the PD target or discharge "
+            "cap was cut by the import cap or the entity's max (0 = none cut)",
+        ),
     ):
         yield gauge(suffix, doc, a.get(key))
 

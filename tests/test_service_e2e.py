@@ -34,6 +34,9 @@ def test_service_runs_end_to_end_and_stops_cleanly(tmp_path):
                      attributes={"unit_of_measurement": "kWh"}),
             ha_state("sensor.esios_pvpc", 0.15, now,
                      attributes=pvpc_attributes(day, tomorrow=True)),
+            # The committed config plans from the SOC entity, trusted while every battery responds.
+            ha_state("sensor.venus_battery_soc", 50, now, attributes={"unit_of_measurement": "%"}),
+            ha_state("sensor.omnibattery_non_responsive_batteries", "None", now),
         ]
     )  # fmt: skip
     config = service_config(

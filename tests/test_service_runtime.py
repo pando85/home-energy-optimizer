@@ -122,9 +122,65 @@ def test_stale_or_missing_inputs_refuse_to_plan(tmp_path, cleanup, mutate, reaso
     assert skipped == 1
 
 
-def test_stale_soc_refuses_to_plan(tmp_path, cleanup):
+def test_idle_soc_without_reports_still_plans(tmp_path, cleanup):
+    # Omnibattery reports the SOC only on change: an idle battery's SOC is hours old but valid.
     clock = FakeClock(NOW)
     service = make_service(tmp_path, clock, entity_mode=True)
+    cleanup(service)
+    old = NOW - timedelta(hours=3)
+    feed(service, old)
+    service.store.apply(
+        entity_state(
+            "sensor.shellyem_main_channel_1_power",
+            380,
+            NOW,
+            attributes={"unit_of_measurement": "W"},
+        )
+    )
+    assert service.config.freshness_for("battery_soc") is None
+    assert run(service.request_solve("test")) == "ok"
+    assert service.plans[-1].snapshot.soc_source == "entity"
+
+
+@pytest.mark.parametrize(
+    ("entity", "state", "planned"),
+    [
+        ("sensor.omnibattery_non_responsive_batteries", "None", True),
+        ("sensor.omnibattery_non_responsive_batteries", "1", False),
+        ("sensor.omnibattery_non_responsive_batteries", "unavailable", False),
+        ("sensor.test_soc", "unavailable", False),
+        ("sensor.test_soc", "140", False),
+    ],
+)
+def test_entity_soc_needs_availability_and_a_responsive_battery(
+    tmp_path, cleanup, entity, state, planned
+):
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, entity_mode=True)
+    cleanup(service)
+    feed(service, NOW)
+    clock.advance(1)
+    service.store.apply(
+        entity_state(entity, state, clock.now(), attributes={"unit_of_measurement": "%"})
+    )
+    expected = "ok" if planned else "skipped:soc_stale"
+    assert run(service.request_solve("test")) == expected
+
+
+def test_liveness_is_not_required_when_unconfigured(tmp_path, cleanup):
+    clock = FakeClock(NOW)
+    service = make_service(
+        tmp_path, clock, entity_mode=True, **{"actuation.entities.battery_liveness": None}
+    )
+    cleanup(service)
+    assert "sensor.omnibattery_non_responsive_batteries" not in service.store.tracked
+    feed(service, NOW)
+    assert run(service.request_solve("test")) == "ok"
+
+
+def test_stale_soc_refuses_to_plan_when_an_age_limit_is_set(tmp_path, cleanup):
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, entity_mode=True, **{"freshness_s.battery_soc": 900})
     cleanup(service)
     old = NOW - timedelta(seconds=1000)
     feed(service, old)  # SOC (and everything else) last reported 1000 s ago

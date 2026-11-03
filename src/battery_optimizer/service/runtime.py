@@ -75,7 +75,7 @@ from typing import Any
 from battery_optimizer.climate.shadow import LiveInputs, detect_regime
 from battery_optimizer.config import TariffConfig
 
-from .actuator import ActuationContext, Actuator
+from .actuator import LIVENESS_OK_STATE, ActuationContext, Actuator
 from .archive import (
     next_fetch_time,
     pvpc_snapshot_record,
@@ -182,6 +182,9 @@ class ShadowService:
         climate_entities = config.climate_shadow.entities() if config.climate_shadow.enabled else ()
         acting = config.mode != "shadow"
         actuation_entities = config.actuation.entities.all() if acting else ()
+        if config.planning.soc_source == "entity" and config.actuation.entities.battery_liveness:
+            # The entity SOC is only trusted while Omnibattery reports the battery responsive.
+            actuation_entities = (*actuation_entities, config.actuation.entities.battery_liveness)
         self.store = EntityStore.for_entities(
             tuple(
                 dict.fromkeys(
@@ -633,7 +636,23 @@ class ShadowService:
             return False, None
         age = self.store.age_s(entity, now)
         value = normalise_value(role, state)
-        return value is not None and age is not None and age <= self.config.freshness_for(role), age
+        limit = self.config.freshness_for(role)
+        if limit is None:  # availability only (battery_soc): no age test
+            return value is not None, age
+        return value is not None and age is not None and age <= limit, age
+
+    def _battery_responsive(self) -> bool:
+        """Omnibattery's liveness sensor reads exactly ``None`` (or none is configured).
+
+        Omnibattery keeps the last SOC when Modbus polling fails, so an available SOC alone
+        does not prove the battery answers; the actuator guard applies the same test.
+        """
+        entity = self.config.actuation.entities.battery_liveness
+        if entity is None:
+            return True
+        state = self.store.get(entity)
+        # Raw state on purpose: the healthy text "None" is what EntityState.available rejects.
+        return state is not None and state.state == LIVENESS_OK_STATE
 
     def _soc_now(self, now: datetime) -> tuple[float | None, datetime | None, str]:
         """``(soc_frac, observed_at, source)`` or a ``None`` SOC when unusable."""
@@ -641,7 +660,7 @@ class ShadowService:
             entity = self.config.entities.get("battery_soc")
             fresh, _ = self._role_fresh("battery_soc", now)
             state = self.store.get(entity)
-            if not fresh or state is None:
+            if not fresh or state is None or not self._battery_responsive():
                 return None, state.observed_at if state else None, "entity"
             value = normalise_value("battery_soc", state)
             if value is None or not 0.0 <= value <= 1.0:
@@ -718,7 +737,8 @@ class ShadowService:
             if not self.config.entities.get("battery_soc"):
                 reasons.append(("soc_unconfigured", "entities.battery_soc is null"))
             elif self._soc_now(now)[0] is None:
-                reasons.append(("soc_stale", "battery SOC missing, stale or out of range"))
+                detail = "battery SOC missing, stale or out of range, or battery unresponsive"
+                reasons.append(("soc_stale", detail))
         elif self.virtual_soc is None:
             reasons.append(("soc_unconfigured", "virtual battery not initialised"))
         if self.tariff is None:

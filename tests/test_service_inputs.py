@@ -189,12 +189,17 @@ def test_committed_service_config_loads(monkeypatch):
     assert config.home_assistant.url == "https://ha.example"
     assert config.home_assistant.token.reveal() == "secret-token"
     assert config.entities.get("grid_power") == "sensor.shellyem_main_channel_1_power"
-    # Commissioned 2026-11-03: SOC and the AC energy counters are mapped, SOC stays simulated.
+    # Commissioned 2026-11-03: SOC and the AC energy counters are mapped; the planner reads the
+    # SOC entity, trusted on availability plus Omnibattery's liveness sensor (no age test).
     assert config.entities.get("battery_soc") == "sensor.venus_battery_soc"
     assert config.entities.get("battery_charge_energy") == "sensor.venus_total_charging_energy"
     assert config.entities.get("battery_power") is None
     assert config.entities.has_battery
-    assert config.planning.soc_source == "simulated"
+    assert config.planning.soc_source == "entity"
+    assert config.freshness_for("battery_soc") is None
+    assert (
+        config.actuation.entities.battery_liveness == "sensor.omnibattery_non_responsive_batteries"
+    )
     public = config.public_dict()
     assert "secret-token" not in repr(public)
     assert public["home_assistant"]["token_configured"] is True
@@ -223,6 +228,7 @@ def test_token_file(tmp_path, monkeypatch):
             "needs entities.battery_soc",
         ),
         ({"planning.solve_timeout_s": 500}, "solve_timeout_s"),
+        ({"freshness_s.grid_power": None}, "freshness_s.grid_power"),
         ({"entities.bogus": "sensor.x"}, "unknown entity roles"),
         ({"entities.grid_power": None}, "grid_power is required"),
         (

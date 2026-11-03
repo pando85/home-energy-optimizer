@@ -89,17 +89,21 @@ battery:
 freshness_s:
   grid_power: 300
   grid_energy: 900
-  battery_soc: 900
+  # null (the default): availability only, no age test, as actuation.freshness_s.battery_soc.
+  # Omnibattery reports the SOC only on change (last_reported is not refreshed for an unchanged
+  # value, verified 2026-11-03), so an idle battery's SOC looks hours old while healthy; it keeps
+  # its last value when Modbus fails, which actuation.entities.battery_liveness catches instead.
+  # A number restores the age test.
+  battery_soc: null
   battery_power: 300
 
 planning:
-  # entity:    plan from the live battery SOC entity (refuses to plan when stale).
+  # entity:    plan from the live battery SOC entity (refuses to plan when it is missing,
+  #            unavailable, out of range, older than freshness_s.battery_soc when that is set,
+  #            or while actuation.entities.battery_liveness is not exactly `None`).
   # simulated: a virtual battery whose SOC evolves by applying the service's own decisions
   #            against the measured load.
-  # Stays `simulated` after commissioning (2026-11-03), on purpose: `entity` ages the SOC
-  # against freshness_s.battery_soc below, and Omnibattery reports it only on change, so an
-  # idle battery's SOC looks stale after 15 minutes and planning would stop (known issues).
-  soc_source: simulated
+  soc_source: entity
   interval_seconds: 900
   # Plans start at the next slot boundary and are solved this long before it.
   solve_lead_s: 120
@@ -153,7 +157,8 @@ archive:
     offset_minutes: 5
 
 # Live battery control through Omnibattery (ADR-0007).  Read only in dry_run / live; shadow
-# ignores it (it is still validated).  mode: live also needs planning.soc_source: entity.
+# ignores it (it is still validated), except entities.battery_liveness, which every mode reads
+# with planning.soc_source: entity.  mode: live also needs planning.soc_source: entity.
 actuation:
   entities:
     # Owner's kill switch (HA helper, created by hand; only read).  Nothing is written while
@@ -195,6 +200,8 @@ actuation:
   min_discharge_cap_w: 100        # the discharge cap is never written below this (0 = unlimited)
   # Venus E V3 limit: its own max charge/discharge is 2500 W (number.venus_max_charge_power /
   # number.venus_max_discharge_power, min 800, never written here).  Separate from import_cap_w.
+  # Go-live: the system caps are 2500/2500 W and Premium mode is on in the Marstek app; without
+  # Premium the firmware limits discharge to 800 W, below what this cap and the planner assume.
   max_discharge_cap_w: 2500       # <= 2500
   # Omnibattery integration_status values in which the intent may be applied; any other
   # (manual, grid_charging, backup_mode, initializing, a competing strategy...) holds safe idle.

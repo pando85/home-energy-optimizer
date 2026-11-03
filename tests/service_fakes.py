@@ -154,6 +154,7 @@ def service_config(tmp_path: Path, **overrides: Any) -> ServiceConfig:
 
 #: The committed config maps the battery (commissioned 2026-11-03); this is the house without it.
 NO_BATTERY = {
+    "planning.soc_source": "simulated",
     "entities.battery_soc": None,
     "entities.battery_charge_energy": None,
     "entities.battery_discharge_energy": None,
@@ -352,10 +353,13 @@ def feed(service, at, *, soc=0.5, grid=400.0, energy=None, tomorrow=False, histo
                 attributes={"unit_of_measurement": "kWh"},
             )
         )
-    if service.config.entities.get("battery_soc"):
+    if soc_entity := service.config.entities.get("battery_soc"):
         store.apply(
-            entity_state("sensor.test_soc", soc * 100, at, attributes={"unit_of_measurement": "%"})
+            entity_state(soc_entity, soc * 100, at, attributes={"unit_of_measurement": "%"})
         )
+    liveness = service.config.actuation.entities.battery_liveness
+    if liveness and liveness in store.tracked:
+        store.apply(entity_state(liveness, "None", at))  # Omnibattery: every battery responds
     day = local_date(at, TZ)
     hour = at.replace(minute=0, second=0, microsecond=0)
     if service.price_curve is None or service.price_curve.reference_day != day or tomorrow:

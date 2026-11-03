@@ -14,9 +14,9 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
 ## Interfaces
 
 - **In:** [battery-load-forecast](battery-load-forecast.md), published prices ([tariff-prices](tariff-prices.md)),
-  [battery-model](battery-model.md), current SOC (still simulated after commissioning on 2026-11-03: the
-  SOC entity is mapped, but the planner's freshness check would stop planning while the battery is idle;
-  [known issues](../known-issues.md#planning-from-the-soc-entity-stops-while-the-battery-is-idle)).
+  [battery-model](battery-model.md), current SOC (the measured `sensor.venus_battery_soc` since this
+  change, `soc_source: entity`, trusted on availability and Omnibattery's liveness sensor;
+  [known issues](../known-issues.md#planning-from-the-soc-entity-checks-availability-and-liveness-not-age)).
 - **Out:** `DispatchPlan` and `DispatchIntent` (`dispatch.py`, types only), shadow records and metrics.
   Not a battery command by itself.
 - **Consumers:** [system-replay-benchmark](system-replay-benchmark.md); the battery actuator
@@ -104,7 +104,10 @@ explained before go-live; the floor-hit share on expensive cold-day slots stays 
 2026-11-03) and its import-cap adapter are built but not deployed (`mode: shadow` in the committed config): a code
 change, not a plant change, so no regime-log row and no recalibration. The battery was commissioned on
 2026-11-03 (regime log); no trigger above fired (the battery block of `tariff.yaml` is unchanged, the battery is
-idle). The AC power sign is measured (-1). Not go-live ready: idle draw, measured SOC (`soc_source: entity`),
-the PD-target bound while the system power limits are on (charge cut to the 1000 W system max charge minus the
-house load) and the [battery-model](battery-model.md) caps are open; the wear cost is set (0.01) and is
+idle). The AC power sign is measured (-1); the shadow planner reads the measured SOC (`soc_source: entity`, a
+config change of the optimizer, not of the plant: the inputs and the model are unchanged, so no recalibration).
+Not go-live ready: idle draw, the HA-independent failsafe ([ADR-0007](../adr/0007-live-battery-control.md#live-preconditions-2026-11-03)),
+the PD-target bound while the system power limits are on (pre-go-live: charge cut to the test socket's 1000 W
+system max charge minus the house load; go-live: system caps 2500/2500 W and Marstek Premium mode for discharge
+above 800 W, matching `power_kw: 2.5`) and the [battery-model](battery-model.md) caps are open; the wear cost is set (0.01) and is
 re-checked on measured data.
