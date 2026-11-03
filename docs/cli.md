@@ -69,12 +69,18 @@ summary is still printed.
 Flags that are **gaps** (exit `3`): `empty_chunk:`, `empty_chunk_after_window_filter:`,
 `chunk_accounting_mismatch`, `no_rows_for_entity:`, `no_rows_extracted:all` (HA) and
 `no_samples_extracted:`, `no_series_chunks:`, `series_without_samples_chunks:` (Prometheus). A
-known-dead entity (`sensor.esios_pvpc_2`) is expected to be empty and never counts.
+known-dead entity (`sensor.esios_pvpc_2`) is expected to be empty and never counts. An entity that
+no longer exists has a `retired_at` instant in `extract_prom.ENTITY_SPECS` (strictly after its last
+archived sample): chunks starting at or after it are not queried and are disclosed as
+`retired_entity_chunks_skipped:` (informational), samples at or after it are not kept, and earlier
+chunks keep the gap flags above. Retired: `sensor.shellypmmini_servers_power` (2026-11-03 22:23 UTC,
+renamed) and `sensor.smart_plug_v2_terrace_power` (22:46 UTC, reflashed).
 
 Flags that stay **informational** (no exit change): `duplicate_rows_suppressed:`,
 `duplicate_rows_already_stored:`, `carry_in_classification_disagreement:`,
 `prior_part_unreadable:`, `duplicate_samples_dropped:`, `boundary_duplicates_dropped:`,
-`non_finite_samples_dropped:`, `overlapping_target_samples:`, `dead_duplicate_entity:`. They say how
+`non_finite_samples_dropped:`, `overlapping_target_samples:`, `dead_duplicate_entity:`,
+`retired_entity_chunks_skipped:`. They say how
 the run went, not that data is missing. An HA entity that simply did not change is *not* an empty
 chunk: the history API returns its state at the chunk start (the `carry_in` row), so a zero-row
 chunk means purged history or an absent entity.

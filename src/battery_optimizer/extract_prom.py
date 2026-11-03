@@ -58,6 +58,11 @@ Three empty cases are distinguished and recorded per entity in the manifest:
 ``c`` **query error** (HTTP error, ``status: "error"``, malformed payload) →
     raises, and no success manifest is written.
 
+An entity with a ``retired_at`` instant (it no longer exists in Home Assistant) is read only
+before it: chunks starting at or after it are not queried and are disclosed as
+``retired_entity_chunks_skipped:<entity>`` (informational, not a gap); earlier chunks keep the
+three cases above.
+
 Additionally, identical ``(labels_json, ts)`` samples (same full label set,
 same timestamp) are deduplicated; when such a sample carries **different**
 values, both rows are kept and the manifest flags ``overlapping_target_samples``.
@@ -182,12 +187,22 @@ class EntitySpec:
     with a ``series`` alias, which only widens the registry key and the per-series flag label
     to ``<entity_id>#<series>``; the PromQL selector and the stored ``entity`` column always
     carry the real entity id.
+
+    ``retired_at`` is the instant an entity stopped existing in Home Assistant (renamed, or its
+    device reflashed), strictly after its last archived sample.  Extraction reads it only before
+    that instant: a chunk starting at or after it is not queried and never flagged, while a chunk
+    before it keeps the normal gap detection.
     """
 
     entity_id: str
     metric: str
     unit: str
     series: str = ""
+    retired_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.retired_at is not None and self.retired_at.tzinfo is None:
+            raise ValueError(f"{self.key}: retired_at must be an aware instant")
 
     @property
     def key(self) -> str:
@@ -270,7 +285,15 @@ ENTITY_SPECS: dict[str, EntitySpec] = {
         # (``features.py``).  None of them is a default: the canonical extraction and
         # ``dataset_id`` never read them.  Request them with ``--entities`` (or via
         # ``FEATURE_ENTITY_IDS``).  Names and units confirmed against the live archive.
-        EntitySpec("sensor.shellypmmini_servers_power", "hass_sensor_power_w", "W"),
+        # Renamed ``sensor.shellypmmini_z800_power`` on 2026-11-03: last sample under this id
+        # 22:22:42 UTC, first under the new one 22:23:42 (``features.SERVERS_SIGNAL`` stops
+        # reading it earlier, at the servers' move).
+        EntitySpec(
+            "sensor.shellypmmini_servers_power",
+            "hass_sensor_power_w",
+            "W",
+            retired_at=datetime(2026, 11, 3, 22, 23, tzinfo=UTC),
+        ),
         # The servers' load from 2026-11-03 (``features.SERVERS_SIGNAL``): the battery's
         # backup-port output.  A feature entity, not a battery counter of the canonical build.
         EntitySpec("sensor.venus_ac_offgrid_power", "hass_sensor_power_w", "W"),
@@ -295,8 +318,14 @@ ENTITY_SPECS: dict[str, EntitySpec] = {
         ),
         EntitySpec("switch.aquarea_force_dhw_mode", "hass_switch_state", "bool"),
         # Washer submeter candidate (audit only; the owner has not confirmed it).  The plug was
-        # reflashed for another load on 2026-11-03 (``features.WASHER_PLUG_REFLASHED_AT``).
-        EntitySpec("sensor.smart_plug_v2_terrace_power", "hass_sensor_power_w", "W"),
+        # reflashed for another load on 2026-11-03 (``features.WASHER_PLUG_REFLASHED_AT``, the
+        # same instant; last sample 22:45:42 UTC).  The energy counter is another, live device.
+        EntitySpec(
+            "sensor.smart_plug_v2_terrace_power",
+            "hass_sensor_power_w",
+            "W",
+            retired_at=datetime(2026, 11, 3, 22, 46, tzinfo=UTC),
+        ),
         EntitySpec("sensor.terrace_lavadora_energy_today", "hass_sensor_energy_wh", "Wh"),
         *_CLIMATE_SPECS,
     )
@@ -744,6 +773,9 @@ class _EntityStats:
     first_us: int | None = None
     last_us: int | None = None
     chunks: int = 0
+    """Chunks queried for this series (a chunk at or after its retirement is not)."""
+    chunks_retired: int = 0
+    """Chunks not queried because they start at or after :attr:`EntitySpec.retired_at`."""
     chunks_no_series: int = 0
     chunks_no_samples: int = 0
     samples_outside_window: int = 0
@@ -766,7 +798,7 @@ class _EntityStats:
         """Manifest quality flags describing exactly what was empty, and why."""
         e = self.spec.key  # the entity id, plus "#<series>" for an entity with a second series
         out: list[str] = []
-        if self.samples == 0:
+        if self.samples == 0 and (self.chunks or not self.chunks_retired):
             out.append(f"no_samples_extracted:{e}")
         if self.chunks_no_series:
             out.append(f"no_series_chunks:{e}:{self.chunks_no_series}/{chunks_total}")
@@ -782,11 +814,14 @@ class _EntityStats:
             out.append(f"overlapping_target_samples:{e}:{self.overlapping_target_samples}")
         if e in DEAD_DUPLICATE_ENTITY_IDS:
             out.append(f"dead_duplicate_entity:{e}")
+        if self.chunks_retired:
+            skipped = f"{self.chunks_retired}/{self.chunks + self.chunks_retired}"
+            out.append(f"retired_entity_chunks_skipped:{e}:{skipped}")
         return out
 
     def as_dict(self, chunks_total: int) -> dict[str, object]:
         """Structured audit summary (per-series completeness, ADR-0003)."""
-        return {
+        out: dict[str, object] = {
             "entity": self.entity_id,
             "metric": self.spec.metric,
             "unit": self.spec.unit,
@@ -804,6 +839,10 @@ class _EntityStats:
             "non_finite_dropped": self.non_finite,
             "overlapping_target_samples": self.overlapping_target_samples,
         }
+        if self.spec.retired_at is not None:
+            out["retired_at"] = iso_z(self.spec.retired_at)
+            out["chunks_after_retirement"] = self.chunks_retired
+        return out
 
 
 def _coerce_value(
@@ -1136,6 +1175,13 @@ def extract_prometheus(
 
             for spec in specs:
                 st = stats[spec.key]
+                spec_hi_us = hi_us
+                if spec.retired_at is not None:
+                    retired_us = to_micros(spec.retired_at)
+                    if lo_us >= retired_us:
+                        st.chunks_retired += 1  # the entity no longer exists: nothing to ask
+                        continue
+                    spec_hi_us = min(hi_us, retired_us)
                 st.chunks += 1
                 query = build_range_query(spec, window_seconds)
                 matrix = query_range_vector(
@@ -1152,7 +1198,7 @@ def extract_prometheus(
                         stats=st,
                         query=query,
                         lo_us=lo_us,
-                        hi_us=hi_us,
+                        hi_us=spec_hi_us,
                         allow_non_finite=allow_non_finite,
                     )
                 )
@@ -1197,7 +1243,7 @@ def extract_prometheus(
     flags: list[str] = []
     for spec in specs:
         st = stats[spec.key]
-        flags.extend(st.flags(chunk_count))
+        flags.extend(st.flags(st.chunks))
         log.info(
             "entity %s metric=%s unit=%s samples=%d series=%d first=%s last=%s "
             "chunks_no_series=%d chunks_no_samples=%d outside_window=%d dropped_dup=%d",
@@ -1213,7 +1259,7 @@ def extract_prometheus(
             st.samples_outside_window,
             st.duplicates + st.boundary_duplicates,
         )
-    if total_rows == 0:
+    if total_rows == 0 and any(stats[s.key].chunks for s in specs):
         flags.append("no_samples_extracted:all")
         log.warning(
             "no samples found for %s in [%s, %s) — coverage is NOT established by an "
@@ -1228,7 +1274,7 @@ def extract_prometheus(
     manifest.part_files = part_files
     manifest.quality_flags = sorted(set(flags))
     manifest.params["chunks"] = chunk_count
-    manifest.params["entity_stats"] = [stats[s.key].as_dict(chunk_count) for s in specs]
+    manifest.params["entity_stats"] = [stats[s.key].as_dict(stats[s.key].chunks) for s in specs]
     manifest.coverage_notes = (
         f"{chunk_count} chunk(s) of <= {chunk_seconds}s covering "
         f"[{iso_z(t_start)}, {iso_z(t_end)}) via instant range-vector queries; "
