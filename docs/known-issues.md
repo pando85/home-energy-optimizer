@@ -150,3 +150,82 @@ the chunk start, and `carry_in` is derived from it. That anchoring is what makes
 carry-in rows collapse correctly on re-extraction — the same chunk start produces
 the same synthetic row, so an overlapping re-pull suppresses it like any other
 duplicate rather than inventing an appliance event per run.
+
+## Battery: findings of the commissioning test (2026-11-03)
+
+A supervised test of the Marstek Venus E V3 behind Omnibattery v1.5.0 on the commissioning evening (backup
+switchover, an 800 W charge, a discharge, HA restart and kill) left the issues below. The measured facts that
+are now configuration (AC power sign, AC-side counters, commissioning instant) are in `config/service.yaml`
+and the [regime log](components/regime-log.md); the live-control consequences are in
+[ADR-0007](adr/0007-live-battery-control.md#commissioning-findings-2026-11-03).
+
+### The PD target is bounded by the system caps while the power limits are on
+
+With `switch.omnibattery_system_power_limits` on, Omnibattery bounds `number.omnibattery_pd_target_grid_power`
+to `[-system max discharge, +system max charge]` (-800..+1000 W with the caps 800/1000 W on the test socket),
+not to the batteries' ±2500 W. The actuator reads the entity's live `min`/`max` attributes and never turns the
+power limits off; the discharge mapping turns them on. So every charge after the first discharge (and today,
+with the owner's caps left on) gets `min(house load + P, import_cap_w, system max charge)`: the charge is at
+most `system max charge - house load` (also capped at the system max charge itself), and **zero** once the
+house load reaches the system max charge, since the discharge switch is off. Nothing fails: the target is in
+range, the readback confirms it, the guard passes and the heartbeat runs; only `clamped: true` in the
+`actuation/` record and the gap between desired and observed battery power show it.
+
+Before `live`, either the owner raises `number.omnibattery_system_max_charge_power` to the battery's 2500 W
+once the battery is off the temporary socket (configuration only; the bound is then +2500 W, as ADR-0007
+decision 4 assumes), or the actuator turns the power limits off in charge mode (the discharge cap does not
+matter while discharge is off) or writes the system max charge (needs the allowlist and an ADR-0007
+amendment). Either code change removes the owner's own charge cap, so it is an owner decision, not a fix in
+this change. A `clamped` metric for the dry run is a small, useful follow-up.
+
+### Planning from the SOC entity stops while the battery is idle
+
+`planning.soc_source: entity` ages the SOC against `freshness_s.battery_soc` (900 s). Omnibattery reports
+the SOC only on change and HA does not refresh `last_reported` for an unchanged value (verified 2026-11-03,
+ADR-0007 decision 6), so an idle battery's SOC looks stale after 15 minutes and the planner refuses to plan
+(`soc_stale`); in `live` that would also block the first charge out of idle. The age test protects nothing
+here: when Modbus fails Omnibattery keeps the last SOC (the liveness sensor catches it). The committed config
+therefore keeps `soc_source: simulated` after commissioning. Fix before `live`: let the planner's battery SOC
+freshness be `null` (availability only, as `actuation.freshness_s`) and gate it on
+`sensor.omnibattery_non_responsive_batteries`.
+
+### Idle battery counters may void a live slot's gross load
+
+With the battery mapped, a slot record's gross load needs both AC energy counters at both slot edges, each
+no older than `observation.counter_max_age_s` (300 s). If the counters behave like the SOC (reported on
+change only), an idle battery leaves them older than that and the slot's gross load and counterfactual cost
+are `null` (not wrong). Unverified; check the first days of `service/v1/slots/`. The Prometheus history is
+not affected (it samples on every scrape), and slots that end before `battery.commissioned_at` use the grid
+counter alone.
+
+### The PD loop oscillates; the discharge margin was too small
+
+Omnibattery's PD loop swings by about ±150 to 200 W on a ~2 s period. With the original 50 W
+`discharge_margin_w` the grid went to -10..-94 W during the discharge test (Shelly `total_returned` stayed
+0.0 Wh). The committed config uses 200 W (the code default stays 50 W); a smoother Omnibattery PD tuning
+profile (owner setting) would allow a smaller margin.
+
+### The battery holds its last command when Home Assistant is down
+
+On a clean HA restart (40 s down) and a forced pod kill (23 s down) while discharging, the battery kept
+discharging at about 700 W and the grid stayed steady: it does **not** go to standby, and Omnibattery does not
+set it to standby on shutdown. On start Omnibattery re-took control with the switches persisted (a brief dip
+to about 190 W). A longer outage (about 10.5 minutes, HA stopped while discharging) gave the same result: the
+battery held about 620 W of discharge for the whole outage (read directly over Modbus), with no firmware
+timeout and no standby; Omnibattery resumed control at once when HA came back. So there is **no device
+timeout of at least 10 minutes**, and the HA watchdog and the service's safe idle cannot stop the battery while
+HA is down: during an outage it neither follows the house load (a discharge can export when the load drops)
+nor backs off a charge on a load step (the import cap is not regulated). Live mode needs a failsafe that does
+not depend on HA. See ADR-0007.
+
+### Omnibattery can stay in `backup_mode` after the grid returns
+
+After a grid return the inverter goes back to Bypass, but Omnibattery v1.5.0 can stay in its `backup_mode`
+cooldown: an upstream race (in `coordinator.py` the key-update timestamps are set mid-poll, the data is
+published later) skips the Bypass zeroing, and a backup-port load above `number.venus_backup_offgrid_threshold`
+(default 50 W; 57 to 85 W observed) keeps refreshing the 5-minute cooldown. While it lasts
+`integration_status` is `backup_mode`, so the actuator holds safe idle (`integration_unhealthy`), possibly
+indefinitely. Workaround: a threshold of 200 W cleared the state within 5 minutes; the owner has since set
+500 W. It must stay above the backup-port load, so re-check it when the servers move to the backup port.
+Upstream: issue ffunes/Omnibattery#660, fixed by ffunes/Omnibattery#723 (stage `_key_update_times` together
+with `data.update`); drop the workaround once a release with it is installed.

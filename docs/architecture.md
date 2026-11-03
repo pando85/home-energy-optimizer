@@ -371,6 +371,7 @@ weather-forecast archives, see [service.md](service.md#passive-archives)), reads
 Prometheus, solves the offline MPC kernel every 15 minutes in a bounded worker, records time-bounded
 shadow intents and exposes `/health/live`, `/health/ready`, `/status`, `/plan` and `/metrics`.
 `battery-optimizer shadow-report` compares the recorded plans with the native battery behaviour.
-No battery entity exists in Home Assistant yet, so the committed configuration runs a virtual battery
-(`soc_source: simulated`) until the Omnibattery entities are mapped. Architecture, configuration,
+The battery was commissioned on 2026-11-03 and its SOC and AC energy counters are mapped, but the
+committed configuration still runs a virtual battery (`soc_source: simulated`) until the planner's SOC
+freshness check suits Omnibattery's report-on-change entities. Architecture, configuration,
 metrics, failure modes and the comparison method: [service.md](service.md).

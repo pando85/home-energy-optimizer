@@ -97,19 +97,19 @@ flowchart LR
 | [system-replay-benchmark](system-replay-benchmark.md) | the decisions in the ADRs |
 | [climate-mpc](climate-mpc.md) | the B2 shadow records and the B3 comparison after winter; nothing acts on it |
 
-## Status (2026-10-31)
+## Status (2026-11-03)
 
 | Component | Status | Since | One-line reason |
 |---|---|---|---|
-| [data-pipeline](data-pipeline.md) | valid until battery go-live | 2026-10-31 | `build` reconstructs gross load and refuses the no-battery assumption from `battery.commissioned_at`; set it and the counter ids on install day |
+| [data-pipeline](data-pipeline.md) | stale | 2026-11-03 | Battery commissioned; counters and `battery.commissioned_at` set, the reconstruction's acceptance check needs a week of data |
 | [outdoor-temperature](outdoor-temperature.md) | valid | 2026-10-30 | Debiased house sensor, fused series only fills long gaps |
 | [heat-pump-controller](heat-pump-controller.md) | valid (legacy), being replaced | 2026-10-30 | Cheapest-hours rule is live; comfort controller designed 2026-10-31, merge gated on the battery ([design](../planning/comfort-controller-design.md)) |
 | [cop-model](cop-model.md) | provisional | 2026-10-30 | Daily error passes, season error fails; trained on 26 to 28 degC water only |
 | [thermal-model](thermal-model.md) | parked | 2026-10-30 | C2 UNDETERMINED, no model accepted |
 | [hp-consumption-forecast](hp-consumption-forecast.md) | planned (LF-1 stale on rule retirement) | 2026-10-30 | Interface specified, not built; LF-1 replays the legacy rule |
-| [battery-load-forecast](battery-load-forecast.md) | valid for the legacy regime, stale at go-live of the comfort schedule | 2026-10-30 | 28-day mean learns from legacy heat-pump hours |
-| [battery-model](battery-model.md) | provisional | 2026-10-31 | RTE 0.80, SOC window and zero idle draw are assumptions; wear cost set to 0.01 from the sweep, to re-check on measured data |
-| [battery-optimizer](battery-optimizer.md) | valid (shadow only) | 2026-10-31 | Objective unchanged by the decoupling; not go-live ready |
+| [battery-load-forecast](battery-load-forecast.md) | stale | 2026-11-03 | Learns from reconstructed gross load since commissioning; recheck after the data-pipeline acceptance (and again at the comfort schedule) |
+| [battery-model](battery-model.md) | stale | 2026-11-03 | Commissioned with Omnibattery caps of 1000 W charge / 800 W discharge against the modelled 2.5 kW; RTE, SOC window, idle draw still assumptions |
+| [battery-optimizer](battery-optimizer.md) | valid (shadow only) | 2026-11-03 | Objective unchanged; battery idle and simulated SOC; not go-live ready (SOC freshness, charge bound, idle draw) |
 | [tariff-prices](tariff-prices.md) | provisional | 2026-10-30 | Taxes unconfirmed, holidays missing |
 | [boost-mode](boost-mode.md) | planned | 2026-10-30 | Rule, thresholds and interlock not built; phase 2 after the comfort controller works |
 | [system-replay-benchmark](system-replay-benchmark.md) | valid as recorded (legacy and transferred regimes) | 2026-10-30 | Replay B load shape was never the real comfort schedule |

@@ -189,8 +189,12 @@ def test_committed_service_config_loads(monkeypatch):
     assert config.home_assistant.url == "https://ha.example"
     assert config.home_assistant.token.reveal() == "secret-token"
     assert config.entities.get("grid_power") == "sensor.shellyem_main_channel_1_power"
-    assert config.entities.get("battery_soc") is None
-    assert not config.entities.has_battery
+    # Commissioned 2026-11-03: SOC and the AC energy counters are mapped, SOC stays simulated.
+    assert config.entities.get("battery_soc") == "sensor.venus_battery_soc"
+    assert config.entities.get("battery_charge_energy") == "sensor.venus_total_charging_energy"
+    assert config.entities.get("battery_power") is None
+    assert config.entities.has_battery
+    assert config.planning.soc_source == "simulated"
     public = config.public_dict()
     assert "secret-token" not in repr(public)
     assert public["home_assistant"]["token_configured"] is True
@@ -214,7 +218,10 @@ def test_token_file(tmp_path, monkeypatch):
     ("override", "message"),
     [
         ({"mode": "autopilot"}, "is not one of"),
-        ({"planning.soc_source": "entity"}, "needs entities.battery_soc"),
+        (
+            {"planning.soc_source": "entity", "entities.battery_soc": None},
+            "needs entities.battery_soc",
+        ),
         ({"planning.solve_timeout_s": 500}, "solve_timeout_s"),
         ({"entities.bogus": "sensor.x"}, "unknown entity roles"),
         ({"entities.grid_power": None}, "grid_power is required"),

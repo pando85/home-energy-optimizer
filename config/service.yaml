@@ -41,31 +41,33 @@ prometheus:
   timeout_s: 60
   history_days: 28
 
-# Role -> entity ID.  Verified against the live registry with a read-only token on
-# 2026-10-25: the Shelly meter and the PVPC sensor exist; NO battery / Omnibattery
-# entity exists yet (the battery is bought but not integrated in HA).  The battery
-# roles therefore stay null until TODO-5.1; the typical Omnibattery fresh-install IDs
-# are given as comments (upstream: "use the entity picker instead of assuming").
+# Role -> entity ID.  Shelly meter and PVPC sensor verified against the live registry with
+# a read-only token on 2026-10-25; the battery roles (Marstek Venus E V3 behind Omnibattery,
+# device name `venus`) mapped at commissioning on 2026-11-03 (docs/components/regime-log.md).
 entities:
-  # Signed net-grid power, positive = import.  Sign/placement is a user assertion
-  # (ADR-0003): the export counter has never moved, so the sign is untested.
+  # Signed net-grid power, positive = import.  Sign verified 2026-11-03: it went negative
+  # (-10..-94 W) during a brief export of the commissioning discharge test.
   grid_power: sensor.shellyem_main_channel_1_power
   # Whole-home import counter (kWh); slot energy comes from its deltas.
   grid_energy: sensor.shellyem_main_channel_1_energy
   # PVPC (pvpc_updated): price_HHh today, price_next_day_HHh after publication,
   # "_d" suffix on the repeated fall-back hour.
   price: sensor.esios_pvpc
-  battery_soc: null                # sensor.omnibattery_system_soc
-  battery_power: null              # signed, + charge (per-battery *_battery_power)
-  battery_charge_power: null       # sensor.omnibattery_system_charge_power
-  battery_discharge_power: null    # sensor.omnibattery_system_discharge_power
-  # PLACEHOLDERS, not entity IDs: fill both in at installation from the HA entity picker
-  # (kWh, cumulative, AC side: the same terminals as the Shelly feed).  The live service
-  # history and the offline `build` (gross = grid - charge + discharge) both read these two.
-  battery_charge_energy: null      # sensor.*_total_charging_energy
-  battery_discharge_energy: null   # sensor.*_total_discharging_energy
-  # Read-only context recorded with each slot (never written).  Add the Omnibattery
-  # control surface here once it exists, e.g. number.omnibattery_pd_target_grid_power,
+  battery_soc: sensor.venus_battery_soc   # %
+  # Signed, + charge.  Not mapped: sensor.venus_ac_power is + while DISCHARGING (the
+  # actuator corrects that with actuation.battery_ac_power_sign; this role has no sign
+  # setting), and the counters below carry the energy.
+  battery_power: null
+  battery_charge_power: null
+  battery_discharge_power: null
+  # Cumulative kWh, AC side (verified 2026-11-03: a supervised charge read 0.180 kWh against
+  # 0.182 kWh of integrated AC power and 0.165 kWh DC; the discharge agreed with AC within the
+  # 0.01 kWh resolution).  The V3 discharge counter excludes the backup-port output.  The live
+  # service history and the offline `build` (gross = grid - charge + discharge) read these two.
+  battery_charge_energy: sensor.venus_total_charging_energy
+  battery_discharge_energy: sensor.venus_total_discharging_energy
+  # Read-only context recorded with each slot (never written).  The Omnibattery control
+  # surface can be added here, e.g. number.omnibattery_pd_target_grid_power,
   # switch.*_battery_allow_charge, switch.*_battery_allow_discharge,
   # switch.omnibattery_system_power_limits, number.omnibattery_system_max_charge_power,
   # number.omnibattery_system_max_discharge_power (0 = UNLIMITED, not zero output),
@@ -73,16 +75,15 @@ entities:
   observed:
     - sensor.shellyem_main_channel_2_power
 
-# Read by the offline dataset build and by `extract --entities` only; `serve` ignores it.
+# Read by the offline dataset build, by `extract --entities` and by the `serve` load history.
 # Not in config/tariff.yaml: that file's hash is part of every dataset_id (ADR-0006).
 battery:
-  # First instant at which the battery may exchange energy, ISO-8601 WITH a UTC offset,
-  # e.g. "2026-11-05T00:00:00+01:00"; null while no battery is installed.  Set it at
-  # installation together with the two energy counters above and the regime log line in
-  # docs/components/regime-log.md.  From this instant on `build` refuses the no-battery
-  # assumption: gross load = grid - charge + discharge, or the interval is unusable.  A window
-  # that ends before it is built exactly as before.
-  commissioned_at: null
+  # First instant at which the battery may exchange energy, ISO-8601 WITH a UTC offset.
+  # From this instant on `build` and the service history refuse the no-battery assumption:
+  # gross load = grid - charge + discharge, or the interval is unusable.  A slot that ends
+  # at or before it is the grid counter alone, exactly as before.  Commissioned 2026-11-03:
+  # the battery's AC input was first energised at 20:14:32 local (regime log).
+  commissioned_at: "2026-11-03T19:14:32.572Z"
 
 # Maximum source age (seconds since HA last_reported) before an input is stale.
 freshness_s:
@@ -93,10 +94,11 @@ freshness_s:
 
 planning:
   # entity:    plan from the live battery SOC entity (refuses to plan when stale).
-  # simulated: pre-commissioning shadow — a virtual battery whose SOC evolves by
-  #            applying the service's own decisions against the measured load.  The
-  #            only honest choice while no battery entity exists; switch to `entity`
-  #            once battery_soc is mapped.
+  # simulated: a virtual battery whose SOC evolves by applying the service's own decisions
+  #            against the measured load.
+  # Stays `simulated` after commissioning (2026-11-03), on purpose: `entity` ages the SOC
+  # against freshness_s.battery_soc below, and Omnibattery reports it only on change, so an
+  # idle battery's SOC looks stale after 15 minutes and planning would stop (known issues).
   soc_source: simulated
   interval_seconds: 900
   # Plans start at the next slot boundary and are solved this long before it.
@@ -171,20 +173,25 @@ actuation:
     # missing or unavailable holds safe idle (guard reason battery_unresponsive).
     battery_liveness: sensor.omnibattery_non_responsive_batteries
   # +1 when sensor.venus_ac_power is positive while CHARGING, -1 when positive while
-  # discharging.  NOT MEASURED YET: dry_run / live refuse to start while it is null.
-  battery_ac_power_sign: null
+  # discharging.  Measured 2026-11-03: -797 W while charging, +797 W while discharging, so
+  # -1 (the actuator's house load is grid - sign * ac_power, charge positive).
+  battery_ac_power_sign: -1
   tick_interval_s: 30             # <= 120: well inside the 5-minute heartbeat watchdog
   # Highest grid-import target ever written: contracted import 5.0 kW and the meter trips
   # instantly on overload.  The guard refuses any number.set_value above it.  Omnibattery
-  # bounds the PD target to its entity max (2500 W here), so the written target is
-  # min(house load + P, import_cap_w, entity max).
+  # bounds the PD target to its entity min/max, read live: +-2500 W (the batteries' limits)
+  # with the system power limits off, [-system max discharge, +system max charge] with them
+  # on (-800..+1000 on 2026-11-03).  The written target is min(house load + P, import_cap_w,
+  # entity max), so with the limits on the charge is at most system max charge - house load.
   import_cap_w: 4500
   # Measured import above import_cap_w + this while charging: charge off at once, and charge
   # intents refused for import_trip_hold_s.  import_cap_w + this must stay below 5000.
   import_guard_margin_w: 200
   import_trip_hold_s: 300
   neutral_pd_target_w: 0          # PD grid target in a planned idle
-  discharge_margin_w: 50          # > 0: small import while discharging, never export
+  # > 0: small import while discharging, never export.  Omnibattery's PD loop swings about
+  # +-150..200 W on a ~2 s period; 50 W gave brief exports (-10..-94 W) on 2026-11-03.
+  discharge_margin_w: 200
   min_discharge_cap_w: 100        # the discharge cap is never written below this (0 = unlimited)
   # Venus E V3 limit: its own max charge/discharge is 2500 W (number.venus_max_charge_power /
   # number.venus_max_discharge_power, min 800, never written here).  Separate from import_cap_w.

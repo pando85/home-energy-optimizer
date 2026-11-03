@@ -16,8 +16,11 @@ the `battery:` block of `config/tariff.yaml`). Roadmap: [Battery Model](../plann
 
 ## Calibrated on
 
-Nothing measured: the battery (Marstek Venus E class AC unit) is bought and **not commissioned**, so there
-is no telemetry. Confirmed from specification or contract: capacity 5.12 kWh nameplate, 2.5 kW AC power,
+Nothing fitted. The battery (Marstek Venus E V3, AC unit) was **commissioned 2026-11-03** ([regime
+log](regime-log.md)); the commissioning test measured signs and counters only. One 800 W charge read about
+0.90 DC/AC and one discharge about 0.94 AC/DC, at 0.01 kWh counter resolution: consistent with 0.894 per leg,
+not an RTE measurement (unbalanced partial cycle). Omnibattery's system caps are 1000 W charge / 800 W
+discharge on the temporary test socket, below the modelled 2.5 kW. Confirmed from specification or contract: capacity 5.12 kWh nameplate, 2.5 kW AC power,
 5.0 kW contracted import limit. Provisional values are in the next section. Datasets built at
 `config_hash` `7a901801...` (RTE 0.80); everything computed at the earlier 0.88 is superseded.
 
@@ -104,5 +107,7 @@ uv run python hack/throughput_sweep.py --dataset <store>/analysis/v1/<dataset_id
 
 ## Status
 
-**provisional** (2026-10-31): RTE, SOC window and idle draw are assumptions, and the wear cost (set to 0.01) is a
-planning convention to be re-checked on measured data. Idle draw must be set before go-live.
+**stale** (2026-11-03): the battery is commissioned and Omnibattery caps it at 1000 W charge / 800 W discharge
+for now, against the modelled 2.5 kW (an "Omnibattery configuration changes limits" trigger); RTE, SOC window
+and idle draw are still assumptions, and the wear cost (0.01) is a planning convention to be re-checked on
+measured data. Recalibrate by step 1 once the caps are final; idle draw must be set before go-live.

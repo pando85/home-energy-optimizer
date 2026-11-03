@@ -142,21 +142,24 @@ planning entities are also refreshed by REST GET every `poll_interval_s` (60 s).
 
 `config/service.yaml` (override with `--service-config` or `BATTERY_OPTIMIZER_SERVICE_CONFIG`) maps
 roles to entity IDs and holds freshness, planning and observation settings; the file documents every
-key. Entity IDs verified against the live registry on 2026-10-25 with the read-only token:
+key. Entity IDs verified against the live registry on 2026-10-25 with the read-only token; the battery
+roles mapped at commissioning on 2026-11-03:
 
 | Role | Entity | State |
 |---|---|---|
-| `grid_power` | `sensor.shellyem_main_channel_1_power` | present (W; sign is a user assertion, the export counter has never moved) |
+| `grid_power` | `sensor.shellyem_main_channel_1_power` | present (W; + import, negative on export, verified 2026-11-03) |
 | `grid_energy` | `sensor.shellyem_main_channel_1_energy` | present (kWh import counter) |
 | `price` | `sensor.esios_pvpc` | present (`pvpc_updated`; `price_HHh`, `price_next_day_HHh` after ~20:00, `_d` on the repeated hour) |
-| `battery_*` | — | **absent**: no Marstek / Omnibattery entity exists in HA yet (typical IDs are listed as comments) |
+| `battery_soc` | `sensor.venus_battery_soc` | present (%; reported on change only) |
+| `battery_charge_energy` / `battery_discharge_energy` | `sensor.venus_total_charging_energy` / `sensor.venus_total_discharging_energy` | present (kWh, AC side, 0.01 kWh resolution; the discharge counter excludes the backup port) |
+| `battery_power` | — | not mapped: `sensor.venus_ac_power` is + while discharging, this role is + charge |
 | observed | `sensor.shellyem_main_channel_2_power` | present (aerotherm branch, context only) |
 
-Until the battery is integrated the committed config uses `soc_source: simulated`. Once the
-Omnibattery entities exist, map `battery_soc` plus either `battery_power` (signed, + charge) or the
-`battery_charge_power`/`battery_discharge_power` pair (and, ideally, the two energy counters), add the
-control surface (`number.*_pd_target_grid_power`, `switch.*_battery_allow_charge/discharge`, system
-caps — where `0` means *unlimited*) to `observed`, and switch to `soc_source: entity`.
+The committed config still uses `soc_source: simulated`: `entity` ages the SOC against
+`freshness_s.battery_soc`, and an idle battery's SOC is reported only on change, so planning would stop
+([known issues](known-issues.md#planning-from-the-soc-entity-stops-while-the-battery-is-idle)). With the
+counters mapped, the load history is `grid - charge + discharge` per slot, except slots that end at or before
+`battery.commissioned_at`, which are the grid counter alone (the counters need not reach back that far).
 
 The `actuation:` section is read only in `dry_run` and `live` (it is validated in every mode); see
 [Live control](#live-control-dry_run-and-live).
@@ -539,7 +542,7 @@ the actuator takes the intent frozen for the current slot and maps it to Omnibat
 |---|---|---|---|
 | `idle` | charge off, discharge off | `neutral_pd_target_w` (0) | untouched |
 | `charge` at P W | discharge off, charge on | `min(house load + P, import_cap_w, entity max)` (never negative) | untouched |
-| `discharge` at P W | charge off, discharge on | `discharge_margin_w` (+50) | on, discharge cap `max(P, min_discharge_cap_w)` (never 0 = unlimited) |
+| `discharge` at P W | charge off, discharge on | `discharge_margin_w` (+200 committed) | on, discharge cap `max(P, min_discharge_cap_w)` (never 0 = unlimited) |
 | safe idle | charge off, discharge off | untouched | untouched |
 
 House load = grid power − battery AC power, charge positive (`battery_ac_power_sign` turns the sensor's sign
@@ -551,10 +554,17 @@ charge-mode PD target's load tracking is rate limited (a change of `min_setpoint
 on, the discharge margin and the discharge cap are always written. Every write except a `turn_off` re-checks the
 kill switch first; if it went off mid-reconcile the actuator aborts to safe idle and hands control back.
 
-Omnibattery bounds the PD target by the batteries' summed charge limit (±2500 W on the installation), so the
-written charge target is `min(house load + P, import_cap_w, entity max)`; the desired state records the value
-actually written and `clamped` when it was cut. The charge is therefore at most 2500 W − house load (about
-2 kW at night): a known limitation, see [ADR-0007](adr/0007-live-battery-control.md#follow-ups).
+Omnibattery bounds the PD target by its entity `min`/`max`, which the actuator reads live: the batteries'
+summed limits (±2500 W) with the system power limits off, `[-system max discharge, +system max charge]` with
+them on (-800..+1000 W on 2026-11-03). The written charge target is `min(house load + P, import_cap_w, entity
+max)`; the desired state records the value actually written and `clamped` when it was cut. The charge is
+therefore at most 2500 W − house load (about 2 kW at night) with the limits off, and only `system max charge −
+house load` (zero once the load reaches it) with them on. The actuator turns the limits on for a discharge and
+never off, so the second case is the normal one until the owner raises the system max charge: see
+[known issues](known-issues.md#the-pd-target-is-bounded-by-the-system-caps-while-the-power-limits-are-on).
+
+`discharge_margin_w` is 200 W in the committed config (code default 50 W): Omnibattery's PD loop swings by
+±150 to 200 W on a ~2 s period, and 50 W gave brief exports in the commissioning test.
 
 **Guard** (any failure → safe idle, recorded with the reason): `import_over_cap` (measured import above
 `import_cap_w + import_guard_margin_w` while charge is on: charge off at once, and charge refused for
@@ -577,7 +587,10 @@ cannot even confirm safe idle sends no heartbeat.
 
 **Restart and shutdown.** Plans live only in memory; the actuator acts only on intents of plans solved by
 this process, so after a restart it holds safe idle until a fresh plan's slot opens. A graceful stop (SIGTERM)
-cancels the actuator loop and sets safe idle before the HA session closes (`shutdown_timeout_s`).
+cancels the actuator loop and sets safe idle before the HA session closes (`shutdown_timeout_s`). None of
+this reaches the battery while Home Assistant itself is down: in the commissioning test (HA outages of 23 s
+to 10.5 minutes) the battery kept its last command, see
+[known issues](known-issues.md#the-battery-holds-its-last-command-when-home-assistant-is-down).
 
 **`dry_run`** runs all of the above (kill switch included) and records every write with `result: dry_run`
 under `actuation/` and in `actuator_writes_total{result="dry_run"}`; nothing is sent, because the HA client
@@ -590,9 +603,10 @@ The actuator also wakes on a kill-switch change, and on a grid reading above
 Configuration keys (`actuation:` in `config/service.yaml`; defaults in parentheses): `entities.*` (eleven
 entity IDs, all required outside shadow, including `battery_liveness`, deployed as
 `sensor.omnibattery_non_responsive_batteries`: Omnibattery keeps the last SOC and AC power values when
-Modbus fails, so this is the check that catches a silent battery), `battery_ac_power_sign` (none: required outside shadow),
+Modbus fails, so this is the check that catches a silent battery), `battery_ac_power_sign` (none: required
+outside shadow; -1 committed, measured 2026-11-03: `sensor.venus_ac_power` is negative while charging),
 `tick_interval_s` (30), `import_cap_w` (4500), `import_guard_margin_w` (200), `import_trip_hold_s` (300),
-`neutral_pd_target_w` (0), `discharge_margin_w` (50), `min_discharge_cap_w` (100), `max_discharge_cap_w`
+`neutral_pd_target_w` (0), `discharge_margin_w` (50; 200 committed), `min_discharge_cap_w` (100), `max_discharge_cap_w`
 (2500), `healthy_states` (`balanced`, `charging`, `discharging`), `command_policy.max_attempts` (3),
 `command_policy.min_setpoint_change_w` (100), `command_policy.min_command_interval_s` (30),
 `readback_timeout_s` (10), `shutdown_timeout_s` (15), `freshness_s.grid_power` (30),

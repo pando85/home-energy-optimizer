@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from battery_optimizer.battery_telemetry import load_battery_telemetry
 from battery_optimizer.config import TariffConfig, load_config, resolve_config_path
 from battery_optimizer.paths import _ensure_private_dir, resolve_data_dir
 
@@ -54,6 +55,7 @@ def build_service(
             price_entity=config.entities.get("price"),
             battery_charge_energy_entity=config.entities.get("battery_charge_energy"),
             battery_discharge_energy_entity=config.entities.get("battery_discharge_energy"),
+            battery_commissioned_at=load_battery_telemetry(config.source_path).commissioned_at,
             interval_seconds=config.planning.interval_seconds,
         ).fetch
 

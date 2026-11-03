@@ -21,7 +21,8 @@ and the data volume are deployed from the homelab repository.
 - Frozen baseline dataset `2e01620ba727` (2024-01-01 to 2025-12-31, `config_hash` `7a901801...`, RTE 0.80), run `fe3cbfec46b6`.
 - Current cluster-store dataset `cdd448abb006` (2024-01-01 to 2026-10-01, built at code `0e5887f`,
   same `config_hash`); climate feature set `da6d678016ed` (2023-11-07 to 2026-05-01, code `ac90586`).
-- Plant regime: no battery, legacy heat-pump control, S1 to S3 (see [regime log](regime-log.md)).
+- Plant regime: no battery, legacy heat-pump control, S1 to S3 (see [regime log](regime-log.md)). The battery
+  was commissioned 2026-11-03 19:14:32 UTC; no dataset reaching that instant has been built yet.
 
 ## Assumptions
 
@@ -29,7 +30,10 @@ and the data volume are deployed from the homelab repository.
   and the servers are inside it, not added to it ([ADR-0003](../adr/0003-phase1-measurement-and-baseline.md)).
 - Before `battery.commissioned_at`: no battery (`battery_absent=True`, a recorded assumption); a window
   ending before it is byte-identical to a build before the battery code (same id, manifest, part).
-- From it: `gross = raw - charge + discharge` per interval, as `service/history.py`. An unknown counter or
+- From it: `gross = raw - charge + discharge` per interval, as `service/history.py` (which also keeps the grid
+  counter alone for slots ending at or before it). The counters `sensor.venus_total_charging_energy` /
+  `_discharging_energy` are AC side (commissioning test 2026-11-03: charge 0.180 kWh against 0.182 kWh of
+  integrated AC power and 0.165 kWh DC), 0.01 kWh resolution; the discharge counter excludes the backup port. An unknown counter or
   a negative result nulls `gross_kwh` (`battery_counters_missing`, `battery_gross_negative`); counters
   not configured or absent from the archive refuse the build. Any counter decrease nulls its interval
   (stricter than the `counter_rates` rollback rule).
@@ -56,7 +60,9 @@ and the data volume are deployed from the homelab repository.
 
 ## Status
 
-**valid** until battery go-live. Reconstruction and refusal are in the code (climate plan item 6); the
-install-day config is unset, untested on real counters. 2026-11-03: the build's reconstruction had the
+**stale** (2026-11-03): the battery is commissioned and recalibration step 1 is done (counters and
+`battery.commissioned_at` set); steps 2 and 3 need a week of post-commissioning data. Until the acceptance
+check passes, the reconstruction is untested on real counters. Reconstruction and refusal are in the code
+(climate plan item 6). 2026-11-03: the build's reconstruction had the
 sign reversed (`raw + charge - discharge`, the service always used `raw - charge + discharge`); corrected
 before go-live, so no dataset was built with it.

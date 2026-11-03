@@ -112,11 +112,21 @@ Phases 0–4 can proceed without the physical battery. **Phase 5 requires verifi
 ## 8. Phase 5 — Integrate in shadow mode (no actuator writes)
 
 - [ ] **TODO-5.1** Install and validate the battery through Home Assistant/Omnibattery using GitOps-compatible configuration and HACS deployment instructions. Confirm grid meter sign, actual battery power, SOC, and exact HA entities and service APIs.
+  *Progress 2026-11-03 (commissioning test):* commissioned at 2026-11-03T19:14:32.572Z; grid sign confirmed
+  (negative on export); `sensor.venus_ac_power` negative while charging; AC-side energy counters and SOC mapped in
+  `config/service.yaml` ([regime log](../components/regime-log.md), [known issues](../known-issues.md#battery-findings-of-the-commissioning-test-2026-11-03)).
 - [ ] **TODO-5.2** Document exactly **one physical battery writer**: Omnibattery retains Modbus ownership and fast PD control. [ADR-0004's source audit](../adr/0004-battery-optimizer-production-architecture.md#omnibattery-integration-contract--source-review-2026-10-24) identifies existing candidate HA entities for `pd_target_grid_power`, `system_power_limits`, `system_max_charge/discharge_power` and per-battery `battery_allow_charge/discharge`, without entering individual manual mode. **Validate** which exist and work on the installed Venus E V3. Manual-mode handoff removes the battery from automatic PD and is not the preferred dispatch route; a new atomic high-level upstream API is a fallback only if necessary.
 - [ ] **TODO-5.3** Deploy planner read-only in the homelab, emit predicted plans and compare them with live telemetry and actual native behavior, without requesting any battery commands.
 - [ ] **TODO-5.4** Characterize and validate independent protection: meter staleness (upstream documentation allows up to ~65 s), battery SOC/temperature unavailability, driver/API latency, HA restart and **HA host powered off**, Modbus/network loss, command timeouts, expired economic intent, optimizer solver errors and invalid price feed. Test whether the **device** retains an old power command without HA; do not call an in-HA lease/watchdog a safe stop after HA failure.
+  *Progress 2026-11-03:* HA restart (40 s) and forced kill (23 s) while discharging: the battery **kept** its last
+  command and did not go to standby; a 10.5-minute stop too (about 620 W held throughout, no firmware timeout).
+  HA host power-off is still untested; an HA-independent failsafe is needed for unattended `live`.
 - [ ] **TODO-5.5** Instrument Grafana dashboard for current plan, source freshness, controller ownership/blockers, last applied HA config and requested vs observed battery/grid power, forecast quality, intended vs actual AC energy, opportunity cost and alerts. Keep all input data local; Vault-backed secrets if needed.
-- [ ] **TODO-5.6 — Omnibattery contract characterization (shadow/test bench).** Inventory current HA entity IDs and attributes. Test positive import targets during charge vs requested battery watts (include changing base load), a small positive import target during discharge, power-cap enable/disable, **cap=0 semantics**, permission switches and physical stop, controller target overrides (pricing, predictive, time slots, hourly balance, peak shaving), and command behavior across HA restarts. Confirm full control cycle sign conventions, meter cadences, sensor staleness, and the ~250 W BACKUP load's actual *AC Bypass* state versus true off-grid exclusion (default 50 W threshold + 5 min cooldown). Test partial updates and out-of-band HA configuration changes. Preserve settings set by the user/installer; do not overwrite them indefinitely.
+- [ ] **TODO-5.6 — Omnibattery contract characterization (shadow/test bench).** Inventory current HA entity IDs and attributes. Test positive import targets during charge vs requested battery watts (include changing base load), a small positive import target during discharge, power-cap enable/disable, **cap=0 semantics**, permission switches and physical stop, controller target overrides (pricing, predictive, time slots, hourly balance, peak shaving), and command behavior across HA restarts. Confirm full control cycle sign conventions, meter cadences, sensor staleness, and the ~250 W BACKUP load's actual *AC Bypass* state versus true off-grid exclusion (default 50 W threshold + 5 min cooldown). *Progress 2026-11-03:* PD target bounded by the system caps while
+the power limits are on; PD oscillation ±150 to 200 W at ~2 s; backup switchover passed three times (Backup Mode
+1 to 6 s after AC loss, no load drop); an upstream race can latch `backup_mode` (workaround: threshold above the backup load, 500 W now;
+fixed upstream by ffunes/Omnibattery#723).
+Test partial updates and out-of-band HA configuration changes. Preserve settings set by the user/installer; do not overwrite them indefinitely.
 
 
 **Exit criteria:** at least two representative weeks of shadow operation (including cheap and expensive weekdays and weekend), zero unplanned battery writes, no unexplained telemetry/sign errors, documented safe handoff procedure, and reproducible estimated uplift relative to Omnibattery's native schedule.
@@ -283,8 +293,9 @@ secrets references, storage, policies, dashboards and runbooks. The history impo
   *Built 2026-10-25 in `src/battery_optimizer/service/` ([service docs](../service.md)): read-only allowlist guard on
   every WebSocket frame and REST request, subscribe-then-`get_states` resync on every connect, source-time ordering,
   `oracle.solve_oracle` + `dispatch.intents_from_schedule` in a one-worker executor with a timeout, time-bounded
-  shadow intents and an append-only store. No battery entity exists in HA yet, so the committed config runs a
-  virtual battery (`soc_source: simulated`) until TODO-5.1 maps the Omnibattery entities.*
+  shadow intents and an append-only store. The committed config runs a virtual battery (`soc_source: simulated`);
+  the Omnibattery SOC and counters are mapped since commissioning (2026-11-03), `entity` waits on the SOC
+  freshness follow-up in [known issues](../known-issues.md#planning-from-the-soc-entity-stops-while-the-battery-is-idle).*
 - [x] **PROD-C2 — HTTP surface.** FastAPI/ASGI with `GET /health/live`, `/health/ready`, `/status`, `/plan` and
   `/metrics`; ClusterIP only, no public ingress and no writable commands.
   *Built 2026-10-25 (`battery-optimizer serve`, port 8080); `battery-optimizer shadow-report` adds the
