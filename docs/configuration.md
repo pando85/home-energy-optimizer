@@ -11,7 +11,7 @@ flags are in the [CLI reference](cli.md); the service-specific settings (`config
 | `BATTERY_OPTIMIZER_DATA_DIR` | Private dataset store; must be **outside** any git worktree | `~/data/energy-baseline` |
 | `BATTERY_OPTIMIZER_CONFIG` | Tariff configuration file | `config/tariff.yaml` relative to the working directory |
 | `BATTERY_OPTIMIZER_HA_URL` | Home Assistant base URL | built-in default |
-| `BATTERY_OPTIMIZER_HA_TOKEN` | Home Assistant bearer token, read-only; required for HA extraction, `ha-states` and `serve` | unset |
+| `BATTERY_OPTIMIZER_HA_TOKEN` | Home Assistant bearer token of a non-admin user; required for HA extraction, `ha-states` and `serve`. Only `serve` in `mode: live` ever writes, and only the allowlisted Omnibattery entities ([ADR-0007](adr/0007-live-battery-control.md)) | unset |
 | `BATTERY_OPTIMIZER_HA_TOKEN_FILE` | File holding the token (e.g. a mounted secret); used by `serve` when the variable above is unset | unset |
 | `BATTERY_OPTIMIZER_SERVICE_CONFIG` | Shadow service configuration (`serve`, `shadow-report`); `build` and `extract` also read its battery counters and `battery.commissioned_at` (a missing file named here is an error) | `config/service.yaml` relative to the working directory |
 | `BATTERY_OPTIMIZER_PORT` | HTTP port of `serve` | `8080` |
@@ -114,6 +114,16 @@ Every command in the [CLI reference](cli.md) is run manually (or by a human-driv
 (extract → validate → build → benchmark → report) is deferred to a later phase: see
 [ADR-0003](adr/0003-phase1-measurement-and-baseline.md) for the scope boundary.
 
+### Service mode (shadow, dry_run, live)
+
+`mode:` in `config/service.yaml` selects what `serve` may do: `shadow` (the default and the committed value)
+reads only; `dry_run` also computes and records the Omnibattery writes it would make and sends nothing; `live`
+sends them through the `ha_guard` allowlist, gated by the owner's kill switch. The `actuation:` section (entity
+IDs, import cap, margins, command policy, freshness) is documented in
+[service.md](service.md#live-control-dry_run-and-live); `dry_run` and `live` refuse to start without the
+measured `actuation.battery_ac_power_sign`, and `live` also without `planning.soc_source: entity`. Changing the
+mode is a homelab config change of the deployed `service.yaml`, never an environment variable.
+
 ## HA authentication
 
 HA history extraction requires a bearer token. The token is **never written to
@@ -137,6 +147,9 @@ extract call and is never persisted.
 ## Secrets policy
 
 - No secrets are written to files by this package
+- The HA token belongs to a non-admin user. HA cannot restrict a token to entities or services, so outside
+  `mode: live` the code (`service/ha_guard.py`) is what keeps it read-only; in `live` a dedicated user's token
+  is used and the same guard admits only the allowlisted Omnibattery writes and the heartbeat
 - `BATTERY_OPTIMIZER_HA_TOKEN` is read from env or passed explicitly; never logged
 - HA extraction writes no endpoint identity: the manifest records
   `endpoint: "home-assistant-history-api"` plus a 16-char SHA-256 digest of the

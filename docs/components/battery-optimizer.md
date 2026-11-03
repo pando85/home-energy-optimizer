@@ -7,15 +7,19 @@ One MILP kernel (`oracle.solve_oracle`, HiGHS) serves the benchmark policies (`p
 `rolling_horizon.py`) and the live shadow planner (`service/planner.py` `run_planner`, free terminal mode,
 re-solved every 15 minutes). Owner: this repository. Roadmap:
 [Dispatch Optimizer](../planning/components/dispatch-optimizer.md). Go-live is through OmniBattery, driven
-by this optimizer, under a separate ADR; the shadow phase has no writer.
+by this optimizer, under [ADR-0007](../adr/0007-live-battery-control.md) (Proposed): `mode: shadow` (default)
+has no writer; `dry_run` records the Omnibattery writes it would make; `live` sends them
+(`service/actuator.py`).
 
 ## Interfaces
 
 - **In:** [battery-load-forecast](battery-load-forecast.md), published prices ([tariff-prices](tariff-prices.md)),
   [battery-model](battery-model.md), current SOC (simulated until commissioning).
 - **Out:** `DispatchPlan` and `DispatchIntent` (`dispatch.py`, types only), shadow records and metrics.
-  Not a battery command.
-- **Consumers:** [system-replay-benchmark](system-replay-benchmark.md); later the battery actuator.
+  Not a battery command by itself.
+- **Consumers:** [system-replay-benchmark](system-replay-benchmark.md); the battery actuator
+  (`service/actuator.py`, `dry_run`/`live` only), which maps the current slot's intent to Omnibattery's
+  direction switches, PD grid-import target (capped at `actuation.import_cap_w`, 4500 W) and discharge cap.
 
 ## Calibrated on
 
@@ -40,7 +44,10 @@ by this optimizer, under a separate ADR; the shadow phase has no writer.
   average with no margin; load that is not in the forecast (boost, hot-water booster) is invisible to that
   constraint. Because the trip is instantaneous, the cap cannot rely on 15-minute averages: OmniBattery must regulate
   against the measured load in real time with a margin below the limit. This is a requirement for the
-  actuator ADR, and at go-live the cap is **required**, not optional.
+  actuator ADR, and at go-live the cap is **required**, not optional. ADR-0007 implements it as the PD
+  grid-import target `min(house load + P, 4500 W)` (Omnibattery reduces the charge when house load rises), a
+  guard that refuses any written target above the cap, and a hard rule that switches charge off when the
+  measured import exceeds 4700 W.
 - **Heater inputs to the import limit** (Panasonic service manual; details in
   [heat-pump-controller](heat-pump-controller.md#heater-facts-import-limit-inputs)): the heat pump alone draws
   at most 3.47 kW, and its integrated 3.00 kW electric heater brings the worst case to about 6.5 kW, above the
@@ -89,5 +96,8 @@ explained before go-live; the floor-hit share on expensive cold-day slots stays 
 
 ## Status
 
-**valid, shadow only** (2026-10-31). Not go-live ready: idle draw, measured SOC, the import-cap adapter and the
-actuator ADR are open; the wear cost is set (0.01) and is re-checked on measured data after commissioning.
+**valid, shadow only** (2026-10-31). The actuator ([ADR-0007](../adr/0007-live-battery-control.md), Proposed,
+2026-11-03) and its import-cap adapter are built but not deployed (`mode: shadow` in the committed config): a code
+change, not a plant change, so no regime-log row and no recalibration. Not go-live ready: idle draw, measured SOC
+(`soc_source: entity`), the sign of the battery AC power sensor and the ADR approval are open; the wear cost is set
+(0.01) and is re-checked on measured data after commissioning.
