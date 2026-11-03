@@ -63,6 +63,15 @@ BATTERY_ROLES: tuple[str, ...] = tuple(r for r in ENTITY_ROLES if r.startswith("
 
 SOC_SOURCES: tuple[str, ...] = ("entity", "simulated")
 
+#: Roles whose ``freshness_s`` may be ``null`` and are by default: availability only, no age
+#: test.  Omnibattery reports these only on change, so an idle battery's SOC and AC energy
+#: counters keep an old ``last_reported`` while healthy (verified 2026-11-03).
+AVAILABILITY_ONLY_ROLES: tuple[str, ...] = (
+    "battery_soc",
+    "battery_charge_energy",
+    "battery_discharge_energy",
+)
+
 #: ``shadow`` records intents only; ``dry_run`` also computes and records every Omnibattery
 #: write it would make; ``live`` sends them through the guarded allowlist (ADR-0007).
 SERVICE_MODES: tuple[str, ...] = ("shadow", "dry_run", "live")
@@ -338,7 +347,8 @@ class ServiceConfig:
     prometheus: PrometheusSettings
     planning: PlanningSettings
     observation: ObservationSettings
-    #: ``battery_soc`` may be ``None``: availability only, no age test (see :meth:`freshness_for`).
+    #: :data:`AVAILABILITY_ONLY_ROLES` may be ``None``: availability only, no age test (see
+    #: :meth:`freshness_for`).
     freshness_s: Mapping[str, float | None]
     archive: ArchiveSettings = field(default_factory=ArchiveSettings)
     climate_shadow: ClimateShadowSettings = field(default_factory=ClimateShadowSettings)
@@ -354,19 +364,18 @@ class ServiceConfig:
     def freshness_for(self, role: str) -> float | None:
         """Maximum age for a role; power roles share ``battery_power``'s limit.
 
-        ``None`` (``battery_soc`` only, its default) = availability only, no age test:
-        Omnibattery reports the SOC only on change, so an idle battery's SOC keeps an old
-        ``last_reported`` while healthy, exactly as the actuator's ``freshness_s`` assumes.
+        ``None`` (the default of :data:`AVAILABILITY_ONLY_ROLES`, and only allowed for them) =
+        availability only, no age test: Omnibattery reports the SOC and the AC energy counters
+        only on change, so on an idle battery they keep an old ``last_reported`` while healthy,
+        exactly as the actuator's ``freshness_s`` assumes.  A number restores the age test.
         """
-        if role == "battery_soc":
-            value = self.freshness_s.get(role)
-            return None if value is None else float(value)
         if role in self.freshness_s:
-            return float(self.freshness_s[role])
+            value = self.freshness_s[role]
+            return None if value is None else float(value)
+        if role in AVAILABILITY_ONLY_ROLES:
+            return None
         if role in ("battery_charge_power", "battery_discharge_power"):
             return float(self.freshness_s.get("battery_power", 300.0))
-        if role in ("battery_charge_energy", "battery_discharge_energy"):
-            return float(self.freshness_s.get("grid_energy", 900.0))
         return 900.0
 
     def public_dict(self) -> dict[str, Any]:
@@ -925,7 +934,9 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
         )
     fresh_raw = _section(raw, "freshness_s")
     freshness: dict[str, float | None] = {
-        str(k): None if k == "battery_soc" and v is None else _positive(v, f"freshness_s.{k}")
+        str(k): None
+        if k in AVAILABILITY_ONLY_ROLES and v is None
+        else _positive(v, f"freshness_s.{k}")
         for k, v in fresh_raw.items()
     }
     return ServiceConfig(

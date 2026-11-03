@@ -62,7 +62,8 @@ entities:
   battery_discharge_power: null
   # Cumulative kWh, AC side (verified 2026-11-03: a supervised charge read 0.180 kWh against
   # 0.182 kWh of integrated AC power and 0.165 kWh DC; the discharge agreed with AC within the
-  # 0.01 kWh resolution).  The V3 discharge counter excludes the backup-port output.  The live
+  # 0.01 kWh resolution).  The discharge counter includes what the battery supplies to the
+  # backup (EPS) port (measured 2026-11-03, docs/components/data-pipeline.md).  The live
   # service history and the offline `build` (gross = grid - charge + discharge) read these two.
   battery_charge_energy: sensor.venus_total_charging_energy
   battery_discharge_energy: sensor.venus_total_discharging_energy
@@ -95,6 +96,12 @@ freshness_s:
   # its last value when Modbus fails, which actuation.entities.battery_liveness catches instead.
   # A number restores the age test.
   battery_soc: null
+  # The battery AC energy counters: null (the default) for the same reason, verified at go-live
+  # on 2026-11-03 (an idle battery's counters never re-report, so the former inherited 900 s of
+  # grid_energy marked them stale in /status and battery_optimizer_input_stale).  They gate
+  # neither planning nor actuation.  A number restores the age test.
+  battery_charge_energy: null
+  battery_discharge_energy: null
   battery_power: 300
 
 planning:

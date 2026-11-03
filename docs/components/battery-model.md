@@ -107,7 +107,8 @@ uv run python hack/throughput_sweep.py --dataset <store>/analysis/v1/<dataset_id
 
 ## Status
 
-**stale** (2026-11-03): the battery is commissioned and Omnibattery caps it at 1000 W charge / 800 W discharge
-for now, against the modelled 2.5 kW (an "Omnibattery configuration changes limits" trigger); RTE, SOC window
-and idle draw are still assumptions, and the wear cost (0.01) is a planning convention to be re-checked on
-measured data. Recalibrate by step 1 once the caps are final; idle draw must be set before go-live.
+**stale** (2026-11-03): the battery is commissioned and, since go-live (2026-11-03 23:45, regime log), live
+with Omnibattery's system caps at 2500 W charge / 2500 W discharge and Marstek Premium mode on (from the test
+socket's 1000/800 W: an "Omnibattery configuration changes limits" trigger, now matching the modelled 2.5 kW).
+RTE, SOC window and idle draw are still assumptions, and the wear cost (0.01) is a planning convention to be
+re-checked on measured data. Recalibrate by step 1 on the live cycles; idle draw was not set before go-live.

@@ -142,6 +142,58 @@ def test_idle_soc_without_reports_still_plans(tmp_path, cleanup):
     assert service.plans[-1].snapshot.soc_source == "entity"
 
 
+def _feed_idle_counters(service, at):
+    for entity, value in (
+        ("sensor.venus_total_charging_energy", 1.23),
+        ("sensor.venus_total_discharging_energy", 0.98),
+    ):
+        service.store.apply(
+            entity_state(entity, value, at, attributes={"unit_of_measurement": "kWh"})
+        )
+
+
+def _counter_inputs(service):
+    return {
+        item["role"]: item
+        for item in service.status()["inputs"]
+        if item["role"] in ("battery_charge_energy", "battery_discharge_energy")
+    }
+
+
+def test_idle_battery_counters_are_not_stale_by_default(tmp_path, cleanup):
+    # Omnibattery reports the AC energy counters only on change: an idle battery's are hours old.
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, entity_mode=True)
+    cleanup(service)
+    feed(service, NOW)
+    _feed_idle_counters(service, NOW - timedelta(hours=3))
+    assert service.config.freshness_for("battery_charge_energy") is None
+    assert service.config.freshness_for("battery_discharge_energy") is None
+    assert service.evaluate_inputs(NOW) == []
+    counters = _counter_inputs(service)
+    assert set(counters) == {"battery_charge_energy", "battery_discharge_energy"}
+    for item in counters.values():
+        assert item["max_age_s"] is None and item["fresh"] is True
+        assert item["age_s"] == pytest.approx(3 * 3600)
+    assert run(service.request_solve("test")) == "ok"
+
+
+def test_a_numeric_counter_limit_restores_the_age_test(tmp_path, cleanup):
+    clock = FakeClock(NOW)
+    service = make_service(
+        tmp_path, clock, entity_mode=True, **{"freshness_s.battery_charge_energy": 900}
+    )
+    cleanup(service)
+    feed(service, NOW)
+    _feed_idle_counters(service, NOW - timedelta(seconds=1000))
+    counters = _counter_inputs(service)
+    assert counters["battery_charge_energy"]["max_age_s"] == 900.0
+    assert counters["battery_charge_energy"]["fresh"] is False
+    # The other counter keeps its own (default) setting.
+    assert counters["battery_discharge_energy"]["max_age_s"] is None
+    assert counters["battery_discharge_energy"]["fresh"] is True
+
+
 @pytest.mark.parametrize(
     ("entity", "state", "planned"),
     [

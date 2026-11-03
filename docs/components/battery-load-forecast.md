@@ -59,7 +59,8 @@ alternating-arm weeks from every evaluation window):
 ## Status
 
 **stale** (2026-11-03): the battery is commissioned, so the forecast now learns from reconstructed gross load
-(grid − charge + discharge after `battery.commissioned_at`, the grid counter alone before). The battery is idle
-and the load shape unchanged; recalibrate once the [data-pipeline](data-pipeline.md) reconstruction passes its
+(grid − charge + discharge after `battery.commissioned_at`, the grid counter alone before). The battery is live
+since 2026-11-03 23:45 (regime log), so the reconstruction now carries real charge and discharge; the load
+shape is unchanged. Recalibrate once the [data-pipeline](data-pipeline.md) reconstruction passes its
 acceptance check. It also becomes stale when the comfort schedule goes live (recalibrate after 28 days of
-new-regime data). Harmless while the battery is shadow-only; matters before go-live.
+new-regime data). It matters now that the battery is live.

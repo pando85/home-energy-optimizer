@@ -100,7 +100,12 @@ explained before go-live; the floor-hit share on expensive cold-day slots stays 
 
 ## Status
 
-**valid, shadow only** (2026-10-31). The actuator ([ADR-0007](../adr/0007-live-battery-control.md), accepted
+**stale** (2026-11-03): live since 2026-11-03 23:45 (first live slot 22:45 UTC; [regime log](regime-log.md)),
+with system caps 2500/2500 W and Marstek Premium mode on. The go-live trigger above fired (measured SOC replaces
+simulated SOC, the import-cap adapter writes the grid target); the objective and the model are unchanged.
+Recalibrate by the benchmark above on measured load after the 28-day settling period; RTE, idle draw and the
+wear cost are re-checked through [battery-model](battery-model.md). Before go-live, **valid, shadow only**
+(2026-10-31): the actuator ([ADR-0007](../adr/0007-live-battery-control.md), accepted
 2026-11-03) and its import-cap adapter are built but not deployed (`mode: shadow` in the committed config): a code
 change, not a plant change, so no regime-log row and no recalibration. The battery was commissioned on
 2026-11-03 (regime log); no trigger above fired (the battery block of `tariff.yaml` is unchanged, the battery is
