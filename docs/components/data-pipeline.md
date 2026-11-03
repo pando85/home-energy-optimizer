@@ -29,7 +29,7 @@ and the data volume are deployed from the homelab repository.
   and the servers are inside it, not added to it ([ADR-0003](../adr/0003-phase1-measurement-and-baseline.md)).
 - Before `battery.commissioned_at`: no battery (`battery_absent=True`, a recorded assumption); a window
   ending before it is byte-identical to a build before the battery code (same id, manifest, part).
-- From it: `gross = raw + charge - discharge` per interval, as `service/history.py`. An unknown counter or
+- From it: `gross = raw - charge + discharge` per interval, as `service/history.py`. An unknown counter or
   a negative result nulls `gross_kwh` (`battery_counters_missing`, `battery_gross_negative`); counters
   not configured or absent from the archive refuse the build. Any counter decrease nulls its interval
   (stricter than the `counter_rates` rollback rule).
@@ -57,4 +57,6 @@ and the data volume are deployed from the homelab repository.
 ## Status
 
 **valid** until battery go-live. Reconstruction and refusal are in the code (climate plan item 6); the
-install-day config is unset, untested on real counters.
+install-day config is unset, untested on real counters. 2026-11-03: the build's reconstruction had the
+sign reversed (`raw + charge - discharge`, the service always used `raw - charge + discharge`); corrected
+before go-live, so no dataset was built with it.

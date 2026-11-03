@@ -1978,6 +1978,7 @@ def battery_archive(
     charge_until: datetime | None = None,
     charge_skip: int = 0,
     counters: bool = True,
+    charge_step: float = CHARGE_STEP,
     discharge_step: float = DISCHARGE_STEP,
     discharge_rollback_at: int | None = None,
 ) -> None:
@@ -2004,13 +2005,13 @@ def battery_archive(
         charge_n = count
         if charge_until is not None:
             charge_n = int((charge_until - start).total_seconds() // 300) + 1
-        rows += counter(CHARGE, CHARGE_STEP, charge_n)[charge_skip:]
+        rows += counter(CHARGE, charge_step, charge_n)[charge_skip:]
         rows += counter(DISCHARGE, discharge_step, count, discharge_rollback_at)
     write_raw_part(data_dir, rows)
 
 
 class TestBatteryGrossLoad:
-    """``gross = raw_grid + charge - discharge`` from commissioning; refusal otherwise."""
+    """``gross = raw_grid - charge + discharge`` from commissioning; refusal otherwise."""
 
     def test_reconstruction_arithmetic(self, tmp_path: Path, data_dir: Path) -> None:
         cfg = write_tariff(tmp_path)
@@ -2024,7 +2025,7 @@ class TestBatteryGrossLoad:
         for i, row in enumerate(out):
             n = spans_in(out, i)  # whole 5-minute spans, each exactly contained
             assert row["raw_grid_kwh"] == pytest.approx(n * GRID_STEP)
-            assert row["gross_kwh"] == pytest.approx(n * (GRID_STEP + CHARGE_STEP - DISCHARGE_STEP))
+            assert row["gross_kwh"] == pytest.approx(n * (GRID_STEP - CHARGE_STEP + DISCHARGE_STEP))
             assert row["battery_absent"] is False
             assert row["energy_quality"] == ENERGY_MEASURED
             assert row["allocation_quality"] == ALLOCATION_EXACT
@@ -2038,6 +2039,25 @@ class TestBatteryGrossLoad:
         used = {e["entity"]: e["used_for"] for e in manifest["entity_audit"]}
         assert used[CHARGE] == used[DISCHARGE] == "battery_counter"
         assert CHARGE not in manifest["input_exclusions"]["other_entities_seen_and_ignored"]
+
+    @pytest.mark.parametrize(
+        ("load", "charge", "discharge"), [(0.5, 0.3, 0.0), (0.5, 0.0, 0.4), (0.2, 0.0, 0.0)]
+    )
+    def test_reconstruction_inverts_the_battery_balance(
+        self, load: float, charge: float, discharge: float
+    ) -> None:
+        """The meter reads ``load + charge - discharge`` (the planner's own balance), so the
+        build must recover the house load from it, as the live service does."""
+        metered = load + charge - discharge
+
+        def interval(kwh: float) -> IntervalEnergy:
+            return IntervalEnergy(kwh, ENERGY_MEASURED, ALLOCATION_EXACT, 0.0, 3)
+
+        gross, quality, _ = build_mod.reconstruct_gross_load(
+            interval(metered), interval(charge), interval(discharge)
+        )
+        assert gross == pytest.approx(load)
+        assert quality == ENERGY_MEASURED
 
     def test_intervals_before_commissioning_keep_the_no_battery_reading(
         self, tmp_path: Path, data_dir: Path
@@ -2059,7 +2079,8 @@ class TestBatteryGrossLoad:
                 assert row["gross_kwh"] == row["raw_grid_kwh"]
                 assert row["battery_absent"] is True
             else:
-                assert row["gross_kwh"] > row["raw_grid_kwh"]
+                # net charging in the fixture: part of the grid import went into the battery
+                assert row["gross_kwh"] < row["raw_grid_kwh"]
                 assert row["battery_absent"] is False
         assert manifest["battery_reconstruction"]["intervals_touching_battery_period"] == 4
 
@@ -2100,7 +2121,7 @@ class TestBatteryGrossLoad:
         raw = sum(r["raw_grid_kwh"] for r in out)
         gross = sum(r["gross_kwh"] for r in out)
         spans = sum(spans_in(out, i) for i in range(intervals))
-        assert gross - raw == pytest.approx(spans * (CHARGE_STEP - DISCHARGE_STEP))
+        assert gross - raw == pytest.approx(spans * (DISCHARGE_STEP - CHARGE_STEP))
 
     def test_ambiguous_fall_back_hour_is_decided_by_the_offset(
         self, tmp_path: Path, data_dir: Path
@@ -2146,7 +2167,7 @@ class TestBatteryGrossLoad:
         out = rows_as_dicts(table)
         assert out[0]["interval_start"] == _T0 < commissioned < out[0]["interval_end"]
         assert out[0]["battery_absent"] is False
-        assert out[0]["gross_kwh"] == pytest.approx(3 * (GRID_STEP + CHARGE_STEP - DISCHARGE_STEP))
+        assert out[0]["gross_kwh"] == pytest.approx(3 * (GRID_STEP - CHARGE_STEP + DISCHARGE_STEP))
         assert manifest["battery_reconstruction"]["intervals_touching_battery_period"] == 8
 
     def test_a_straddling_interval_without_counters_is_unusable_not_assumed_absent(
@@ -2216,8 +2237,8 @@ class TestBatteryGrossLoad:
     ) -> None:
         cfg = write_tariff(tmp_path)
         end = _T0 + timedelta(hours=1)
-        # discharging 0.30 kWh per sample while grid + charge only supply 0.14: they disagree
-        battery_archive(data_dir, _T0, end, discharge_step=0.30)
+        # charging 0.30 kWh per sample while grid + discharge only supply 0.11: they disagree
+        battery_archive(data_dir, _T0, end, charge_step=0.30)
         table, manifest = build_rows(
             data_dir, cfg, _T0, end, lookback=timedelta(minutes=5), battery=battery_telemetry(_T0)
         )

@@ -38,7 +38,7 @@ Allowed categorical values
     - ``battery_counters_missing`` — at or after the battery commissioning instant, a
       battery AC counter is unknown for the interval, so ``gross_kwh`` is null (the grid
       reading alone is net exchange, never load)
-    - ``battery_gross_negative`` — at or after commissioning, ``raw_grid + charge -
+    - ``battery_gross_negative`` — at or after commissioning, ``raw_grid - charge +
       discharge`` came out negative (the meters disagree inside the interval); ``gross_kwh``
       is null, never clamped
 
