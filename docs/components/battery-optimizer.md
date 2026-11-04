@@ -35,6 +35,17 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
 
 ## Assumptions
 
+- **The objective is unchanged; its feasible set may contain one day with a lifted ceiling and a soft
+  checkpoint** ([periodic full charge](../planning/periodic-full-charge.md), solver and planner only so far,
+  not wired to the service). On that day the SOC ceiling is 1.00 (0.95 before it), the SOC must reach 100% at
+  a slot the optimizer picks, or the plan pays `shortfall_penalty_eur_per_kwh` (10, two orders of magnitude
+  above any price) for the missing energy, so the plan is always feasible; the terminal value, the free
+  terminal mode and the regular plan are untouched, and the regular plan is never replaced by an evaluation
+  (`run_planner` evaluate mode adds the lifted and target solves of the same snapshot). The extra cost of the
+  day is `forcing_cost = target - lifted` (the lifted free plan also stores more at the horizon end, so
+  `target - normal` is a diagnostic only). The solve is a MILP with one binary per eligible slot: the target
+  solve takes about 13 times the regular solve at the median (taper on, random windows) and about 1.5 s at the
+  worst, against a 20 s limit.
 - Load is exogenous. The decoupled design keeps the objective unchanged; only price-driven heat-pump
   planning and a joint MPC are dropped ([ADR-0006](../adr/0006-decouple-heat-pump-comfort-from-battery-price-optimisation.md)).
 - The horizon ends at the last published price slot; there is no unpublished-price forecast live.
@@ -85,6 +96,8 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
 - The load forecast changes regime (comfort schedule, boost): re-check floor-hit share and clipping.
 - At go-live: measured SOC replaces simulated SOC; the charge adapter caps the grid target below the
   import limit; a second price-reactive writer appears.
+- Omnibattery is upgraded beyond 1.5.1b1 (the weekly full-charge contract the day relies on), the SOC window of
+  `tariff.yaml` changes, or the charge-delay configuration differs from the one the plan assumes.
 - The heater facts change (hot-water target above about 51 degC, sterilization schedule, a power-limit input
   fitted), or the contracted power or the meter's trip behaviour changes, or a meter cut-off happens with the battery
   charging (treat as a failed acceptance and review the margin).
@@ -97,6 +110,8 @@ new regime after the 28-day settling period, with that window's measured load as
 Acceptance: oracle certified; `rolling_horizon` gap closure and relative saving against `no_battery` on the
 same load are reported next to the legacy figures above (same RTE basis) and any material drop is
 explained before go-live; the floor-hit share on expensive cold-day slots stays near the replay's 0 to 3.3%.
+For the full-charge day: the existing benchmark plus the `dry_run` decision study of the plan (the distribution
+of `forcing_cost`); the benchmark ladder itself does not model the day, so no benchmark claim is made for it.
 
 ## Status
 
@@ -116,6 +131,11 @@ the PD-target bound while the system power limits are on (pre-go-live: charge cu
 system max charge minus the house load; go-live: system caps 2500/2500 W and Marstek Premium mode for discharge
 above 800 W, matching `power_kw: 2.5`) and the [battery-model](battery-model.md) caps are open; the wear cost is set (0.01) and is
 re-checked on measured data.
+
+Full-charge solver (2026-11-04, code only): `oracle.FullChargeModel` and `planner.FullChargeSpec` add the lifted
+ceiling, soft checkpoint and taper rows described above. Nothing calls them yet (the service never sets
+`full_charge` on a snapshot), so plans are byte-identical to before and no recalibration or regime-log row is due
+from this change; it extends the reason above with the taper parameters, which are provisional.
 
 Slot decisions (2026-11-04, code only, regime log): a slot that opened without an intent adopts one later in
 the slot (`late_intent`, see [service](../service.md#scheduling-and-the-slot-cycle)), and a solve inside such a

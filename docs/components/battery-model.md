@@ -29,7 +29,8 @@ discharge on the temporary test socket, below the modelled 2.5 kW. Confirmed fro
 | Parameter | Value | Basis |
 |---|---|---|
 | Round-trip efficiency | 0.80 (0.89443 per leg) | Owner choice 2026-10-24, bottom of the 0.80 to 0.84 range reported by others; a scalar, not a curve |
-| SOC window | 0.20 to 0.95 (3.84 kWh usable) | Owner's life-extension choice; real controller limits not read |
+| SOC window | 0.20 to 0.95 (3.84 kWh usable), **except on a chosen full-charge day, when the ceiling is 1.00** (ceiling 0.95 before that day, 1.00 from its start to the horizon end) | Owner's life-extension choice; real controller limits not read. The lifted day is a solver capability of [the periodic full-charge plan](../planning/periodic-full-charge.md); it is not wired to the live service yet (code only) |
+| Charge limit near full | 200 W once a cell latches at 3.48 V (Omnibattery's `switch.venus_full_charge_voltage_taper`, voltage-latched, not SOC-based); modelled by one convex half-space per slot of the full-charge day, a ramp from full power at `taper.start_soc_frac` down to `taper.power_kw` at 100%. **Provisional**: `start_soc_frac` 0.90 and `power_kw` 0.2 are not measured, and the ramp is a relaxation of the real step (it allows more than 200 W just above the start), so it only binds when `start_soc_frac` is lower; `start_soc_frac: null` drops the rows | Omnibattery source read 2026-11-04 (plan section 2); to be calibrated on the first supervised run |
 | Initial SOC | 0.20 | Floor, so no free stored energy |
 | Idle draw | 0, not modelled | `battery.py`; unmeasured |
 | Wear / throughput cost | 0.01 EUR/kWh per AC kWh and direction (`planning.throughput_cost_eur_per_kwh`, set 2026-10-31) | Knee of the rolling-horizon sweep, see [Wear cost decision](#wear-cost-decision-2026-10-31); a planning convention, not a measured aging rate |
@@ -48,6 +49,8 @@ Evidence: [`config/tariff.yaml`](../../config/tariff.yaml), [benchmark](../bench
   datasets and benchmark results are superseded (record it).
 - The import-limit basis turns out to be an instantaneous trip: the averaged constraint is then not a
   sufficient guard.
+- The first supervised full charge disagrees with the taper parameters (`start_soc_frac`, `power_kw`), or
+  the BMS does not reach 100% in the measured time.
 
 ## Recalibrate by
 
@@ -60,6 +63,9 @@ Evidence: [`config/tariff.yaml`](../../config/tariff.yaml), [benchmark](../bench
    `planning.throughput_cost_eur_per_kwh` (a service value; no dataset re-mint).
 4. Acceptance: predicted against measured Wh and SOC on held-out physical intervals, by power band;
    a model refinement is rejected if the measured gain is negligible or it breaks MILP feasibility.
+5. Taper: on the first supervised full charge record SOC, AC power and (if exposed) the maximum cell
+   voltage every 30 s from 85% to completion; set `start_soc_frac` to the SOC at which AC power first
+   falls under 400 W and `power_kw` to its steady value (`service.planner.FullChargeSpec`).
 
 ## Wear cost decision (2026-10-31)
 
@@ -112,3 +118,5 @@ with Omnibattery's system caps at 2500 W charge / 2500 W discharge and Marstek P
 socket's 1000/800 W: an "Omnibattery configuration changes limits" trigger, now matching the modelled 2.5 kW).
 RTE, SOC window and idle draw are still assumptions, and the wear cost (0.01) is a planning convention to be
 re-checked on measured data. Recalibrate by step 1 on the live cycles; idle draw was not set before go-live.
+The full-charge ceiling and taper rows (above) are provisional and unmeasured, which extends the same reason; no
+benchmark claim changes (the benchmark ladder does not model the full-charge day).

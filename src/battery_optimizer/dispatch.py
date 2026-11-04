@@ -1250,7 +1250,8 @@ def intents_from_schedule(
                 target_power_w=0.0
                 if mode is DispatchMode.IDLE
                 else _power_w(flowing_kwh, interval_seconds),
-                soc_target_frac=float(soc_kwh[t]) / capacity,
+                # A full battery re-traces a few ulps above nameplate; the contract is [0, 1].
+                soc_target_frac=min(1.0, max(0.0, float(soc_kwh[t]) / capacity)),
                 generated_at=generated,
                 expires_at=expiry,
                 sequence_id=t,
