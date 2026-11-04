@@ -95,11 +95,20 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
   ([high-soc dwell cost](../planning/high-soc-dwell-cost.md)): 0.01 EUR/kWh/h cuts the hours above 90% by 46% and
   those at or above 95% by 70% for 0.08% of cost (0.41% of the saving); a hard 20-90 window costs 3.3% of the
   saving. Measured on the benchmark's rolling horizon, not the live 15-minute re-solve (one season checked).
+- **Thermal charge-power soft cap (off, 2026-11-04).** `planning.charge_soft_cap_eur_per_kwh` (0 = off) prices every
+  AC kWh charged above `planning.charge_soft_cap_kw` (1.5) in a slot, in every solve (the full-charge ones too; the
+  checkpoint's shortfall penalty must exceed the dwell cost plus the cap cost per stored kWh, checked at solve and at
+  config load). Planning only, same reporting rules as the dwell cost. Replay study
+  ([thermal soft cap](../planning/thermal-charge-soft-cap.md)): 1.5 kW at 0.005 EUR/kWh cuts the mean power while
+  charging from 2.13 to 1.49 kW and the energy charged above 1.5 kW from 35% to 7% for 0.10% of cost (0.52% of the
+  saving, worst window 0.91%). The knee is a conservative documented choice: the temperature fit has 21 h of data and
+  no session above 1.5 kW. Omnibattery's Temperature Charge Limit stays the backstop.
 - Omnibattery's own price features will be off, so this is the only battery price reactor.
 
 ## Invalidated when
 
-- Any [battery-model](battery-model.md) parameter changes, or the wear cost or the high-SOC dwell cost is changed.
+- Any [battery-model](battery-model.md) parameter changes, or the wear cost, the high-SOC dwell cost or the thermal
+  charge soft cap is changed.
 - [tariff-prices](tariff-prices.md) changes (taxes confirmed, holidays added, new publication timing).
 - The load forecast changes regime (comfort schedule, boost): re-check floor-hit share and clipping.
 - At go-live: measured SOC replaces simulated SOC; the charge adapter caps the grid target below the
@@ -150,6 +159,11 @@ benchmark, default 0, so plans, `inputs_hash` and `config_hash` are byte-identic
 regime log). Merging changes nothing observable and nothing goes stale; enabling it changes the plans (less time
 above 90%, same cost within 0.1%) and is recorded in the regime log when it happens, with the dependants checked
 then (the replay benchmark and the dry-run decision study are recomputed on plans made with it).
+
+Thermal charge soft cap (2026-11-04, code only): `charge_soft_cap` in the solver, the planner, the service config and the
+benchmark, default 0, so plans, `inputs_hash` and `config_hash` are byte-identical until a deploy sets it (planned,
+regime log). Merging changes nothing observable and nothing goes stale; enabling it changes the plans (charge spread over
+more slots, same cost within 0.1%) and is recorded in the regime log when it happens, with the dependants checked then.
 
 Slot decisions (2026-11-04, code only, regime log): a slot that opened without an intent adopts one later in
 the slot (`late_intent`, see [service](../service.md#scheduling-and-the-slot-cycle)), and a solve inside such a

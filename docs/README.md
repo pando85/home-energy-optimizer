@@ -69,6 +69,7 @@ change leads to a recalibration instead of a silent drift.
 | [Climate preregistration 2026-27](planning/climate-preregistration-2026-27.md) | Criteria committed before any 2026-27 heating data: shadow thermal model and MPC (track B) and the comfort controller before/after comparison; amendments only before go-live |
 | [Periodic full charge for cell balancing](planning/periodic-full-charge.md) | Plan (not implemented, off by default): opportunistic 100% charge on an adaptive cadence (amended 2026-11-04: new-balance-reading success criterion, settle hold, 5 to 28 days by balance status) chosen from next-day prices, soft-target MILP, Omnibattery weekly-full-charge as self-limiting enabler, ADR-0007 allowlist amendment, state, failure modes and the 3-PR split |
 | [Battery longevity policy](planning/battery-longevity.md) | Plan: documented Omnibattery behaviour versus proposed site settings, current and target state, the six steps (full-charge PRs, balance and thermal telemetry, scheduler, high-SOC dwell cost, thermal soft cap), risks and out-of-scope |
+| [Thermal soft cap on charge power](planning/thermal-charge-soft-cap.md) | Step 6 of the longevity plan (off by default): the thermal evidence study (21 h, two charge sessions, too thin for a fitted knee), the replay cost study and the recommended 1.5 kW at 0.005 EUR/kWh |
 | [Whole-system replay](planning/system-replay.md) | Offline heat-pump regime x battery replay (`hack/system_sim.py`): results as relative figures and how to reproduce them |
 
 ## Provenance

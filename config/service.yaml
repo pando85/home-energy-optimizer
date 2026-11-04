@@ -138,6 +138,13 @@ planning:
   # discharge.  Value chosen by hack/high_soc_dwell_sweep.py, see docs/planning/high-soc-dwell-cost.md.
   high_soc_threshold_frac: 0.90
   high_soc_cost_eur_per_kwh_h: 0.0
+  # Thermal soft cap on charge power: EUR per AC kWh charged above charge_soft_cap_kw in a slot
+  # (planning only, never in reported cost; the battery's internal temperature rises with charge
+  # power and LFP ageing is worse hot).  0 = off, today's behaviour.  Composes with the dwell cost and
+  # the full-charge checkpoint.  Value chosen by hack/charge_soft_cap_sweep.py, see
+  # docs/planning/thermal-charge-soft-cap.md.
+  charge_soft_cap_kw: 1.5
+  charge_soft_cap_eur_per_kwh: 0.0
   replan:
     soc_change_frac: 0.05
     debounce_s: 30

@@ -112,7 +112,12 @@ from .load_forecast import (
     resolve_forecaster_params,
     run_forecaster,
 )
-from .oracle import OracleError, solve_oracle, validate_high_soc_cost
+from .oracle import (
+    OracleError,
+    solve_oracle,
+    validate_charge_soft_cap,
+    validate_high_soc_cost,
+)
 from .policies import (
     DayAheadDay,
     _clip_plan_to_model_bounds,
@@ -1454,6 +1459,7 @@ def run_day_ahead_with_frozen_forecast(
     mip_abs_gap: float = 1e-9,
     throughput_cost_eur_per_kwh: float = 0.0,
     high_soc_cost: tuple[float, float] | None = None,
+    charge_soft_cap: tuple[float, float] | None = None,
 ) -> tuple[Schedule, dict[str, Any]]:
     """Run the existing day-ahead policy using a frozen load forecast.
 
@@ -1503,6 +1509,7 @@ def run_day_ahead_with_frozen_forecast(
         mip_abs_gap=mip_abs_gap,
         throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
         high_soc_cost=high_soc_cost,
+        charge_soft_cap=charge_soft_cap,
     )
 
 
@@ -1544,6 +1551,7 @@ def run_rolling_horizon(
     load_forecaster_side: SideInputs | None = None,
     price_outlook_side: OutlookSide | None = None,
     high_soc_cost: tuple[float, float] | None = None,
+    charge_soft_cap: tuple[float, float] | None = None,
 ) -> RollingResult:
     """Run the rolling horizon dispatcher.
 
@@ -1598,6 +1606,11 @@ def run_rolling_horizon(
     solve.  ``None`` or a zero cost leaves every plan bit-identical; like the throughput
     cost it is planning-only and never enters the reported cost.
 
+    ``charge_soft_cap`` (default ``None``) is ``(threshold_kw, eur_per_kwh)``, the thermal
+    charge-power soft cap of :func:`battery_optimizer.oracle.solve_oracle` applied to every
+    solve: every AC kWh charged above ``threshold_kw`` in a slot costs ``eur_per_kwh`` in the
+    planning objective.  ``None`` or a zero cost leaves every plan bit-identical; planning-only.
+
     ``forecast_window_days`` (default ``28``) is the trailing window in local days
     for the causal mode's slot means.  Ignored in frozen mode (the frozen profile
     has its own window baked in at build time).
@@ -1638,6 +1651,7 @@ def run_rolling_horizon(
             f"{throughput_cost_eur_per_kwh!r}"
         )
     validate_high_soc_cost(high_soc_cost)
+    validate_charge_soft_cap(charge_soft_cap)
     if replan_interval_slots is not None and replan_interval_slots < 1:
         raise ValueError(f"replan_interval_slots must be >= 1, got {replan_interval_slots}")
     if horizon_slots is not None and horizon_slots < 1:
@@ -1952,6 +1966,7 @@ def run_rolling_horizon(
                 floor_kwh=horizon_floor_kwh,
                 throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
                 high_soc_cost=high_soc_cost,
+                charge_soft_cap=charge_soft_cap,
             )
         except OracleError as exc:
             text = str(exc).lower()
@@ -2105,6 +2120,12 @@ def run_rolling_horizon(
         telemetry["high_soc_cost"] = {
             "threshold_frac": float(high_soc_cost[0]),
             "eur_per_kwh_h": float(high_soc_cost[1]),
+        }
+    if validate_charge_soft_cap(charge_soft_cap) is not None:
+        # Only an active soft cap adds a key, so the canonical telemetry is unchanged.
+        telemetry["charge_soft_cap"] = {
+            "threshold_kw": float(charge_soft_cap[0]),
+            "eur_per_kwh": float(charge_soft_cap[1]),
         }
     if not exact_outlook:
         # Only a non-default outlook adds keys, so the canonical telemetry is unchanged.

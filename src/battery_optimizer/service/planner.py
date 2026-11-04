@@ -27,7 +27,8 @@ An optional :class:`FullChargeSpec` on the snapshot prices (``evaluate``) or pla
 (``commit``) a day with a lifted SOC ceiling and a soft checkpoint at 100%
 (docs/planning/periodic-full-charge.md); without it nothing below changes.  An optional high-SOC
 dwell cost (``planning.high_soc_*``, off at 0) prices the hours spent above a threshold SOC in every
-solve of the snapshot, the full-charge ones included.
+solve of the snapshot, the full-charge ones included; so does the optional thermal soft cap on
+charge power (``planning.charge_soft_cap_*``, off at 0).
 
 Everything the solve depends on is frozen in :class:`PlanningSnapshot` before it
 is handed to the worker thread, and its canonical hash (``inputs_hash``) is stored
@@ -192,6 +193,10 @@ class PlanningSnapshot:
     #: High-SOC dwell cost (``planning.high_soc_*``): EUR per kWh above the threshold per hour.
     high_soc_threshold_frac: float = 0.90
     high_soc_cost_eur_per_kwh_h: float = 0.0
+    #: Thermal soft cap on charge power (``planning.charge_soft_cap_*``): EUR per AC kWh charged
+    #: above the threshold power in a slot.
+    charge_soft_cap_kw: float = 1.5
+    charge_soft_cap_eur_per_kwh: float = 0.0
 
     def __post_init__(self) -> None:
         n = len(self.slot_starts)
@@ -238,6 +243,12 @@ class PlanningSnapshot:
             payload["high_soc_cost"] = {
                 "threshold_frac": self.high_soc_threshold_frac,
                 "eur_per_kwh_h": self.high_soc_cost_eur_per_kwh_h,
+            }
+        if self.charge_soft_cap_eur_per_kwh > 0.0:
+            # Likewise the thermal soft cap joins the inputs only when active.
+            payload["charge_soft_cap"] = {
+                "threshold_kw": self.charge_soft_cap_kw,
+                "eur_per_kwh": self.charge_soft_cap_eur_per_kwh,
             }
         return payload
 
@@ -422,6 +433,11 @@ def _solve(
         high_soc_cost=(
             (snapshot.high_soc_threshold_frac, snapshot.high_soc_cost_eur_per_kwh_h)
             if snapshot.high_soc_cost_eur_per_kwh_h > 0.0
+            else None
+        ),
+        charge_soft_cap=(
+            (snapshot.charge_soft_cap_kw, snapshot.charge_soft_cap_eur_per_kwh)
+            if snapshot.charge_soft_cap_eur_per_kwh > 0.0
             else None
         ),
     )

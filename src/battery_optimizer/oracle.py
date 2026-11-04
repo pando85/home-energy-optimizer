@@ -142,6 +142,19 @@ checked), so the checkpoint is still reached whatever the dwell price; the dwell
 only decides *when* the plan climbs to the target, which is what makes it finish close to
 the discharge.
 
+Optional thermal charge-power soft cap
+--------------------------------------
+``charge_soft_cap=(threshold_kw, eur_per_kwh)`` of :func:`build_model` and :func:`solve_oracle`
+(``None`` or a zero cost: the model above, byte for byte) prices charge **power** above a
+threshold (LFP ageing is worse hot, and the battery's internal temperature rises with charge
+power).  After every other column (the dwell columns included) there is one continuous
+``x[t] >= 0`` per slot, with the row ``x[t] - charge[t] >= -threshold_kw * h`` and
+``+ cost * x[t]`` in the objective: the solver pays ``cost`` for every AC kWh charged above
+``threshold_kw`` in a slot, a convex piecewise-linear penalty on charge power, so spreading the
+same charge over more slots is free.  Like the throughput and dwell costs it is a planning
+convention, not a fitted thermal model; the shortfall penalty of a full-charge checkpoint must
+dominate it (checked), so the target is still reached whatever the cap price.
+
 Prices are pretax, and a uniform tax factor scales energy cost without changing
 the argmin, so this optimum is also the tax-multiplied optimum.
 
@@ -205,8 +218,10 @@ __all__ = [
     "build_model",
     "checkpoint_outcome",
     "classify_result",
+    "charge_soft_cap_excess_kwh",
     "high_soc_dwell_kwh_h",
     "solve_oracle",
+    "validate_charge_soft_cap",
     "validate_high_soc_cost",
 ]
 
@@ -416,6 +431,42 @@ def validate_high_soc_cost(high_soc_cost) -> tuple[float, float] | None:
     return (threshold, cost) if cost > 0.0 else None
 
 
+def validate_charge_soft_cap(charge_soft_cap) -> tuple[float, float] | None:
+    """Validate ``charge_soft_cap`` and return ``(threshold_kw, cost)``, or ``None`` when inert."""
+    if charge_soft_cap is None:
+        return None
+    try:
+        threshold, cost = charge_soft_cap
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"charge_soft_cap must be (threshold_kw, eur_per_kwh) or None, got {charge_soft_cap!r}"
+        ) from exc
+    if isinstance(threshold, bool) or isinstance(cost, bool):
+        raise ValueError(f"charge_soft_cap must hold numbers, got bool in {charge_soft_cap!r}")
+    try:
+        threshold, cost = float(threshold), float(cost)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"charge_soft_cap must hold numbers, got {charge_soft_cap!r}") from exc
+    if not (math.isfinite(threshold) and threshold > 0.0):
+        raise ValueError(f"charge_soft_cap threshold_kw must be finite and > 0, got {threshold!r}")
+    if not math.isfinite(cost) or cost < 0.0:
+        raise ValueError(f"charge_soft_cap eur_per_kwh must be finite and >= 0, got {cost!r}")
+    return (threshold, cost) if cost > 0.0 else None
+
+
+def charge_soft_cap_excess_kwh(
+    schedule: Schedule, interval_seconds: float, threshold_kw: float
+) -> float:
+    """AC kWh charged above ``threshold_kw`` (per slot) in a solved plan.
+
+    The quantity the soft cap multiplies: the plan's cap cost is ``eur_per_kwh`` times this,
+    recoverable from the schedule because the reported ``cost_eur`` excludes it.
+    """
+    charge = np.asarray(schedule.charge_kwh, dtype=float)
+    over = np.maximum(charge - threshold_kw * interval_seconds / 3600.0, 0.0)
+    return float(over.sum())
+
+
 def high_soc_dwell_kwh_h(
     schedule: Schedule, spec: BatterySpec, interval_seconds: float, threshold_frac: float
 ) -> float:
@@ -440,6 +491,7 @@ def build_model(
     throughput_cost_eur_per_kwh: float = 0.0,
     full_charge: FullChargeModel | None = None,
     high_soc_cost: tuple[float, float] | None = None,
+    charge_soft_cap: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, Bounds, list[LinearConstraint]]:
     """Assemble the MILP: ``(objective, integrality, bounds, constraints)``.
 
@@ -495,6 +547,11 @@ def build_model(
     column ``e[t]`` per slot (after the full-charge columns, so ``z`` and the shortfall keep
     their indices), the row ``e[t] - soc[t] >= -threshold * capacity`` after every other row,
     and ``cost * h`` on each ``e[t]``.  See the module section "Optional high-SOC dwell cost".
+
+    ``charge_soft_cap`` (default ``None``: byte for byte) is ``(threshold_kw, eur_per_kwh)``; a
+    positive cost appends one continuous column ``x[t]`` per slot (after the dwell columns),
+    the row ``x[t] - charge[t] >= -threshold_kw * h`` after every other row, and ``cost`` on each
+    ``x[t]``.  See the module section "Optional thermal charge-power soft cap".
     """
     _check_terminal_mode(terminal_mode)
     free = terminal_mode == _TERMINAL_FREE
@@ -519,7 +576,9 @@ def build_model(
     n_checkpoints = 0 if full_charge is None else len(full_charge.checkpoint_slots)
     n_fc_cols = n_checkpoints + 1 if n_checkpoints else 0
     e0 = 4 * n + n_fc_cols
-    n_vars = e0 + (n if dwell is not None else 0)
+    cap = validate_charge_soft_cap(charge_soft_cap)
+    x0 = e0 + (n if dwell is not None else 0)
+    n_vars = x0 + (n if cap is not None else 0)
     limit = spec.interval_energy_limit_kwh(horizon.interval_seconds)
     # Free mode shares the causal floor (cannot spend the seed); fixed mode uses
     # the bare window floor and pins the terminal SOC instead.  An explicit
@@ -556,6 +615,17 @@ def build_model(
                 f"over the horizon ({dwell[1] * horizon_h:.6g} EUR/kWh): the checkpoint must "
                 "dominate the dwell cost"
             )
+        if cap is not None and full_charge.checkpoint_slots:
+            # One more stored kWh costs at most 1/eta_c AC kWh above the threshold.
+            planning_price = (0.0 if dwell is None else dwell[1] * horizon_h) + (
+                cap[1] / spec.charge_efficiency
+            )
+            if full_charge.shortfall_penalty_eur_per_kwh <= planning_price:
+                raise ValueError(
+                    "full_charge.shortfall_penalty_eur_per_kwh must exceed the high-SOC dwell "
+                    "cost over the horizon plus the charge soft-cap cost per stored kWh "
+                    f"({planning_price:.6g} EUR/kWh): the checkpoint must dominate the soft cap"
+                )
     soc_init = spec.soc_bound_kwh("init")
     terminal_kwh = spec.soc_bound_kwh("terminal")
     eta_c = spec.charge_efficiency
@@ -686,6 +756,14 @@ def build_model(
         obj[e_cols] = dwell[1] * h
         for t in range(n):
             add_row([(e0 + t, 1.0), (_soc_idx(n, t), -1.0)], -threshold_kwh, np.inf)
+
+    if cap is not None:
+        cap_kwh = cap[0] * horizon.interval_seconds / 3600.0
+        x_cols = x0 + t_of
+        ub[x_cols] = max(limit - cap_kwh, 0.0)
+        obj[x_cols] = cap[1]
+        for t in range(n):
+            add_row([(x0 + t, 1.0), (_charge_idx(t), -1.0)], -cap_kwh, np.inf)
 
     a = coo_array((rows_v, (rows_i, rows_j)), shape=(len(con_lb), n_vars), dtype=float)
     constraints = [LinearConstraint(a, np.asarray(con_lb), np.asarray(con_ub))]
@@ -820,6 +898,7 @@ def solve_oracle(
     throughput_cost_eur_per_kwh: float = 0.0,
     full_charge: FullChargeModel | None = None,
     high_soc_cost: tuple[float, float] | None = None,
+    charge_soft_cap: tuple[float, float] | None = None,
 ) -> Schedule:
     """Cost-minimising dispatch over the whole horizon with perfect information.
 
@@ -883,6 +962,13 @@ def solve_oracle(
             dual bound is discarded because it belongs to the penalised objective.  With a
             full-charge checkpoint, the shortfall penalty must exceed the dwell cost over
             the horizon (``ValueError`` otherwise).
+        charge_soft_cap: Optional ``(threshold_kw, eur_per_kwh)`` soft cap on charge power (see
+            "Optional thermal charge-power soft cap" in the module docstring): every AC kWh
+            charged above ``threshold_kw`` in a slot costs ``eur_per_kwh``.  ``None`` or a zero
+            cost is the historical model.  Planning-only like the dwell cost: the reported
+            ``cost_eur`` excludes it (``eur_per_kwh * charge_soft_cap_excess_kwh(...)``
+            recovers it), the dual bound is discarded, and with a full-charge checkpoint the
+            shortfall penalty must exceed the dwell cost plus ``eur_per_kwh`` per stored kWh.
 
     Raises:
         ValueError: If *spec* is not physically meaningful, a tolerance or the
@@ -928,6 +1014,7 @@ def solve_oracle(
         throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
         full_charge=full_charge,
         high_soc_cost=high_soc_cost,
+        charge_soft_cap=charge_soft_cap,
     )
     options = _solver_options(time_limit_s, mip_rel_gap, mip_abs_gap)
     with warnings.catch_warnings():
@@ -1000,8 +1087,8 @@ def solve_oracle(
     # basis with the constants the objective dropped (load term and, in free
     # mode, the terminal_value * initial_SOC offset).  value == 0 in fixed mode.
     #
-    # HOWEVER: when throughput_cost > 0 (or a high-SOC dwell cost is active, which prices the
-    # plan the same way), the solver's primal/dual bounds are for
+    # HOWEVER: when throughput_cost > 0 (or a high-SOC dwell cost or a charge soft cap is active,
+    # which price the plan the same way), the solver's primal/dual bounds are for
     # the **penalized** objective (meter_cost + throughput_penalty + inventory),
     # not the reported meter-cost objective (meter_cost + inventory).  Subtracting
     # the incumbent's throughput from the dual bound is NOT a valid lower bound
@@ -1017,7 +1104,8 @@ def solve_oracle(
     # and policies.days_at_time_limit need a finite upper bound).
     upper: float | None = total_cost
     dwell_active = validate_high_soc_cost(high_soc_cost) is not None
-    if throughput_cost_eur_per_kwh > 0.0 or dwell_active:
+    cap_active = validate_charge_soft_cap(charge_soft_cap) is not None
+    if throughput_cost_eur_per_kwh > 0.0 or dwell_active or cap_active:
         lower = None
         # upper stays total_cost — the incumbent's unpenalized cost is a valid
         # (loose) upper bound; we discard only the dual bound because it belongs
