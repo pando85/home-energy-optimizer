@@ -26,8 +26,10 @@ from service_fakes import (
 
 from battery_optimizer.service.actuator import (
     GUARD_REASONS,
+    WRITE_ROLES,
     ActuationContext,
     Actuator,
+    FullChargeDirective,
     safe_idle,
 )
 from battery_optimizer.service.api import create_app
@@ -35,11 +37,13 @@ from battery_optimizer.service.clock import FakeClock, SystemClock
 from battery_optimizer.service.config import (
     ActuationEntities,
     ActuationSettings,
+    FullChargeEntities,
+    FullChargeSettings,
     load_service_config,
 )
 from battery_optimizer.service.entity_store import EntityStore
 from battery_optimizer.service.ha_client import HACommandError
-from battery_optimizer.service.ha_guard import ForbiddenHACallError
+from battery_optimizer.service.ha_guard import WEEKDAY_OPTIONS, ForbiddenHACallError
 from battery_optimizer.service.metrics import ServiceMetrics
 from battery_optimizer.service.planner import ShadowIntent
 from battery_optimizer.service.runtime import ShadowService
@@ -138,6 +142,8 @@ class FakeHA:
             value = "on" if service == "turn_on" else "off"
         elif domain == "number":
             value = data["value"]
+        elif domain == "select":
+            value = data["option"]
         else:
             value = self.clock.now().isoformat()
         self.store.apply(entity_state(entity, value, self.clock.now(), attributes=attrs))
@@ -171,8 +177,9 @@ def world(
     cap=0.0,
     liveness="None",
     at=None,
+    extra=(),
 ):
-    store = EntityStore.for_entities((GRID, *ENTS.all()))
+    store = EntityStore.for_entities((GRID, *ENTS.all(), *extra))
     at = at or clock.now()
     for entity, value, attrs in (
         (GRID, grid, {"unit_of_measurement": "W"}),
@@ -192,7 +199,9 @@ def world(
     return store
 
 
-def make(clock, store, *, mode="live", settings=SETTINGS, records=None, **fake_kw):
+def make(
+    clock, store, *, mode="live", settings=SETTINGS, records=None, full_charge=None, **fake_kw
+):
     ha = FakeHA(store, clock, **fake_kw)
 
     async def record(at, rec):
@@ -209,6 +218,8 @@ def make(clock, store, *, mode="live", settings=SETTINGS, records=None, **fake_k
         send=ha.send,
         record=record,
         metrics=metrics,
+        full_charge=full_charge,
+        tz=TZ,
     )
     return actuator, ha, metrics
 
@@ -1245,3 +1256,703 @@ def test_live_service_end_to_end_through_the_guarded_websocket(tmp_path):
     assert calls()[0] == ("switch", "turn_off", ENTS.allow_charge)
     written = {entity for _, _, entity in calls()}
     assert written <= {ENTS.allow_charge, ENTS.allow_discharge, ENTS.heartbeat}
+
+
+# ---------------------------------------------------------------------------
+# Periodic full charge: Omnibattery's weekly full charge as the enabler (ADR-0007 amendment)
+# ---------------------------------------------------------------------------
+
+FC_ENTS = FullChargeEntities(
+    enable_switch="switch.omnibattery_weekly_full_charge_enabled",
+    day_select="select.omnibattery_weekly_full_charge_day",
+    delay_switch="switch.omnibattery_weekly_full_charge_delay",
+    charge_delay_switch="switch.omnibattery_charge_delay",
+    last_balance_read="sensor.venus_last_balance_read",
+    balancing_mode="binary_sensor.venus_balancing_mode",
+    cell_delta="sensor.venus_cell_delta",
+)
+FC = FullChargeSettings(enabled=True, entities=FC_ENTS)
+TODAY = WEEKDAY_OPTIONS[NOW.astimezone(TZ).weekday()]  # local Tuesday
+ARMED = FullChargeDirective(True, TODAY)
+DISARMED = FullChargeDirective(False)
+WEEKLY = "weekly_full_charge"
+
+
+def fc_world(clock, *, weekly="off", day="monday", delay="off", options=WEEKDAY_OPTIONS, **kw):
+    store = world(clock, extra=FC_ENTS.all(), **kw)
+    at = clock.now()
+    store.apply(entity_state(FC_ENTS.enable_switch, weekly, at))
+    attrs = {} if options is None else {"options": list(options)}
+    store.apply(entity_state(FC_ENTS.day_select, day, at, attributes=attrs))
+    if delay is not None:
+        store.apply(entity_state(FC_ENTS.delay_switch, delay, at))
+    return store
+
+
+def fc_calls(ha):
+    """The calls on the two full-charge entities, as ``(service, kind, data)``."""
+    return [
+        (service, entity.split(".", 1)[1], data)
+        for domain, service, entity, data in ha.calls
+        if entity in (FC_ENTS.enable_switch, FC_ENTS.day_select)
+    ]
+
+
+def fc_arming_writes(ha):
+    return [c for c in fc_calls(ha) if c[0] in ("turn_on", "select_option")]
+
+
+def test_the_two_full_charge_roles_are_write_roles():
+    assert {"full_charge_day", "full_charge_enable"} <= set(WRITE_ROLES)
+
+
+def test_an_armed_directive_needs_a_weekday():
+    with pytest.raises(ValueError, match="weekday"):
+        FullChargeDirective(True)
+    with pytest.raises(ValueError, match="weekday"):
+        FullChargeDirective(True, "Tuesday")
+    assert FullChargeDirective(False).weekday is None
+    assert [FullChargeDirective(True, d).armed for d in WEEKDAY_OPTIONS] == [True] * 7
+
+
+def test_the_feature_needs_the_service_time_zone():
+    clock = FakeClock(NOW)
+    with pytest.raises(ValueError, match="time zone"):
+        Actuator(
+            settings=SETTINGS,
+            mode="live",
+            store=world(clock),
+            clock=clock,
+            grid_entity=GRID,
+            send=FakeHA(world(clock), clock).send,
+            full_charge=FC,
+        )
+
+
+def test_arming_writes_the_day_then_the_switch_before_charge_is_enabled():
+    clock = FakeClock(NOW)
+    store = fc_world(clock)
+    actuator, ha, metrics = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    order = [c[2] for c in ha.calls if c[0] != "input_datetime"]
+    assert order == [ENTS.pd_target, FC_ENTS.day_select, FC_ENTS.enable_switch, ENTS.allow_charge]
+    assert ha.calls[1][1:] == ("select_option", FC_ENTS.day_select, {"option": TODAY})
+    assert ha.calls[2][1:] == ("turn_on", FC_ENTS.enable_switch, None)
+    assert actuator.desired.full_charge_armed is True
+    assert actuator.desired.to_dict()["full_charge_weekday"] == TODAY
+    assert counter(metrics, "actuator_writes", role="full_charge_day", result="ok") == 1
+    assert counter(metrics, "actuator_writes", role="full_charge_enable", result="ok") == 1
+
+
+def test_arming_in_an_idle_slot_writes_only_the_pair_and_is_idempotent():
+    clock = FakeClock(NOW)
+    store = fc_world(clock)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=ARMED))
+    assert [c[:2] for c in fc_calls(ha)] == [
+        ("select_option", "omnibattery_weekly_full_charge_day"),
+        ("turn_on", "omnibattery_weekly_full_charge_enabled"),
+    ]
+    # Omnibattery acknowledges: status weekly_full_charge; nothing is rewritten
+    clock.advance(30)
+    store.apply(entity_state(ENTS.integration_status, WEEKLY, clock.now()))
+    for entity, value in ((GRID, 400), (ENTS.battery_ac_power, 0)):
+        store.apply(entity_state(entity, value, clock.now()))
+    calls = len(ha.calls)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=ARMED))
+    assert actuator.reasons == () and len(fc_calls(ha)) == 2
+    assert [c for c in ha.calls[calls:] if c[0] != "input_datetime"] == []
+
+
+def test_an_already_matching_day_and_switch_are_not_rewritten():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert fc_calls(ha) == []
+    assert store.get(ENTS.allow_charge).state == "on"
+
+
+def test_only_the_day_is_written_when_the_switch_is_already_on():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day="monday")
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=ARMED))
+    assert [c[0] for c in fc_calls(ha)] == ["select_option"]
+
+
+def test_disarming_is_the_first_write_of_the_restrictive_block():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=DISARMED))
+    order = [(c[1], c[2]) for c in ha.calls if c[0] != "input_datetime"]
+    assert order[0] == ("turn_off", FC_ENTS.enable_switch)
+    assert order[1] == ("turn_off", ENTS.allow_charge)
+    assert actuator.desired.full_charge_armed is False
+    # idempotent: switch already off, nothing more to write
+    clock.advance(1)
+    calls = len(ha.calls)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=DISARMED))
+    assert [c for c in ha.calls[calls:] if c[2] == FC_ENTS.enable_switch] == []
+
+
+def test_the_switch_is_driven_off_while_the_feature_is_enabled_and_no_run_is_armed():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY)  # e.g. the owner flipped it by hand
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=DISARMED))
+    assert fc_calls(ha) == [("turn_off", "omnibattery_weekly_full_charge_enabled", None)]
+
+
+# ---- the feature off: the two roles are never touched ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("settings", "directive"),
+    [
+        (None, ARMED),
+        (None, DISARMED),
+        (FullChargeSettings(enabled=False, entities=FC_ENTS), ARMED),
+        (FullChargeSettings(enabled=False, entities=FC_ENTS), DISARMED),
+    ],
+)
+@pytest.mark.parametrize("mode", ["live", "dry_run"])
+def test_with_the_feature_off_the_weekly_entities_are_never_touched(settings, directive, mode):
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day="friday", charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store, mode=mode, full_charge=settings)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=directive))
+    clock.advance(1)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=directive))
+    assert fc_calls(ha) == []
+    assert actuator.full_charge_refusal is None
+    assert "full_charge" not in actuator.view() and "full_charge" not in actuator.snapshot()
+    assert "weekly_enable" not in actuator.readings
+    assert "full_charge_armed" not in actuator.desired.to_dict()
+    assert asyncio.run(actuator.shutdown()) in (True, False)
+    assert fc_calls(ha) == []
+
+
+@pytest.mark.parametrize("mode", ["live", "dry_run"])
+def test_enabled_but_without_a_directive_the_weekly_entities_are_never_touched(mode):
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day="friday", charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store, mode=mode, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000)))
+    clock.advance(1)
+    tick(actuator, ctx(clock, intent("idle")))
+    assert fc_calls(ha) == []
+    assert asyncio.run(actuator.shutdown()) is True
+    assert fc_calls(ha) == []  # not even the shutdown disarm: nothing ever drove the feature
+
+
+def test_without_the_feature_the_weekly_status_still_holds_safe_idle():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, status=WEEKLY)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert actuator.reasons == ("integration_unhealthy",)
+    assert actuator.desired.mode == "safe_idle"
+
+
+# ---- guard status -----------------------------------------------------------------------------
+
+
+def test_the_weekly_status_is_healthy_only_while_a_run_is_armed_for_today():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, status=WEEKLY, weekly="on", day=TODAY, charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert actuator.reasons == () and actuator.desired.mode == "charge"
+    assert ha.writes() == []
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [None, DISARMED, FullChargeDirective(True, "wednesday")],
+    ids=["no_directive", "disarmed", "armed_for_another_day"],
+)
+def test_the_weekly_status_holds_safe_idle_otherwise(directive):
+    clock = FakeClock(NOW)
+    store = fc_world(clock, status=WEEKLY, weekly="on", day=TODAY, charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=directive))
+    assert actuator.reasons == ("integration_unhealthy",)
+    assert actuator.desired.mode == "safe_idle"
+    assert store.get(ENTS.allow_charge).state == "off"
+
+
+@pytest.mark.parametrize("status", ["manual", "backup_mode", "grid_charging", "unavailable"])
+def test_every_other_status_still_holds_safe_idle_while_armed(status):
+    clock = FakeClock(NOW)
+    store = fc_world(clock, status=status, weekly="on", day=TODAY)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert actuator.reasons == ("integration_unhealthy",)
+    assert actuator.desired.mode == "safe_idle"
+
+
+def test_a_refused_directive_does_not_make_the_weekly_status_healthy():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, status=WEEKLY, weekly="on", day=TODAY, delay="on")
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert actuator.reasons == ("integration_unhealthy",)
+    assert actuator.full_charge_refusal == "delay_switch_on"
+    assert fc_calls(ha) == [("turn_off", "omnibattery_weekly_full_charge_enabled", None)]
+
+
+def test_a_guard_failure_safe_idle_neither_arms_nor_disarms():
+    clock = FakeClock(NOW)
+    store = fc_world(clock)  # switch off
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED, price_fresh=False))
+    assert actuator.reasons == ("price_stale",) and actuator.desired.mode == "safe_idle"
+    assert fc_calls(ha) == []
+
+    clock = FakeClock(NOW)
+    store = fc_world(clock, status=WEEKLY, weekly="on", day=TODAY, charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED, price_fresh=False))
+    assert actuator.reasons == ("price_stale",)
+    assert store.get(ENTS.allow_charge).state == "off"  # the safe idle
+    assert fc_calls(ha) == []  # mid-run: the switch stays on, nothing is toggled for nothing
+
+
+def test_a_safe_idle_still_disarms_when_the_directive_says_so():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=DISARMED, price_fresh=False))
+    assert actuator.desired.mode == "safe_idle"
+    assert [(c[1], c[2]) for c in ha.calls if c[0] != "input_datetime"][:2] == [
+        ("turn_off", FC_ENTS.enable_switch),
+        ("turn_off", ENTS.allow_charge),
+    ]
+
+
+# ---- refusals --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("world_kw", "directive", "reason"),
+    [
+        ({"delay": "on"}, ARMED, "delay_switch_on"),
+        ({"delay": "unavailable"}, ARMED, "delay_switch_unreadable"),
+        ({"delay": "unknown"}, ARMED, "delay_switch_unreadable"),
+        ({"delay": None}, ARMED, "delay_switch_unreadable"),
+        ({"options": WEEKDAY_OPTIONS[:6]}, ARMED, "day_options_invalid"),
+        ({"options": ["Monday", "Tuesday"]}, ARMED, "day_options_invalid"),
+        ({"options": None}, ARMED, "day_options_invalid"),
+        ({"day": "unavailable"}, ARMED, "entities_missing"),
+        ({"weekly": "unavailable"}, ARMED, "entities_missing"),
+        ({}, FullChargeDirective(True, "wednesday"), "not_today"),
+        ({"kill": "off"}, ARMED, "kill_switch_off"),
+    ],
+)
+def test_arming_is_refused_and_never_written(world_kw, directive, reason):
+    clock = FakeClock(NOW)
+    store = fc_world(clock, **world_kw)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=directive))
+    assert actuator.full_charge_refusal == reason
+    assert fc_arming_writes(ha) == []
+    assert actuator.view()["full_charge"]["refusal"] == reason
+    if reason != "kill_switch_off":  # the battery itself keeps following the plan
+        assert actuator.reasons == () and store.get(ENTS.allow_charge).state == "on"
+    clock.advance(1)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=DISARMED))
+    assert actuator.full_charge_refusal is None
+
+
+def test_a_refusal_is_logged_once(caplog):
+    clock = FakeClock(NOW)
+    store = fc_world(clock, delay="on")
+    actuator, _, _ = make(clock, store, full_charge=FC)
+    with caplog.at_level("INFO", logger="battery_optimizer.service.actuator"):
+        for _ in range(3):
+            clock.advance(1)
+            tick(actuator, ctx(clock, intent("idle"), full_charge=ARMED))
+    lines = [r for r in caplog.records if "arming refused" in r.getMessage()]
+    assert len(lines) == 1 and "delay_switch_on" in lines[0].getMessage()
+    assert lines[0].levelname == "WARNING"
+
+
+def test_kill_switch_off_writes_nothing_even_when_armed():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, kill="off")
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert ha.calls == []
+
+
+def test_no_writes_without_a_synced_home_assistant_when_armed():
+    clock = FakeClock(NOW)
+    store = fc_world(clock)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED, ha_synced=False))
+    assert ha.calls == []
+
+
+# ---- readback, retry, forbidden --------------------------------------------------------------
+
+
+def test_a_transient_error_on_the_day_select_is_retried():
+    clock = FakeClock(NOW)
+    store = fc_world(clock)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    ha.refuse_once.add(FC_ENTS.day_select)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=ARMED))
+    assert [c[0] for c in fc_calls(ha)] == ["select_option", "select_option", "turn_on"]
+    assert store.get(FC_ENTS.day_select).state == TODAY
+    assert store.get(FC_ENTS.enable_switch).state == "on"
+
+
+def test_the_readback_of_the_switch_is_awaited_then_retried_then_safe_idle():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, charge="on", pd=1400)
+    actuator, ha, metrics = make(clock, store, full_charge=FC, silent={FC_ENTS.enable_switch})
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert [c[0] for c in fc_calls(ha)] == ["select_option"] + ["turn_on"] * 3
+    assert counter(metrics, "actuator_writes", role="full_charge_enable", result="failed") == 1
+    assert counter(metrics, "actuator_write_failures", reason="readback_timeout") == 3
+    assert actuator.alert == "write_failed" and actuator.desired == safe_idle("write_failed")
+    assert store.get(ENTS.allow_charge).state == "off"  # charge was never enabled
+
+
+def test_a_forbidden_arming_write_is_never_retried_and_the_pair_is_not_retried_each_tick():
+    clock = FakeClock(NOW)
+    store = fc_world(clock)
+    actuator, ha, metrics = make(clock, store, full_charge=FC, forbid={FC_ENTS.day_select})
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert [c[0] for c in fc_calls(ha)] == ["select_option"]  # once, no retry, no switch
+    assert counter(metrics, "actuator_write_failures", reason="forbidden") == 1
+    assert actuator.desired == safe_idle("write_failed") and actuator.alert == "write_failed"
+    # the next tick does not retry the same directive (no safe-idle loop all day) ...
+    clock.advance(30)
+    for entity, value in ((GRID, 400), (ENTS.battery_ac_power, 0)):
+        store.apply(entity_state(entity, value, clock.now()))
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert [c[0] for c in fc_calls(ha)] == ["select_option"]
+    assert actuator.full_charge_refusal == "write_failed"
+    assert actuator.desired.mode == "charge"  # ... and the battery follows the plan again
+    # ... but a new directive (the scheduler cancelled, then re-armed) gets a fresh try
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=DISARMED))
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert [c[0] for c in fc_calls(ha)] == ["select_option", "select_option"]
+
+
+# ---- dry_run ----------------------------------------------------------------------------------
+
+
+def test_dry_run_simulates_the_two_entities_and_sends_nothing():
+    clock = FakeClock(NOW)
+    store = fc_world(clock)
+    records: list = []
+    actuator, ha, metrics = make(clock, store, mode="dry_run", records=records, full_charge=FC)
+    record = tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert ha.calls == []
+    assert [(w["role"], w["result"]) for w in record["writes"]] == [
+        ("pd_target", "dry_run"),
+        ("full_charge_day", "dry_run"),
+        ("full_charge_enable", "dry_run"),
+        ("allow_charge", "dry_run"),
+    ]
+    assert record["writes"][1]["option"] == TODAY
+    assert record["writes"][1]["service"] == "select.select_option"
+    assert record["desired"]["full_charge_armed"] is True
+    assert counter(metrics, "actuator_writes", role="full_charge_day", result="dry_run") == 1
+    # planned against the simulated state: not repeated, and the actuator's view follows it
+    clock.advance(1)
+    record = tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert record["writes"] == []
+    view = actuator.view()["full_charge"]
+    assert (view["enable_switch"], view["day"], view["delay_switch"]) == (True, TODAY, False)
+    # disarm is simulated too
+    clock.advance(1)
+    record = tick(actuator, ctx(clock, intent("charge", 1000), full_charge=DISARMED))
+    assert [(w["role"], w["service"]) for w in record["writes"]] == [
+        ("full_charge_enable", "switch.turn_off")
+    ]
+    clock.advance(1)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=DISARMED))
+    assert actuator.view()["full_charge"]["enable_switch"] is False
+    assert ha.calls == []
+
+
+# ---- kill switch edge and shutdown -----------------------------------------------------------
+
+
+def test_kill_switch_off_edge_disarms_once_after_the_safe_idle():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, status=WEEKLY, charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert fc_calls(ha) == []
+    calls = len(ha.calls)
+    clock.advance(1)
+    store.apply(entity_state(ENTS.kill_switch, "off", clock.now()))
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert [(c[1], c[2]) for c in ha.calls[calls:]] == [
+        ("turn_off", ENTS.allow_charge),
+        ("turn_off", FC_ENTS.enable_switch),
+    ]
+    assert not actuator.in_control
+    assert actuator.full_charge_refusal == "kill_switch_off"
+    clock.advance(30)  # hands off from here on
+    store.apply(entity_state(FC_ENTS.enable_switch, "on", clock.now()))
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert len(ha.calls) == calls + 2
+
+
+def test_kill_switch_off_mid_arming_aborts_before_the_switch_and_disarms_nothing_extra():
+    clock = FakeClock(NOW)
+    store = fc_world(clock)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    ha.after[FC_ENTS.day_select] = lambda: store.apply(
+        entity_state(ENTS.kill_switch, "off", clock.now())
+    )
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert [c[0] for c in fc_calls(ha)] == ["select_option"]  # the switch was never turned on
+    assert store.get(ENTS.allow_charge).state == "off" and not actuator.in_control
+
+
+def test_kill_switch_off_after_the_switch_turned_on_turns_it_back_off():
+    clock = FakeClock(NOW)
+    store = fc_world(clock)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    ha.after[FC_ENTS.enable_switch] = lambda: store.apply(
+        entity_state(ENTS.kill_switch, "off", clock.now())
+    )
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert [c[0] for c in fc_calls(ha)] == ["select_option", "turn_on", "turn_off"]
+    assert store.get(FC_ENTS.enable_switch).state == "off"
+    assert store.get(ENTS.allow_charge).state == "off" and not actuator.in_control
+
+
+def test_shutdown_disarms_after_the_safe_idle_when_in_control():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, status=WEEKLY, charge="on", pd=1400)
+    records: list = []
+    actuator, ha, _ = make(clock, store, records=records, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=ARMED))
+    assert actuator.in_control
+    assert asyncio.run(actuator.shutdown()) is True
+    assert [(c[1], c[2]) for c in ha.calls if c[0] != "input_datetime"] == [
+        ("turn_off", ENTS.allow_charge),
+        ("turn_off", FC_ENTS.enable_switch),
+    ]
+    assert [w["role"] for w in records[-1]["writes"]] == ["allow_charge", "full_charge_enable"]
+
+
+def test_shutdown_is_best_effort_about_the_switch():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, status=WEEKLY)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=ARMED))
+    ha.refuse.add(FC_ENTS.enable_switch)
+    assert asyncio.run(actuator.shutdown()) is True  # the safe idle itself succeeded
+    assert [c[0] for c in fc_calls(ha)] == ["turn_off"] * 3
+
+
+def test_shutdown_without_control_or_without_the_feature_writes_nothing():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, kill="off")
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=ARMED))
+    assert asyncio.run(actuator.shutdown()) is True
+    assert ha.calls == []
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY)
+    actuator, ha, _ = make(clock, store)  # feature off
+    tick(actuator, ctx(clock, intent("idle")))
+    assert asyncio.run(actuator.shutdown()) is True
+    assert fc_calls(ha) == []
+
+
+# ---- views for the scheduler ------------------------------------------------------------------
+
+
+def test_view_and_snapshot_expose_the_weekly_readings():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, delay="off", status=WEEKLY)
+    actuator, _, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("idle"), full_charge=ARMED))
+    expected = {
+        "enable_switch": True,
+        "day": TODAY,
+        "delay_switch": False,
+        "integration_status": WEEKLY,
+        "driven_armed": True,
+        "refusal": None,
+    }
+    assert actuator.view()["full_charge"] == expected
+    snapshot = actuator.snapshot()["full_charge"]
+    assert snapshot == {
+        "enable_switch": 1.0,
+        "day": TODAY,
+        "delay_switch": 0.0,
+        "integration_status": WEEKLY,
+        "refusal": None,
+    }
+    assert actuator.readings["weekly_enable"] is True and actuator.readings["weekly_day"] == TODAY
+    json.dumps(actuator.view())  # /status must stay serialisable
+
+
+def test_the_directive_follows_the_local_weekday_across_midnight():
+    # 23:30 local Tuesday == 21:30Z; 00:10 local Wednesday == 22:10Z (CEST, UTC+2)
+    late = datetime(2026, 10, 20, 21, 30, tzinfo=UTC)
+    clock = FakeClock(late)
+    store = fc_world(clock, status=WEEKLY, weekly="on", day="tuesday")
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("idle", valid_from=floor_slot(late, 900)), full_charge=ARMED))
+    assert actuator.full_charge_refusal is None and actuator.reasons == ()
+    clock.advance(40 * 60)
+    for entity, value in ((GRID, 400), (ENTS.battery_ac_power, 0)):
+        store.apply(entity_state(entity, value, clock.now()))
+    store.apply(entity_state(ENTS.integration_status, WEEKLY, clock.now()))
+    next_intent = intent("idle", valid_from=floor_slot(clock.now(), 900))
+    tick(actuator, ctx(clock, next_intent, full_charge=ARMED))  # a stale Tuesday directive
+    assert actuator.full_charge_refusal == "not_today"
+    assert actuator.reasons == ("integration_unhealthy",)
+    assert fc_calls(ha) == [("turn_off", "omnibattery_weekly_full_charge_enabled", None)]
+
+
+# ---- configuration ----------------------------------------------------------------------------
+
+FC_ON = {**LIVE, "full_charge.enabled": True}
+
+
+def test_the_committed_full_charge_section_is_off_and_names_the_installation_entities():
+    fc = load_service_config(REPO / "config" / "service.yaml").full_charge
+    assert fc == FullChargeSettings(enabled=False, entities=FC_ENTS)
+    assert (fc.min_interval_days, fc.max_interval_days) == (5, 15)
+    assert (fc.threshold_min_eur, fc.threshold_scale_eur, fc.fixed_cost_eur) == (0.01, 0.01, 0.0)
+    assert (fc.taper.start_soc_frac, fc.taper.power_kw) == (0.90, 0.2)
+    assert fc.bootstrap_last_full is None and fc.reached_soc_pct == 99
+
+
+def test_a_missing_full_charge_section_means_the_feature_is_off(tmp_path):
+    import yaml
+
+    raw = yaml.safe_load((REPO / "config" / "service.yaml").read_text())
+    del raw["full_charge"]
+    path = tmp_path / "service.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    assert load_service_config(path).full_charge == FullChargeSettings()
+
+
+def test_the_full_charge_section_does_not_change_the_plan_identity(tmp_path):
+    base = load_service_config(write_service_config(tmp_path))
+    other = load_service_config(write_service_config(tmp_path, **{"full_charge.enabled": True}))
+    assert other.full_charge.enabled is True
+    assert base.config_hash() == other.config_hash()
+    assert base.public_dict()["full_charge"]["enabled"] is False
+    json.dumps(other.public_dict())  # /status serialises it
+
+
+@pytest.mark.parametrize("mode", ["shadow", "dry_run", "live"])
+def test_the_feature_can_be_enabled_in_every_mode(tmp_path, mode):
+    config = load_service_config(write_service_config(tmp_path, **{**FC_ON, "mode": mode}))
+    assert config.mode == mode and config.full_charge.enabled
+
+
+def test_a_bootstrap_date_and_a_disabled_taper_are_accepted(tmp_path):
+    config = load_service_config(
+        write_service_config(
+            tmp_path,
+            **{
+                **FC_ON,
+                "full_charge.bootstrap_last_full": "2026-11-01",
+                "full_charge.taper.start_soc_frac": None,
+            },
+        )
+    )
+    assert config.full_charge.bootstrap_last_full.isoformat() == "2026-11-01"
+    assert config.full_charge.taper.start_soc_frac is None
+    assert config.public_dict()["full_charge"]["bootstrap_last_full"] == "2026-11-01"
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"full_charge.bogus": 1}, "unknown full_charge keys"),
+        ({"full_charge.entities.bogus": "switch.x"}, "unknown full_charge.entities keys"),
+        ({"full_charge.taper.bogus": 1}, "unknown full_charge.taper keys"),
+        ({"full_charge.enabled": "yes"}, "full_charge.enabled must be true or false"),
+        ({"full_charge.min_interval_days": 0}, "min_interval_days"),
+        ({"full_charge.min_interval_days": 15}, "min_interval_days < max_interval_days"),
+        ({"full_charge.min_interval_days": 2.5}, "min_interval_days"),
+        ({"full_charge.max_interval_days": 31}, "max_interval_days <= 30"),
+        ({"full_charge.max_interval_days": 4}, "min_interval_days < max_interval_days"),
+        ({"full_charge.threshold_min_eur": -0.01}, "threshold_min_eur"),
+        ({"full_charge.threshold_min_eur": float("nan")}, "threshold_min_eur"),
+        ({"full_charge.threshold_scale_eur": float("inf")}, "threshold_scale_eur"),
+        ({"full_charge.fixed_cost_eur": -1}, "fixed_cost_eur"),
+        ({"full_charge.fixed_cost_eur": True}, "fixed_cost_eur"),
+        ({"full_charge.shortfall_penalty_eur_per_kwh": 0}, "shortfall_penalty_eur_per_kwh"),
+        ({"full_charge.shortfall_penalty_eur_per_kwh": -1}, "shortfall_penalty_eur_per_kwh"),
+        ({"full_charge.target_soc_frac": 1.1}, "arm_before_soc_frac < target_soc_frac <= 1"),
+        ({"full_charge.target_soc_frac": 0.9}, "arm_before_soc_frac < target_soc_frac <= 1"),
+        ({"full_charge.arm_before_soc_frac": 0}, "arm_before_soc_frac"),
+        ({"full_charge.arm_before_soc_frac": 1.0}, "arm_before_soc_frac < target_soc_frac"),
+        ({"full_charge.reached_soc_pct": 101}, "reached_soc_pct"),
+        ({"full_charge.reached_soc_pct": 0}, "reached_soc_pct"),
+        ({"full_charge.completion_margin_slots": 0}, "completion_margin_slots"),
+        ({"full_charge.arm_lead_slots": -1}, "arm_lead_slots"),
+        ({"full_charge.ack_timeout_s": 0}, "ack_timeout_s"),
+        ({"full_charge.top_hold_timeout_min": 0}, "top_hold_timeout_min"),
+        ({"full_charge.max_consecutive_failures": 0}, "max_consecutive_failures"),
+        ({"full_charge.failure_pause_days": 0}, "failure_pause_days"),
+        ({"full_charge.taper.start_soc_frac": 0.5}, "start_soc_frac must be in"),
+        ({"full_charge.taper.start_soc_frac": 1.0}, "start_soc_frac must be in"),
+        ({"full_charge.taper.power_kw": 0}, "taper.power_kw"),
+        ({"full_charge.taper.power_kw": 2.6}, "taper.power_kw must not exceed"),
+        ({"full_charge.bootstrap_last_full": "yesterday"}, "bootstrap_last_full"),
+        ({"full_charge.bootstrap_last_full": 5}, "bootstrap_last_full"),
+        ({"full_charge.entities.enable_switch": "number.x"}, "enable_switch must be a switch"),
+        ({"full_charge.entities.day_select": "switch.x"}, "day_select must be a select"),
+        ({"full_charge.entities.delay_switch": "sensor.x"}, "delay_switch must be a switch"),
+        ({"full_charge.entities.balancing_mode": "sensor.x"}, "balancing_mode must be a binary_"),
+        ({"full_charge.entities.cell_delta": "x"}, "cell_delta"),
+        (
+            {"full_charge.entities.delay_switch": FC_ENTS.enable_switch},
+            "must name distinct entities",
+        ),
+        (
+            {"full_charge.entities.enable_switch": ENTS.allow_charge},
+            "must name distinct entities",
+        ),
+        (
+            {"full_charge.entities.delay_switch": ENTS.power_limits},
+            "must name distinct entities",
+        ),
+        ({"actuation.healthy_states": ["balanced", "weekly_full_charge"]}, "weekly_full_charge"),
+    ],
+)  # fmt: skip
+def test_invalid_full_charge_config_is_refused(tmp_path, override, message):
+    with pytest.raises(ValueError, match=message):
+        load_service_config(write_service_config(tmp_path, **override))
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"full_charge.entities.enable_switch": None}, "needs full_charge.entities.enable_switch"),
+        ({"full_charge.entities.day_select": None}, "needs full_charge.entities.day_select"),
+        ({"full_charge.entities.delay_switch": None}, "needs full_charge.entities.delay_switch"),
+        ({"full_charge.entities.cell_delta": None}, "needs full_charge.entities.cell_delta"),
+        ({"planning.soc_source": "simulated"}, "needs planning.soc_source=entity"),
+        ({"actuation.entities.integration_status": None}, "integration_status"),
+        ({"actuation.entities.battery_soc": None}, "battery_soc"),
+    ],
+)  # fmt: skip
+def test_enabling_the_feature_requires_its_inputs(tmp_path, override, message):
+    on = {"full_charge.enabled": True, **override}
+    with pytest.raises(ValueError, match=message):
+        load_service_config(write_service_config(tmp_path, **on))
+    # the same gaps are fine while the feature is off
+    off = {k: v for k, v in override.items() if k.startswith("full_charge.")}
+    if off:
+        load_service_config(write_service_config(tmp_path, **off))

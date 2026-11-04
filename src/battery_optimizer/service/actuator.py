@@ -30,6 +30,18 @@ no direction is being switched on, is rate limited: it is rewritten when it move
 edges, mode changes, the discharge margin and the discharge cap are always written.  Every
 write but a ``turn_off`` re-checks the kill switch first and aborts to safe idle when it is off.
 
+**Periodic full charge** (ADR-0007 amendment 2026-11-04; off unless the runtime hands the actuator
+enabled :class:`~.config.FullChargeSettings` *and* a :class:`FullChargeDirective` in the context):
+the directive says whether Omnibattery's weekly full charge is armed.  Arming writes the day
+select (the local weekday), then turns the weekly switch on, both before the direction on-writes
+of the same reconcile; disarming turns the switch off first, in the restrictive block.  Arming is
+refused (never written, the switch is driven off) while the weekly delay switch is on or
+unreadable, the select does not offer the seven weekdays, the directive is not for the current
+local weekday, or a write of the pair failed; the reason is ``full_charge_refusal``.
+``weekly_full_charge`` counts as a healthy ``integration_status`` only while a directive is
+effectively armed for today.  A guard-failure safe idle neither arms nor disarms, but the kill
+switch's on -> off edge and shutdown disarm once, best effort, after their safe idle.
+
 Numeric targets are bounded by the entity's own ``min``/``max`` as well as ours: Omnibattery
 bounds the PD target by the batteries' summed charge limit (±2500 W here), so the effective
 charge ceiling is ``min(import_cap_w, entity max)``; ``Desired`` carries the value actually
@@ -55,14 +67,14 @@ import contextlib
 import logging
 import math
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING, Any
 
 from .clock import Clock
-from .config import ActuationSettings
+from .config import ActuationSettings, FullChargeSettings
 from .entity_store import EntityState, EntityStore, parse_ha_state
-from .ha_guard import ForbiddenHACallError
+from .ha_guard import WEEKDAY_OPTIONS, ForbiddenHACallError
 
 if TYPE_CHECKING:
     from .planner import ShadowIntent
@@ -72,10 +84,12 @@ __all__ = [
     "GUARD_REASONS",
     "SAFE_IDLE_REASONS",
     "WRITE_FAILURE_REASONS",
+    "WEEKLY_FULL_CHARGE_STATUS",
     "WRITE_ROLES",
     "ActuationContext",
     "Actuator",
     "Desired",
+    "FullChargeDirective",
     "Write",
     "safe_idle",
 ]
@@ -110,7 +124,13 @@ WRITE_ROLES: tuple[str, ...] = (
     "power_limits",
     "pd_target",
     "heartbeat",
+    "full_charge_day",
+    "full_charge_enable",
 )
+#: The two roles of the periodic full charge (never touched without an enabled directive).
+FULL_CHARGE_ROLES: tuple[str, ...] = ("full_charge_day", "full_charge_enable")
+#: ``integration_status`` while Omnibattery's weekly full charge is running.
+WEEKLY_FULL_CHARGE_STATUS = "weekly_full_charge"
 
 #: Slot decision (runtime ``_SlotOpen.decision``) -> guard reason when there is no intent.
 _DECISION_REASON = {
@@ -142,6 +162,20 @@ class ActuationContext:
     plan_from_this_process: bool
     #: A PVPC price is known for the current slot.
     price_fresh: bool
+    #: The periodic full charge: ``None`` = feature off, the two roles are never touched.
+    full_charge: FullChargeDirective | None = None
+
+
+@dataclass(frozen=True)
+class FullChargeDirective:
+    """Whether Omnibattery's weekly full charge should be armed (built by the scheduler)."""
+
+    armed: bool  # the actuator drives the weekly switch to this
+    weekday: str | None = None  # "monday".."sunday": weekday of the run's local date
+
+    def __post_init__(self) -> None:
+        if self.armed and self.weekday not in WEEKDAY_OPTIONS:
+            raise ValueError(f"an armed directive needs a weekday of {WEEKDAY_OPTIONS}")
 
 
 @dataclass(frozen=True)
@@ -159,9 +193,16 @@ class Desired:
     clamped: bool = False
     #: Planned battery power (W) the clamp removed; 0 when nothing was cut.
     clamped_w: float = 0.0
+    #: Periodic full charge: ``True`` arm (select, then switch on), ``False`` disarm, ``None``
+    #: leave both entities alone.  Recorded only when set.
+    full_charge_armed: bool | None = None
+    full_charge_weekday: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        out = asdict(self)
+        if self.full_charge_armed is None:
+            del out["full_charge_armed"], out["full_charge_weekday"]
+        return out
 
 
 def safe_idle(reason: str) -> Desired:
@@ -180,11 +221,15 @@ class Write:
     domain: str
     service: str
     value: float | None = None
+    #: ``select.select_option`` only.
+    option: str | None = None
 
     @property
     def service_data(self) -> dict[str, Any] | None:
         if self.domain == "number":
             return {"value": self.value}
+        if self.domain == "select":
+            return {"option": self.option}
         if self.domain == "input_datetime":
             return {"timestamp": self.value}
         return None
@@ -196,6 +241,8 @@ class Write:
         if self.domain == "switch":
             wanted = "on" if self.service == "turn_on" else "off"
             return state.state.strip().lower() == wanted
+        if self.domain == "select":
+            return state.state.strip() == self.option
         value = state.numeric()
         return value is not None and self.value is not None and abs(value - self.value) <= tolerance
 
@@ -207,6 +254,8 @@ class Write:
         }
         if self.value is not None:
             out["value"] = self.value
+        if self.option is not None:
+            out["option"] = self.option
         return out
 
 
@@ -255,6 +304,8 @@ class Actuator:
         refresh: Refresher | None = None,
         record: Recorder | None = None,
         metrics: Any = None,
+        full_charge: FullChargeSettings | None = None,
+        tz: tzinfo | None = None,
     ) -> None:
         if mode not in ACTUATOR_MODES:
             raise ValueError(f"actuator mode must be one of {ACTUATOR_MODES}, got {mode!r}")
@@ -271,6 +322,17 @@ class Actuator:
         self._record = record
         self._metrics = metrics
         self._lock = asyncio.Lock()
+        #: The periodic full charge's settings; ``None`` while the feature is off.
+        self._fc = full_charge if full_charge is not None and full_charge.enabled else None
+        if self._fc is not None and tz is None:
+            raise ValueError("the periodic full charge needs the service time zone (tz)")
+        self._tz = tz
+        #: Why the directive's arming was refused at the last tick (``None``: not refused).
+        self.full_charge_refusal: str | None = None
+        #: The armed directive whose write failed: refused until the directive changes.
+        self._fc_failed: FullChargeDirective | None = None
+        #: A directive has been seen: only then do the kill-switch edge and shutdown disarm.
+        self._fc_driven = False
 
         self.kill_switch: bool | None = None
         #: The kill switch has been seen on: an off edge or a shutdown must idle once.
@@ -341,7 +403,7 @@ class Actuator:
             state = self._store.get(entity)
             return state.numeric() if state is not None else None
 
-        return {
+        readings: dict[str, Any] = {
             "grid_power_w": grid,
             "battery_ac_power_w": ac,
             "battery_soc_pct": soc,
@@ -354,6 +416,21 @@ class Actuator:
             "pd_target_w": number(e.pd_target),
             "max_discharge_w": number(e.max_discharge_power),
         }
+        if self._fc is not None:  # the weekly readings, for the scheduler (what we believe)
+            f = self._fc.entities
+            day = self._observed(f.day_select)
+            readings["weekly_enable"] = self._switch_state_observed(f.enable_switch)
+            usable = day is not None and day.available
+            readings["weekly_day"] = day.state.strip() if usable else None
+            readings["weekly_delay"] = self._switch_state(f.delay_switch)
+        return readings
+
+    def _full_charge_entities(self) -> tuple[str | None, ...]:
+        """The weekly entities the actuator reads (none while the feature is off)."""
+        if self._fc is None:
+            return ()
+        f = self._fc.entities
+        return (f.enable_switch, f.day_select, f.delay_switch)
 
     async def _refresh_entities(self, entities: tuple[str | None, ...]) -> None:
         if self._refresh is None:
@@ -406,9 +483,52 @@ class Actuator:
         if not ctx.price_fresh:
             reasons.append("price_stale")
         status = readings.get("integration_status")
-        if status is None or status.strip() not in s.healthy_states:
+        healthy = status is not None and status.strip() in s.healthy_states
+        if status is not None and status.strip() == WEEKLY_FULL_CHARGE_STATUS:
+            # The weekly run is healthy only while this service has armed one for today.
+            healthy = self._full_charge_target(ctx, readings)[0] is True
+        if not healthy:
             reasons.append("integration_unhealthy")
         return reasons
+
+    def _local_weekday(self, now: datetime) -> str:
+        assert self._tz is not None
+        return WEEKDAY_OPTIONS[now.astimezone(self._tz).weekday()]
+
+    def _full_charge_target(
+        self, ctx: ActuationContext, readings: Mapping[str, Any]
+    ) -> tuple[bool | None, str | None, str | None]:
+        """``(armed, weekday, refusal)``; ``armed`` is ``None`` when the feature is not driven.
+
+        An armed directive that is refused becomes ``False`` (the switch is driven off) with the
+        refusal reason; it is never written.
+        """
+        directive = ctx.full_charge
+        if self._fc is None or directive is None:
+            return None, None, None
+        if not directive.armed:
+            return False, None, None
+        f = self._fc.entities
+        refusal: str | None = None
+        enable, day = self._observed(f.enable_switch), self._observed(f.day_select)
+        options = day.attributes.get("options") if day is not None else None
+        if directive == self._fc_failed:
+            refusal = "write_failed"
+        elif directive.weekday != self._local_weekday(ctx.now):
+            refusal = "not_today"
+        elif not self._kill_switch_on():
+            refusal = "kill_switch_off"
+        elif enable is None or not enable.available or day is None or not day.available:
+            refusal = "entities_missing"
+        elif not isinstance(options, list) or not set(WEEKDAY_OPTIONS) <= set(map(str, options)):
+            refusal = "day_options_invalid"
+        elif readings.get("weekly_delay") is None:
+            refusal = "delay_switch_unreadable"
+        elif readings["weekly_delay"]:
+            refusal = "delay_switch_on"
+        if refusal is not None:
+            return False, None, refusal
+        return True, directive.weekday, None
 
     def desired_for(self, intent: ShadowIntent, readings: Mapping[str, Any]) -> Desired:
         """The mapping table of the module docstring (call only after a passing guard)."""
@@ -493,6 +613,9 @@ class Actuator:
                     return
             writes.append(write)
 
+        fc = self._fc.entities if self._fc is not None else None
+        if fc is not None and desired.full_charge_armed is False:
+            switch("full_charge_enable", fc.enable_switch, False)  # disarm: restrictive, first
         if not desired.allow_charge:
             switch("allow_charge", e.allow_charge, False)
         if not desired.allow_discharge:
@@ -509,6 +632,20 @@ class Actuator:
             switch("power_limits", e.power_limits, True)
         if desired.pd_target_w is not None:
             number("pd_target", e.pd_target, desired.pd_target_w, 0.0, s.import_cap_w)
+        if fc is not None and desired.full_charge_armed:
+            # Arm: the day first (a select change while a run is active would abort it), then the
+            # switch, both before any direction is switched on.
+            assert fc.day_select is not None and desired.full_charge_weekday in WEEKDAY_OPTIONS
+            day = Write(
+                "full_charge_day",
+                fc.day_select,
+                "select",
+                "select_option",
+                option=desired.full_charge_weekday,
+            )
+            if not day.matches(self._observed(fc.day_select)):
+                writes.append(day)
+            switch("full_charge_enable", fc.enable_switch, True)
         if desired.allow_discharge:
             switch("allow_discharge", e.allow_discharge, True)
         if desired.allow_charge:
@@ -524,7 +661,13 @@ class Actuator:
     def _simulate(self, write: Write) -> None:
         """dry_run: remember the state this write would leave (attributes kept)."""
         old = self._observed(write.entity_id)
-        value = write.value if write.domain == "number" else write.service.removeprefix("turn_")
+        value = (
+            write.value
+            if write.domain == "number"
+            else write.option
+            if write.domain == "select"
+            else write.service.removeprefix("turn_")
+        )
         now = self._clock.now()
         self._simulated[write.entity_id] = parse_ha_state(
             {
@@ -607,9 +750,15 @@ class Actuator:
         self, desired: Desired, now: datetime
     ) -> tuple[bool, list[dict[str, Any]]]:
         """Apply the planned writes in order; stop at the first one that fails."""
-        done: list[dict[str, Any]] = []
         self._aborted = None
-        for write in self.plan_writes(desired, now):
+        ok, done = await self._apply(self.plan_writes(desired, now))
+        if ok:
+            self._applied_mode = desired.mode
+        return ok, done
+
+    async def _apply(self, writes: list[Write]) -> tuple[bool, list[dict[str, Any]]]:
+        done: list[dict[str, Any]] = []
+        for write in writes:
             ok = await self._execute(write)
             if not ok and self._aborted:
                 result = "aborted"
@@ -623,13 +772,23 @@ class Actuator:
                 write.role,
                 write.domain,
                 write.service,
-                "-" if write.value is None else f"{write.value:g}",
+                write.option or ("-" if write.value is None else f"{write.value:g}"),
                 result,
             )
             if not ok:
                 return False, done
-        self._applied_mode = desired.mode
         return True, done
+
+    async def _disarm(self) -> list[dict[str, Any]]:
+        """Best effort: turn the weekly switch off unless it already reads off (feature on only)."""
+        if self._fc is None or not self._fc_driven or self._fc.entities.enable_switch is None:
+            return []
+        entity = self._fc.entities.enable_switch
+        write = Write("full_charge_enable", entity, "switch", "turn_off")
+        if write.matches(self._observed(entity)):
+            return []
+        _, done = await self._apply([write])
+        return done
 
     async def _heartbeat(self, now: datetime) -> str:
         entity = self.settings.entities.heartbeat
@@ -669,12 +828,20 @@ class Actuator:
                 e.battery_liveness,
                 e.integration_status,
                 e.kill_switch,
+                *self._full_charge_entities(),
             )
         )
         readings = self._read(now)
         self.readings = readings
         before = (self.kill_switch, self.in_control, self.reasons, self.desired, self.alert)
         self.kill_switch = self._kill_switch_on()
+        self._fc_driven = self._fc_driven or (self._fc is not None and ctx.full_charge is not None)
+        if self._fc_failed is not None and ctx.full_charge != self._fc_failed:
+            self._fc_failed = None  # a new directive gets a fresh try
+        refused_before = self.full_charge_refusal
+        fc_armed, fc_weekday, self.full_charge_refusal = self._full_charge_target(ctx, readings)
+        if self.full_charge_refusal not in (None, refused_before):
+            log.warning("actuator full-charge arming refused reason=%s", self.full_charge_refusal)
         writes: list[dict[str, Any]] = []
         desired: Desired | None = None
         heartbeat: str | None = None
@@ -685,6 +852,7 @@ class Actuator:
             if self.in_control:  # the on -> off edge: idle once, then hands off
                 desired = safe_idle("kill_switch_off")
                 ok, writes = await self._reconcile(desired, now)
+                writes += await self._disarm()  # best effort, after the safe idle
                 self.in_control = not ok
                 self.alert = None if ok else "safe_idle_failed"
         else:
@@ -695,19 +863,28 @@ class Actuator:
             else:
                 assert ctx.intent is not None
                 desired = self.desired_for(ctx.intent, readings)
+            if fc_armed is False or (fc_armed and desired.mode != "safe_idle"):
+                # A safe idle never arms; it disarms only when the directive says so.
+                desired = replace(
+                    desired, full_charge_armed=fc_armed, full_charge_weekday=fc_weekday
+                )
             ok, writes = await self._reconcile(desired, now)
             if self._aborted:  # the kill switch went off mid-reconcile: idle and hand off
                 reasons = [self._aborted]
                 self.kill_switch = False
                 desired = safe_idle(self._aborted)
                 ok, more = await self._reconcile(desired, now)
-                writes += more
+                writes += more + await self._disarm()  # the on -> off edge, mid-reconcile
                 self.in_control = not ok
                 self.alert = None if ok else "safe_idle_failed"
                 ok = False  # no heartbeat: control is handed back
             elif ok:
                 self.alert = None
             elif desired.mode != "safe_idle":
+                if fc_armed and any(
+                    w["role"] in FULL_CHARGE_ROLES and w["result"] == "failed" for w in writes
+                ):
+                    self._fc_failed = ctx.full_charge  # do not retry the pair every tick
                 desired = safe_idle("write_failed")
                 ok, more = await self._reconcile(desired, now)
                 writes += more
@@ -791,6 +968,7 @@ class Actuator:
                 now = self._clock.now()
                 desired = safe_idle("shutdown")
                 ok, writes = await self._reconcile(desired, now)
+                writes += await self._disarm()  # best effort, after the safe idle
                 self.in_control = not ok
                 self.desired = desired
                 self._count("actuator_safe_idles", reason="shutdown")
@@ -877,6 +1055,19 @@ class Actuator:
             "last_tick_at": iso(self.last_tick_at),
             "last_successful_write_at": iso(self.last_success_write_at),
             "last_heartbeat_at": iso(self.last_heartbeat_at),
+            **({"full_charge": self._full_charge_view()} if self._fc is not None else {}),
+        }
+
+    def _full_charge_view(self) -> dict[str, Any]:
+        """The weekly readings and the refusal, for ``GET /status`` and the scheduler."""
+        r = self.readings
+        return {
+            "enable_switch": r.get("weekly_enable"),
+            "day": r.get("weekly_day"),
+            "delay_switch": r.get("weekly_delay"),
+            "integration_status": r.get("integration_status"),
+            "driven_armed": self.desired.full_charge_armed if self.desired is not None else None,
+            "refusal": self.full_charge_refusal,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -902,4 +1093,19 @@ class Actuator:
             "observed_grid_power_w": self.readings.get("grid_power_w"),
             "house_load_w": self.readings.get("house_load_w"),
             "observed_pd_target_w": self.readings.get("pd_target_w"),
+            **({"full_charge": self._full_charge_snapshot()} if self._fc is not None else {}),
+        }
+
+    def _full_charge_snapshot(self) -> dict[str, Any]:
+        r = self.readings
+
+        def flag(value: bool | None) -> float | None:
+            return None if value is None else (1.0 if value else 0.0)
+
+        return {
+            "enable_switch": flag(r.get("weekly_enable")),
+            "day": r.get("weekly_day"),
+            "delay_switch": flag(r.get("weekly_delay")),
+            "integration_status": r.get("integration_status"),
+            "refusal": self.full_charge_refusal,
         }

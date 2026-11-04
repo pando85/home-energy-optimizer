@@ -63,7 +63,9 @@ just release           # cut a release (see the release skill)
   `service/ha_guard.py`'s `ActuationAllowlist` — `switch.turn_on/off` on the two Omnibattery direction switches
   and the system power-limit switch, `number.set_value` on the PD grid target and the system discharge cap
   (bounded values), `input_datetime.set_datetime` on the heartbeat helper, one entity per call, gated by the
-  owner's kill switch (never written). Do not widen it, do not add any other service call, Modbus, REST write
+  owner's kill switch (never written); `switch.turn_on/off` on the Omnibattery weekly-full-charge switch and
+  `select.select_option` on its day select (seven weekday values), only with `full_charge.enabled`
+  ([plan](docs/planning/periodic-full-charge.md)). Do not widen it, do not add any other service call, Modbus, REST write
   or device, and never make `live` a default. The other exception is the non-mutating
   `weather.get_forecasts` query (with `return_response`) of the passive forecast archive, allowed only by the
   narrow check in `service/ha_guard.py`; do not widen it. Home Assistant tokens belong to non-admin users:

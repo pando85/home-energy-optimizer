@@ -393,3 +393,24 @@ unchanged: a persisted plan, or one from an earlier process, is never acted on; 
 is never re-decided; and a late intent passes the same guard (kill switch, liveness, plan expiry, inputs, import
 cap) as any other. Reason: every deploy cost up to 15 minutes of control, and the slot at local midnight usually
 opened not ready because the day's load history is fetched just after it.
+
+## Amendment 2026-11-04 (periodic full charge)
+
+Decision 3's allowlist is widened by **exactly two entries, and only when `full_charge.enabled` is true in
+`mode: live`**; nothing else changes (kill switch, heartbeat, mode gating, readback, retry, `forbidden` never retried,
+one entity per call, no `return_response`, REST GET-only):
+
+| Service | Entity | `service_data` |
+|---|---|---|
+| `switch.turn_on` / `switch.turn_off` | `switch.omnibattery_weekly_full_charge_enabled` | none |
+| `select.select_option` | `select.omnibattery_weekly_full_charge_day` | exactly `{"option": <one of monday, tuesday, wednesday, thursday, friday, saturday, sunday>}` |
+
+Purpose: Omnibattery's own weekly full charge is used as a self-limiting enabler of a periodic charge to 100% for cell
+balancing ([plan](../planning/periodic-full-charge.md)). Omnibattery lifts its maximum SOC to 100%, completes on its
+own detection and restores the configured 95%; it clears the run at its day rollover, so if the optimizer dies the
+worst case is a repeat on that weekday. Not allowlisted, and never to be: `switch.omnibattery_weekly_full_charge_delay`
+and `switch.omnibattery_charge_delay` (read only), the charge-cutoff numbers, any button, and any other weekly-charge
+entity. Decision 6 gains one healthy status: `weekly_full_charge`, accepted only while the actuator has armed a run for
+the current local day. The service owns the two entities while the feature is enabled (it turns the switch off
+whenever no run is armed). Decision 7 is unchanged: the persisted full-charge state is a calendar decision and a
+timestamp, never a plan. A homelab watchdog follow-up turns the switch off on heartbeat loss.

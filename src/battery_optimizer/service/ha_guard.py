@@ -43,8 +43,15 @@ with ``(<d>, <s>)`` one of :data:`ACTUATION_SERVICES`, one single entity (in ``t
 a finite ``value`` inside the entity's configured bounds for ``number.set_value`` (so the
 Omnibattery caps can never receive the ``0`` that means *unlimited*, and the grid-import
 target can never exceed the import cap), a finite positive ``timestamp`` for
-``input_datetime.set_datetime`` (the heartbeat).  ``return_response`` and any other field
-raise.  The only builder is :func:`actuation_request`.
+``input_datetime.set_datetime`` (the heartbeat), exactly ``{"option": <one of the seven weekday
+names>}`` for ``select.select_option`` (the periodic full charge, below).  ``return_response`` and
+any other field raise.  The only builder is :func:`actuation_request`.
+
+The periodic full charge (ADR-0007, amendment 2026-11-04) widens that list by exactly two
+entries, and only when ``full_charge.enabled`` in ``mode: live``: ``switch.turn_on/off`` on the
+Omnibattery weekly-full-charge switch and ``select.select_option`` on its day select (the seven
+weekday values of :data:`WEEKDAY_OPTIONS`).  Its delay switch, the charge-delay switch, the
+cutoff numbers, any button and every other entity of those domains stay refused.
 
 The guard holds no credentials and does no I/O; the transports call it.
 """
@@ -64,6 +71,7 @@ __all__ = [
     "ALLOWED_SUBSCRIBE_EVENT_TYPES",
     "ALLOWED_WEATHER_FORECAST_TYPES",
     "ALLOWED_WS_TYPES",
+    "WEEKDAY_OPTIONS",
     "ActuationAllowlist",
     "ForbiddenHACallError",
     "actuation_allowlist",
@@ -186,7 +194,19 @@ ACTUATION_SERVICES: frozenset[tuple[str, str]] = frozenset(
         ("switch", "turn_off"),
         ("number", "set_value"),
         ("input_datetime", "set_datetime"),
+        ("select", "select_option"),
     }
+)
+
+#: The options of Omnibattery's weekly-full-charge day select, verbatim (not configurable).
+WEEKDAY_OPTIONS: tuple[str, ...] = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
 )
 
 _ACTUATION_CALL_KEYS = frozenset({"id", "type", "domain", "service", "service_data", "target"})
@@ -198,18 +218,21 @@ class ActuationAllowlist:
     """The entities the live writer may operate, per service.
 
     ``switches``: ``switch.turn_on``/``turn_off``; ``numbers``: ``number.set_value`` with
-    inclusive ``(low, high)`` bounds; ``datetimes``: ``input_datetime.set_datetime``.
+    inclusive ``(low, high)`` bounds; ``datetimes``: ``input_datetime.set_datetime``;
+    ``selects``: ``select.select_option`` with the options each entity may be set to.
     """
 
     switches: frozenset[str] = frozenset()
     numbers: Mapping[str, tuple[float, float]] = field(default_factory=dict)
     datetimes: frozenset[str] = frozenset()
+    selects: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for domain, entities in (
             ("switch", self.switches),
             ("number", self.numbers),
             ("input_datetime", self.datetimes),
+            ("select", self.selects),
         ):
             for entity in entities:
                 if not isinstance(entity, str) or not _ENTITY.match(entity):
@@ -219,6 +242,9 @@ class ActuationAllowlist:
         for entity, (low, high) in self.numbers.items():
             if not (math.isfinite(low) and math.isfinite(high) and low <= high):
                 raise ValueError(f"actuation allowlist: bad bounds for {entity}: {low}..{high}")
+        for entity, options in self.selects.items():
+            if not options or not all(isinstance(o, str) and o for o in options):
+                raise ValueError(f"actuation allowlist: bad options for {entity}: {options!r}")
 
 
 def actuation_allowlist(config: Any) -> ActuationAllowlist | None:
@@ -227,15 +253,23 @@ def actuation_allowlist(config: Any) -> ActuationAllowlist | None:
     The two direction switches and the power-limit switch; the PD grid target bounded to
     ``[0, import_cap_w]`` (never an export target, never above the cap); the system
     discharge cap bounded to ``[min_discharge_cap_w, max_discharge_cap_w]`` (never 0, which
-    Omnibattery reads as *unlimited*); the heartbeat helper.  Nothing else — in particular
-    not the kill switch, which only the owner flips.
+    Omnibattery reads as *unlimited*); the heartbeat helper.  With ``full_charge.enabled`` also
+    the weekly-full-charge switch and its day select (the seven weekdays).  Nothing else — in
+    particular not the kill switch, which only the owner flips, nor the weekly delay switch.
     """
     if getattr(config, "mode", None) != "live":
         return None
     act = config.actuation
     ents = act.entities
+    switches = {ents.allow_charge, ents.allow_discharge, ents.power_limits}
+    selects: dict[str, frozenset[str]] = {}
+    full_charge = getattr(config, "full_charge", None)
+    if full_charge is not None and full_charge.enabled:
+        switches.add(full_charge.entities.enable_switch)
+        selects[full_charge.entities.day_select] = frozenset(WEEKDAY_OPTIONS)
     return ActuationAllowlist(
-        switches=frozenset({ents.allow_charge, ents.allow_discharge, ents.power_limits}),
+        switches=frozenset(switches),
+        selects=selects,
         numbers={
             ents.pd_target: (0.0, float(act.import_cap_w)),
             ents.max_discharge_power: (
@@ -290,6 +324,16 @@ def check_actuation_call(message: Mapping[str, Any], allowlist: ActuationAllowli
         if value is None or not low <= value <= high:
             raise ForbiddenHACallError(
                 f"number.set_value: {entity} value {data['value']!r} outside [{low}, {high}]"
+            )
+    elif domain == "select":  # select.select_option: the weekly-full-charge day
+        if entity not in allowlist.selects:
+            raise ForbiddenHACallError(f"select.select_option: {entity!r} is not allowlisted")
+        if set(data) != {"option"}:
+            raise ForbiddenHACallError("select.select_option: service_data must be exactly option")
+        option = data["option"]
+        if not isinstance(option, str) or option not in allowlist.selects[entity]:
+            raise ForbiddenHACallError(
+                f"select.select_option: {entity} option {option!r} is not allowlisted"
             )
     else:  # input_datetime.set_datetime: the heartbeat
         if entity not in allowlist.datetimes:

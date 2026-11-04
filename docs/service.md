@@ -47,7 +47,7 @@ mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 | Module (`battery_optimizer.service`) | Role |
 |---|---|
 | `config` | `config/service.yaml` + environment; `mode: shadow` (default), `dry_run` or `live` |
-| `ha_guard` | Read-only allowlist for every WebSocket frame and REST request (plus the one `weather.get_forecasts` exception, and in `live` only the Omnibattery write allowlist) |
+| `ha_guard` | Read-only allowlist for every WebSocket frame and REST request (plus the one `weather.get_forecasts` exception, and in `live` only the Omnibattery write allowlist, including the weekly-full-charge switch and day select when `full_charge.enabled`) |
 | `actuator` | `dry_run`/`live` only: guard, intent → Omnibattery mapping, ordered writes with readback, kill switch, heartbeat ([ADR-0007](adr/0007-live-battery-control.md)) |
 | `ha_client` | WebSocket session (auth, subscribe, resync, heartbeat, reconnect) and GET-only REST |
 | `entity_store` | Latest state per entity, ordered by HA source time, freshness from `last_reported` |
@@ -705,6 +705,63 @@ seconds enables an age test). Validation: `import_cap_w + import_guard_margin_w`
 `mode: live` also requires
 `planning.soc_source: entity`. The section is excluded from the plan's config hash.
 
+### Periodic full charge: the weekly-charge enabler
+
+Plan: [periodic-full-charge](planning/periodic-full-charge.md); the allowlist change is the
+[ADR-0007 amendment 2026-11-04](adr/0007-live-battery-control.md#amendment-2026-11-04-periodic-full-charge).
+The LFP cells need a charge to 100% from time to time so that the BMS balances them. Omnibattery's own weekly
+full charge does the work and limits itself (it lifts its maximum SOC to 100%, completes on its own detection,
+restores 95% and clears the run at its day rollover); the service only arms it. **Off by default**
+(`full_charge.enabled: false` in `config/service.yaml`): with it off the actuator never reads or writes the
+entities below and the guard refuses them in every mode.
+
+This part (the guard and the actuator) is what a `FullChargeDirective` in `ActuationContext.full_charge` drives:
+`armed` and the weekday of the run's local date. The scheduler that builds the directive (the rule, the state,
+`/status`, metrics) is separate and not yet wired, so enabling the section changes nothing until it is.
+
+* **Writes** (`live` with `full_charge.enabled` only; roles `full_charge_day` and `full_charge_enable`, with the
+  same readback, retry, `forbidden`-never-retried and `dry_run` simulation as every other role; each only on an
+  edge, never rate limited): arm = `select.select_option` to the weekday, then `switch.turn_on`, both before
+  the direction on-writes of the same reconcile and each skipped when it already reads back; disarm =
+  `switch.turn_off`, the first write of the restrictive block. While the feature is enabled and a directive is
+  given, the service drives the switch to it on every tick (it owns the entity). A failed write of the pair
+  drops to safe idle like any other, and the same directive is then refused as `write_failed` (not retried
+  every tick) until the scheduler changes it.
+* **Refusals** (arming is never written, the switch is driven off, `full_charge_refusal` in the actuator `view()`
+  says why): `delay_switch_on` and `delay_switch_unreadable` (`switch.omnibattery_weekly_full_charge_delay`
+  must read `off`: on means the weekly run waits for solar charge, and there is no PV here),
+  `day_options_invalid` (the select's `options` must contain the seven weekdays; an Omnibattery upgrade can
+  change them), `entities_missing` (switch or select absent or unavailable), `not_today` (the directive's
+  weekday is not the local weekday of the tick), `kill_switch_off`, `write_failed`.
+* **Guard.** `integration_status == weekly_full_charge` is healthy **only while the directive is effectively armed
+  for today** (it is not in `healthy_states`, and the config refuses it there); every other status still holds
+  `integration_unhealthy` safe idle. A guard-failure safe idle neither arms nor disarms (it would only toggle
+  Home Assistant config entries); one that comes with a directive of `armed: false` still disarms.
+* **Kill switch and shutdown.** The kill switch's `on → off` edge and SIGTERM turn the switch off once, best
+  effort, after the existing safe idle (once a directive has been seen); nothing else is written.
+* **`view()["full_charge"]` / `snapshot()["full_charge"]`** (feature enabled only): `enable_switch`, `day`,
+  `delay_switch`, `integration_status`, `refusal` (and `driven_armed` in the view): the weekly readings the
+  scheduler reads. In `dry_run` the switch and the day show the simulated state.
+* **Time zone.** Omnibattery decides the weekday with the container's local time; the service writes the weekday
+  of its own `timezone`. Checking that Home Assistant's `time_zone` equals the service's is the scheduler's
+  startup check, not part of the actuator.
+
+`full_charge:` keys (the whole schema is validated now; see the comments in `config/service.yaml`):
+`enabled`, `min_interval_days` (5), `max_interval_days` (15), `threshold_min_eur` and `threshold_scale_eur`
+(0.01), `fixed_cost_eur` (0), `target_soc_frac` (1.0), `reached_soc_pct` (99), `shortfall_penalty_eur_per_kwh`
+(10), `completion_margin_slots` (2), `arm_lead_slots` (1), `arm_before_soc_frac` (0.93), `ack_timeout_s` (90),
+`top_hold_timeout_min` (120), `taper.start_soc_frac` (0.90, `null` disables it) and `taper.power_kw` (0.2),
+`max_consecutive_failures` (3), `failure_pause_days` (5), `bootstrap_last_full` (ISO date or `null`) and
+`entities.*` (seven entity IDs, all required when enabled: the two written and the delay switch, the
+charge-delay switch and three evidence sensors, read only). Validation: `0 < min_interval_days <
+max_interval_days <= 30`; thresholds, fixed cost and penalty finite and non-negative (penalty positive);
+`0 < arm_before_soc_frac < target_soc_frac <= 1`; `taper.start_soc_frac` in (0.5, 1) and `taper.power_kw` in
+`(0, max_discharge_cap_w / 1000]`; with `enabled: true` every entity set, distinct from each other and from
+`entities` and `actuation.entities`, `planning.soc_source: entity`, and `actuation.entities.integration_status`
+and `battery_soc` set. `enabled` works in every mode; the two writable entities join the allowlist only when it
+is true and the mode is `live`. The section is excluded from the plan's config hash until the scheduler
+uses it.
+
 ## Safety
 
 * WebSocket: every outgoing frame is checked against the allowlist `auth`, `ping`,
@@ -728,7 +785,11 @@ seconds enables an age test). Validation: `import_cap_w + import_guard_margin_w`
   {"entity_id": "<one entity>"}, "service_data": {...}}` for `switch.turn_on`/`turn_off` on the two direction
   switches and the power-limit switch, `number.set_value` on the PD grid target (`value` in `[0,
   import_cap_w]`) and the system discharge cap (`value` in `[min_discharge_cap_w, max_discharge_cap_w]`, so
-  never the `0` that means unlimited), and `input_datetime.set_datetime` (`timestamp`) on the heartbeat. A list
+  never the `0` that means unlimited), and `input_datetime.set_datetime` (`timestamp`) on the heartbeat. With
+  `full_charge.enabled` also `switch.turn_on`/`turn_off` on the Omnibattery weekly-full-charge switch and
+  `select.select_option` on its day select, `service_data` exactly `{"option": <one of the seven lower-case
+  weekdays>}` ([ADR-0007 amendment](adr/0007-live-battery-control.md#amendment-2026-11-04-periodic-full-charge));
+  its delay switch, the charge-delay switch, the cutoff numbers and any button stay refused. A list
   of entities, another entity or service, an out-of-bounds or non-numeric value, `return_response` or any other
   field raises `ForbiddenHACallError`. The kill switch is never writable. The only builder is
   `ha_guard.actuation_request`.

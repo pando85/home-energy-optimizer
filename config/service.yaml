@@ -227,6 +227,41 @@ actuation:
     battery_soc: null
     battery_ac_power: null
 
+# Periodic full charge for cell balancing (docs/planning/periodic-full-charge.md).  OFF by
+# default: false means no decision, no state and no read or write of the entities below.  It
+# works in every mode (shadow: decisions only; dry_run: plus the would-be writes; live: sends).
+# Only in `mode: live` with `enabled: true` does the guard admit switch.turn_on/off on
+# `entities.enable_switch` and select.select_option (the seven weekdays) on
+# `entities.day_select`: Omnibattery's own weekly full charge is the self-limiting enabler
+# (ADR-0007 amendment 2026-11-04).  Needs planning.soc_source: entity.
+full_charge:
+  enabled: false
+  min_interval_days: 5                # never before
+  max_interval_days: 15               # forced on the next priced day
+  threshold_min_eur: 0.01             # day-5 threshold, EUR per run (pre-tax, objective unit)
+  threshold_scale_eur: 0.01           # hyperbolic growth towards day 15
+  fixed_cost_eur: 0.0                 # added to the forcing cost (wear / time at 100%)
+  target_soc_frac: 1.0
+  reached_soc_pct: 99                 # an observed SOC at or above counts as a full charge
+  shortfall_penalty_eur_per_kwh: 10.0
+  completion_margin_slots: 2          # checkpoint at least this many slots before local midnight
+  arm_lead_slots: 1
+  arm_before_soc_frac: 0.93
+  ack_timeout_s: 90
+  top_hold_timeout_min: 120
+  taper: {start_soc_frac: 0.90, power_kw: 0.2}   # provisional; start_soc_frac: null disables it
+  max_consecutive_failures: 3
+  failure_pause_days: 5
+  bootstrap_last_full: null           # ISO date; null: Prometheus history, then battery.commissioned_at
+  entities:                           # required when enabled
+    enable_switch: switch.omnibattery_weekly_full_charge_enabled   # written (live only)
+    day_select: select.omnibattery_weekly_full_charge_day          # written (live only)
+    delay_switch: switch.omnibattery_weekly_full_charge_delay      # read only, must be off
+    charge_delay_switch: switch.omnibattery_charge_delay           # read only, logged
+    last_balance_read: sensor.venus_last_balance_read              # read only, evidence
+    balancing_mode: binary_sensor.venus_balancing_mode             # read only, evidence
+    cell_delta: sensor.venus_cell_delta                            # read only, evidence
+
 # Climate shadow (track B2): B0's thermal model and the price-blind comfort MPC on live data,
 # every `replan_every_minutes` of the MPC config (hourly), `offset_minutes` after the boundary.
 # Records decisions, scores and the preregistered gates under <data_dir>/service/v1/climate_*;
