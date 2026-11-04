@@ -55,6 +55,28 @@ plans: nothing writes to Home Assistant or the plant. Owner: this repository (`c
 settling period. Acceptance is section A of the [2026-27 preregistration](../planning/climate-preregistration-2026-27.md)
 on live data (the B2 shadow; B3); this offline replay grants nothing. TODO (future extension, not code): schedule the legionella cycle (owner wish, design section 7.2).
 
+## KPIs
+
+Observability only (no calibration changes). The comfort MPC runs in shadow, so these are the health of the
+plan production and its inputs; nothing measures a plan that was never executed. Metrics are prefixed
+`battery_optimizer_climate_shadow_` (service, [climate shadow](../service.md#climate-shadow-track-b2)).
+Dashboard: `Climate: comfort MPC` (uid `climate-mpc`).
+
+| KPI | Where |
+|---|---|
+| Plan production | `sum(increase(runs_total{result="planned"}[1d])) / sum(increase(runs_total[1d]))`; `no_state` while space heating is off is expected, `no_inputs`, `plan_failed` and `error` are not; `last_run_timestamp_seconds` (hourly) |
+| Solver health | non-optimal share `sum(increase(solves_total{status!="optimal"}[1d])) / sum(increase(solves_total[1d]))` (`infeasible` and `error` should be 0); duration `histogram_quantile(0.95, sum by (le) (rate(solve_duration_seconds_bucket[6h])))` against the 20 s limit |
+| Plan shape: share of heating slots at the top water offset | `last_plan_top_offset_share_ratio`, per window `top_offset_share_ratio{window}`; offline `top_offset_share` of `battery-optimizer climate-shadow-report` (a high share leans on lifts the [COP table](cop-model.md) extrapolates) |
+| Planned against rule electricity (descriptive, grants nothing) | offline only: the plan-over-rule ratio of `battery-optimizer climate-shadow-report`; offline replay `uv run python hack/climate_mpc_replay.py` |
+| Comfort the rule delivered in the MPC's rooms (the reference for the plan's deficit) | degree-hours below the 21 degC floor per room, `sum_over_time(clamp_min(21 - max by (entity) (hass_climate_current_temperature_celsius{entity=~"climate.thermostat_(bedroom\|hall_kitchen\|office_t)"}), 0)[1d:5m]) / 12`; offline `uv run python hack/comfort_history.py` |
+| Accuracy of the model underneath | [thermal-model](thermal-model.md) KPIs (`rmse_kelvin`, `skill_ratio`, `abs_bias_kelvin`, `gate`) |
+
+Not yet measured: the plan's own comfort deficit (degree-hours outside the band, per plan), planned against
+actual heat-pump energy per day and the plan's electricity cost. The plan carries the deficit and the
+predicted electricity per slot in the private `climate_decisions` records and no metric exposes them (energy
+figures stay in the store); the MPC is price-blind, so no cost is computed; its realised comfort cannot be
+observed because it never acts.
+
 ## Status
 
 **provisional** (2026-10-31): offline replay; live shadow (B2) implemented, not deployed. Exploratory model, no gate yet.

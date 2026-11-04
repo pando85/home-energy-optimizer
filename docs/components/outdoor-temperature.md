@@ -54,6 +54,28 @@ while the compressor runs and warm in the sun, so the series is rebuilt from the
    trusted readings of a season the offset fit has not seen; otherwise keep debiased and report the
    unknown share and the filled share of the new regime.
 
+## KPIs
+
+Observability only. The series the models read (`t_out_model`) is built offline, so the live part is what the
+rule depends on: how often the unit sensor is trustworthy and the availability of the forecast archive the MPC
+horizon reads. The shares below are approximations from the compressor frequency, not the model's 15 minute
+slots. Dashboard: `Climate: outdoor temperature` (uid `climate-outdoor-temperature`).
+
+| KPI | Where |
+|---|---|
+| Trusted share (compressor idle for 30 min; about 60% of slots in S2/S3) | `avg_over_time(max(min_over_time(hass_sensor_unit_hz{entity="sensor.aquarea_compressor_frequency"}[30m]) == bool 0)[1d:5m])`; offline the exact shares from `uv run python hack/climate_station.py evaluate --feature-set <id> --dataset <dir>` |
+| Unknown share (a run longer than 6 h, filled from the station) | `avg_over_time(max(min_over_time(hass_sensor_unit_hz{entity="sensor.aquarea_compressor_frequency"}[6h]) > bool 0)[1d:5m])` |
+| Compressor duty (what shrinks the trusted share) | `avg_over_time((max(hass_sensor_unit_hz{entity="sensor.aquarea_compressor_frequency"}) > bool 0)[1d:5m])` |
+| Fused against debiased RMSE on held-out trusted blocks (the switch rule) | offline `hack/climate_station.py evaluate` (leave-block-out test, coverage); per candidate station bias and RMSE: `hack/climate_station.py compare` |
+| Forecast archive availability | `sum(increase(battery_optimizer_weather_forecast_fetches_total{result="ok"}[1d]))` against `result="failed"`; `time() - max(battery_optimizer_archive_last_success_timestamp_seconds{archive="weather_forecast"})` (hourly at HH:05 UTC) |
+| Unit sensor | `hass_sensor_unit_celsius{entity="sensor.aquarea_outside_ambient_temperature"}` against the compressor frequency (the self-heating dip) |
+
+Not yet measured: the outdoor temperature **forecast error** (MAE and bias per lead against the measured
+series): the forecast is archived and the plan records the horizon it used, but nothing joins it with the
+debiased series as a metric (the private `climate_scores` carry the `heat_plan_weather` diagnostic only); the
+debias offset against the reference station; the trusted, interpolated and unknown shares of the model's own
+slots as a metric.
+
 ## Status
 
 **valid** (2026-10-30) for the legacy compressor duty. Re-run `evaluate` once the comfort schedule has

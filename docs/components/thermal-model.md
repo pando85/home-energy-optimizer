@@ -54,6 +54,29 @@ holdout. Test the candidate above prospectively on live heating data against the
 [2026-27 preregistration](../planning/climate-preregistration-2026-27.md) (section A), as the B2 shadow does (`climate-shadow-report`). G-R1 to G-R3 of the
 [C2 recovery](../planning/climate-c2-recovery.md#7-status-2026-10-31-b0-results-r0-to-r2) plan are not reached.
 
+## KPIs
+
+Observability only. The parked model is scored read-only by its B0 candidate in the live shadow (B2), on the
+comfort-room mean (bedroom, hall_kitchen, office_t) with the measured heat and outdoor temperature, so it tests
+the model and not the weather forecast. Metrics are prefixed `battery_optimizer_climate_shadow_`; `window` is
+`legacy` or `new`, `horizon` is `1h`, `6h`, `12h` or `24h`. Dashboard: `Climate: thermal model`
+(uid `climate-thermal-model`).
+
+| KPI | Where |
+|---|---|
+| Room-mean RMSE per lead, K (limits 0.30 at 6 h, 0.40 at 12 h) | `rmse_kelvin{window,horizon}`; offline `battery-optimizer climate-shadow-report`, and for the replay folds `validation.json` of `battery-optimizer climate-fit` (model, persistence and diurnal baselines) |
+| Skill against persistence (at least 25% at 6 h and 12 h) | `skill_ratio{window,horizon}` = 1 - RMSE(model) / RMSE(persistence) |
+| Bias per lead, K (6 h at most 0.15) | `abs_bias_kelvin{window,horizon}` (absolute mean error) |
+| Daily heat-delivery error (median APE at most 15%) | `daily_heat_mdape_ratio{window}` |
+| Data behind the verdict | `origins{window,horizon}`, `valid_weeks{window}` (6 needed, else UNDETERMINED), `gate{window,criterion,status}` for the six criteria and the verdict |
+| Refit freshness | `last_refit_timestamp_seconds`, `sum by (result) (increase(refits_total[7d]))` (`refitted`, `prior_kept`) |
+| The quantity predicted | room means of `hass_climate_current_temperature_celsius{entity=~"climate.thermostat_(bedroom\|hall_kitchen\|office_t)"}` |
+
+Not yet measured: the error per room (only the room mean is scored; the four thermostat rooms are a private
+diagnostic in `climate_scores`), the error under the forecast outdoor temperature the plan used
+(`heat_plan_weather`, a private record) and the model's heat-response to a permission `u`, which has no
+counterpart under the comfort schedule.
+
 ## Status
 
 **parked** (2026-10-30, unchanged by B0 on 2026-10-31). Nothing acts on it; the battery side does not depend on it.

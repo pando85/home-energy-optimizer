@@ -84,6 +84,25 @@ Acceptance: no interval above the import limit minus the margin while the batter
 starts after the battery reached its SOC trigger or the fallback time; comfort is not degraded the day
 after; then rerun [battery-load-forecast](battery-load-forecast.md) with boost days flagged.
 
+## KPIs
+
+Observability only. Boost is **planned** (no rule, threshold or interlock), so there are no activation or soak
+KPIs yet. What is measurable today are the limits it must respect, so a first boost day can be read against
+them. Dashboard: `Climate: planned components` (uid `climate-planned`, boost row).
+
+| KPI | Where |
+|---|---|
+| Import margin against the 5.0 kW limit (no interval above the limit while the battery charges) | `max(battery_optimizer_actuator_observed_grid_power_watts)` and its 15 min mean `avg_over_time(max(battery_optimizer_actuator_observed_grid_power_watts)[15m:1m])` against 5000 W (needs the actuator in `dry_run` or `live`) |
+| Battery first: SOC and charge power the soak waits for | `max(hass_sensor_battery_percent{entity="sensor.venus_battery_soc"})`; `max(clamp_min(battery_optimizer_actuator_observed_battery_power_watts, 0))` |
+| Hot-water cap (at most about 50 degC, heat pump only) | `max_over_time(max(hass_sensor_unit_celsius{entity="sensor.aquarea_tank_temperature"})[1d:5m])` |
+| The 3 kW heater and the sterilization stay off | `hass_binary_sensor_state{entity=~"binary_sensor.aquarea_(internal_heater_state\|external_heater_state\|sterilization_state)"}`; `sum(increase(hass_sensor_unit_h{entity="sensor.aquarea_dhw_heater_operating_hours"}[7d]))` |
+| Cheap windows that qualify (hours at or below a threshold, runs of 3 h or more) | offline `uv run python hack/cheap_price_windows.py --dataset <dir>`; no live metric: the forward price curve is a sensor attribute |
+| Comfort not degraded the day after | the [heat-pump-controller](heat-pump-controller.md) comfort KPIs for the following day |
+
+Not yet measured: boost activations per day, soak energy and duration, the SOC at soak start, the gap between
+the soak start and the battery trigger, saved cost, and the battery-charge and soak overlap per slot. They need
+the rule to export its decisions (a state and a kWh counter) when it is built.
+
 ## Status
 
 **planned** (2026-10-31): no rule, threshold, interlock or code. Blocked on normal mode working, the

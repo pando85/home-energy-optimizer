@@ -53,6 +53,24 @@ season and testing on a later block. Acceptance, unchanged from the config: dail
 season error at most 3% on the held-out block. Also report (flags, not gates) the share of lifts outside
 the table (warn above 10%) and whether `d` and `e` sit in their plausible physical range.
 
+## KPIs
+
+Observability only. The model is not run live, so the live part is the **measured side**: the reference it is
+validated against and the drivers of its terms. Metrics are Home Assistant's (`hass_*`, HeishaMon entities).
+Dashboard: `Climate: COP model` (uid `climate-cop`).
+
+| KPI | Where |
+|---|---|
+| Measured COP, the reference (heat, hot water) | `sum(increase(hass_sensor_energy_kwh{entity="sensor.aquarea_heat_energy_produced"}[1d])) / sum(increase(hass_sensor_energy_kwh{entity="sensor.aquarea_heat_energy_consumed"}[1d]))`, and `dhw` for hot water (the counters of the model's basis); the unit's own `hass_sensor_unit_x{entity="sensor.aquarea_heat_cop"}` while running |
+| Model error: daily MAPE (at most 8%) and season error (at most 3%) on a held-out block | offline `uv run python hack/climate_cop.py --feature-set <id> --dataset <dir>`: `cop.json` / `cop.md`, `validation.<model>.daily_mape` and `season_error`; also `battery-optimizer climate-fit` |
+| Lift, the table's bin variable (K) | `max(hass_sensor_unit_celsius{entity="sensor.aquarea_outlet_temperature"}) - max(hass_sensor_unit_celsius{entity="sensor.aquarea_outside_ambient_temperature"})` while `hass_sensor_power_w{entity="sensor.aquarea_heat_power_consumed"} > 0` |
+| Starts and hours on (the `d` and `e` terms) | `sum(increase(hass_sensor_state{entity="sensor.aquarea_compressor_start_stop_counter"}[1d]))`; `sum(increase(hass_sensor_unit_hours{entity="sensor.aquarea_compressor_operating_hours"}[1d]))`; offline the fitted `d` and `e` against their plausible physical range in `cop.json` |
+| Heat and electricity per day | `sum(increase(...heat_energy_produced[1d]))` and `...consumed` (the model's inputs and output) |
+
+Not yet measured: the predicted COP or electricity live, hence the model error as a metric; the share of lifts
+that fall outside the table (nearest-bin reads, the page's warn above 10%) and the residual by bin. Both need
+the model run on live data, which nothing does; offline only.
+
 ## Status
 
 **provisional** (2026-10-30): daily MAPE about 7.7% passes, season error about 5.0% fails the 3% limit.

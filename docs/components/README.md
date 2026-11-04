@@ -40,6 +40,7 @@ Every component page has the same sections, in this order, and stays at 30 to 60
 | Assumptions | Each with an evidence link |
 | Invalidated when | Concrete triggers, not general worries |
 | Recalibrate by | The exact command or analysis, and the acceptance check |
+| KPIs | Per KPI, what it measures and where: the live PromQL or the offline command that exists today, and a "Not yet measured" line for the rest |
 | Status | One of the values below, with date |
 
 Statuses: **valid** (calibrated on the current regime), **provisional** (calibrated, but an acceptance
