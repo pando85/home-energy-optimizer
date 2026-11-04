@@ -177,7 +177,9 @@ of the dwell cost, i.e. about 0.05 to 0.15% of B's saving averaged over a season
 - The replay is the benchmark's rolling horizon on the observed load and the dataset's SOC rules, not the live planner on
   live data (an hourly re-solve is checked on one season); windows are replayed separately.
 - The sensor may measure electronics, not cells; the cap is a soft convex price, never a hard limit, and Omnibattery's
-  Temperature Charge Limit stays at its default as the backstop (owner setting).
+  Temperature Charge Limit is the backstop (owner setting): switched on at its default values on 2026-11-04 14:10:56 UTC, after
+  this study; the soft cap and the derate barely overlap and the thermal fit of section 2 is superseded, see
+  [derate-aware planning](thermal-derate-aware-planning.md) and [battery-thermal](../components/battery-thermal.md).
 - A very long, flat valley makes the cap nearly free; a short valley with a steep spike makes it cost more. The study
   averages over 956 days of the real tariff.
 
