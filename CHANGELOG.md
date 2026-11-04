@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.10.0](https://github.com/pando85/home-energy-optimizer/tree/v0.10.0) - 2026-11-04
+
+### Added
+
+- service: Read-only thermal inputs, thermal state and refit ([34ebdaa](https://github.com/pando85/home-energy-optimizer/commit/34ebdaaeb9062b76a9b11fb73307901c3be6dfd0))
+
+### Documentation
+
+- planning: Derate-aware planning study, thermal model fit and battery-thermal component ([2ed41dc](https://github.com/pando85/home-energy-optimizer/commit/2ed41dc2f973670d0b35d43c8628e93283817732))
+
 ## [v0.9.0](https://github.com/pando85/home-energy-optimizer/tree/v0.9.0) - 2026-11-04
 
 ### Added
