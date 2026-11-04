@@ -204,6 +204,48 @@ def test_a_decision_plans_from_the_forecast_and_reads_nothing_after_t0():
     ]
 
 
+def _without(series, start: datetime, minutes: int):
+    """*series* with every sample of ``[start, start + minutes)`` missing (a scrape outage)."""
+    lo, hi = (int(x.timestamp() * 1e6) for x in (start, start + timedelta(minutes=minutes)))
+    out = {}
+    for k, s in series.items():
+        keep = (s.t_us < lo) | (s.t_us >= hi)
+        out[k] = RawSeries(s.entity, s.metric, s.unit, s.t_us[keep], s.values[keep])
+    return out
+
+
+@pytest.mark.parametrize(("minutes", "status"), [(16, "planned"), (180, "no_state")])
+def test_a_short_scrape_outage_does_not_stop_the_observer(minutes, status):
+    """Regression (2026-11-03): two slots without samples in the last 48 h restarted the observer
+    and every decision was ``no_state`` for the next 24 h."""
+    sp = prior()
+    t0 = MIDNIGHT + timedelta(hours=10)
+    start = t0 - timedelta(days=4)
+    samples = _without(house(start, t0 + timedelta(minutes=5)), t0 - timedelta(hours=5), minutes)
+    d = live_data(t0, samples=samples)
+    inputs = shadow.LiveInputs(
+        regime="legacy", forecast=forecast_record(t0 - timedelta(minutes=55))
+    )
+    rec = shadow.decide(sp, model_rec(sp), d, MPC, t0, inputs, settings=SETTINGS)
+    assert rec["status"] == status, rec.get("status")
+    # the 3 h outage is longer than the bridge: the observer restarts and waits for its warm-up
+    assert ("origin" in rec) is (status == "planned")
+
+
+def test_bridge_outages_holds_heat_over_short_runs_only():
+    w = np.column_stack([np.arange(20.0), np.ones(20), np.ones(20), np.ones(20)])
+    cooling = np.zeros(20, dtype=bool)
+    w[3:5, 0] = np.nan  # two slots: bridged with the slot before
+    w[8:14, 0] = np.nan  # six slots: left unknown
+    w[16, 0] = np.nan  # not before ``upto``: left unknown
+    out = shadow.bridge_outages(w, cooling, upto=16, max_slots=4)
+    assert out[3:5, 0].tolist() == [2.0, 2.0]
+    assert np.isnan(out[8:14, 0]).all() and np.isnan(out[16, 0])
+    assert np.isnan(w[3, 0])  # the input is not changed
+    cooling[3] = True  # a cooling slot is unknown by design
+    assert np.isnan(shadow.bridge_outages(w, cooling, upto=16, max_slots=4)[3, 0])
+
+
 def _perturbed_after(t0):
     data = house(t0 - timedelta(days=4), t0 + timedelta(hours=6))
     cut = int(t0.timestamp() * 1e6)

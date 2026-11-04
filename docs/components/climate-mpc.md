@@ -41,6 +41,9 @@ plans: nothing writes to Home Assistant or the plant. Owner: this repository (`c
   gaps); `persistence` holds the last valid reading; the DHW mask is known. Beyond about 12 h
   predictions are low-confidence. Lifts outside the COP table read the nearest bin, which understates
   the cost of high water (13 to 22% of planned slots at +6 K).
+- The live observer (B2) holds the last heat reading over up to 4 consecutive slots without one (a scrape or
+  Home Assistant outage; `shadow.MAX_BRIDGE_SLOTS`), so a short outage no longer restarts it; a longer one
+  does, and plans wait for 96 unbroken slots (24 h). Live path only: the calibration and the offline replay are unchanged.
 - Residual: a slot forced on by a minimum on time in progress may be planned against shut valves, where the MILP credits `phi` heat that `simulate` does not deliver (run logic).
 
 ## Invalidated when

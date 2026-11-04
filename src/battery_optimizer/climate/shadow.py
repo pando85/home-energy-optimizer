@@ -83,6 +83,7 @@ __all__ = [
     "REGIMES",
     "LiveInputs",
     "ShadowPrior",
+    "bridge_outages",
     "build_live_data",
     "day_record",
     "decide",
@@ -108,6 +109,9 @@ PRIORS_DIR = Path("analysis") / "v1" / "climate-shadow" / "priors"
 PRIOR_FILE = "prior.json"
 STEP_US = 900 * 1_000_000
 WARMUP_SLOTS = mpc_replay.WARMUP_SLOTS
+#: Longest run of slots without a heat reading (a Prometheus or Home Assistant outage) the live
+#: observer bridges; a longer one restarts it and costs ``WARMUP_SLOTS`` before the next plan.
+MAX_BRIDGE_SLOTS = 4
 
 #: The thermostat rooms of design section 3: the preregistered room-mean.
 DESIGN_ROOMS = tuple(CLIMATE_ROOMS)
@@ -192,6 +196,33 @@ def observer_inputs(d: ClimateData, diurnal: np.ndarray) -> np.ndarray:
     w = b2d.full_inputs(d, diurnal)
     w[:, 1] = np.where(d.cooling, np.nan, outdoor_series(d))
     return w
+
+
+def bridge_outages(
+    w: np.ndarray, cooling: np.ndarray, upto: int, max_slots: int = MAX_BRIDGE_SLOTS
+) -> np.ndarray:
+    """*w* with the heat input ``Q`` held over the short runs of slots before *upto* that have no
+    reading.
+
+    The observer restarts on any unknown input, and a plan needs ``WARMUP_SLOTS`` of unbroken
+    state, so one 8-minute scrape outage (a Home Assistant restart) would stop the shadow for a
+    day.  Only a run of at most *max_slots* with a known ``Q`` before it is bridged, with that
+    last ``Q`` (causal); cooling slots are unknown by design and never bridged."""
+    out = w.copy()
+    q = out[:, 0]
+    n = min(upto, q.size)
+    i = 1
+    while i < n:
+        if np.isfinite(q[i]) or cooling[i] or not np.isfinite(q[i - 1]):
+            i += 1
+            continue
+        j = i
+        while j < n and not np.isfinite(q[j]) and not cooling[j]:
+            j += 1
+        if j - i <= max_slots and np.isfinite(out[i:j, 1:]).all():
+            q[i:j] = q[i - 1]
+        i = j
+    return out
 
 
 def live_config(cfg: MpcConfig) -> MpcConfig:
@@ -540,7 +571,7 @@ def _context(
     diurnal = b2d.diurnal_matrix(hour_frac, weekend, cfg.model.diurnal_harmonics)
     if diurnal.shape[1] != sp.prior.n_diurnal:
         raise ValueError("model.diurnal_harmonics differs from the prior's")
-    w = observer_inputs(d, diurnal)
+    w = bridge_outages(observer_inputs(d, diurnal), d.cooling, t0)
     causal = mpc_replay.causal_outdoor(d)
     return mpc_replay.Context(
         d=d,
