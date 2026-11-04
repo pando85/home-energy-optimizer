@@ -9,6 +9,7 @@ cardinality.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from datetime import datetime
 from typing import Any
 
 from prometheus_client import (
@@ -181,9 +182,109 @@ class _RuntimeCollector(Collector):
         climate = snap.get("climate_shadow")
         if climate is not None:
             yield from _climate_families(climate)
+        health = snap.get("battery_health")
+        if health is not None:
+            yield from _health_families(health)
         actuator = snap.get("actuator")
         if actuator is not None:
             yield from _actuator_families(actuator)
+
+
+def _health_families(h: dict[str, Any]) -> Iterable[Metric]:
+    """Battery health telemetry (prefix ``battery_optimizer_battery_``); read only.
+
+    An unknown reading is an absent sample, never a 0.
+    """
+    from .battery_health import BALANCE_STATUSES
+
+    name = f"{PREFIX}_battery"
+    session = h.get("charge_session") or {}
+    shown = session.get("current") or session.get("last") or {}
+    cells = h.get("cell_voltage") or {}
+    balance = h.get("balance") or {}
+
+    def gauge(suffix: str, doc: str, value: float | None) -> GaugeMetricFamily:
+        family = GaugeMetricFamily(f"{name}_{suffix}", doc, labels=[])
+        if value is not None:
+            family.add_metric([], float(value))
+        return family
+
+    yield gauge("temperature_celsius", "Battery internal temperature", h.get("temperature_c"))
+    hot = CounterMetricFamily(
+        f"{name}_hot_seconds",
+        "Seconds the battery temperature was strictly above the threshold (since start)",
+        labels=["threshold_celsius"],
+    )
+    for threshold, seconds in (h.get("hot_seconds") or {}).items():
+        hot.add_metric([threshold], float(seconds))
+    yield hot
+    uncounted = CounterMetricFamily(
+        f"{name}_hot_uncounted_seconds",
+        "Seconds a stalled clock advance did not credit to the held temperature",
+    )
+    uncounted.add_metric([], float(h.get("uncounted_s") or 0.0))
+    yield uncounted
+    yield gauge(
+        "charge_session_active",
+        "1 while a charge session (AC power above the threshold) is running",
+        1.0 if session.get("active") else 0.0,
+    )
+    yield gauge(
+        "charge_session_peak_temperature_celsius",
+        "Peak temperature of the running charge session, else of the last one",
+        shown.get("peak_temperature_c"),
+    )
+    yield gauge(
+        "charge_session_duration_seconds",
+        "Duration of the running charge session, else of the last one",
+        shown.get("duration_s"),
+    )
+    sessions = CounterMetricFamily(
+        f"{name}_charge_sessions", "Charge sessions completed (since start)"
+    )
+    sessions.add_metric([], float(session.get("completed") or 0))
+    yield sessions
+    yield gauge("cell_voltage_max_volts", "Highest cell voltage", cells.get("max_v"))
+    yield gauge("cell_voltage_min_volts", "Lowest cell voltage", cells.get("min_v"))
+    yield gauge(
+        "cell_voltage_spread_millivolts",
+        "Live spread between the highest and the lowest cell voltage",
+        cells.get("spread_mv"),
+    )
+    yield gauge(
+        "cell_delta_millivolts",
+        "Last comparable settled top-of-charge cell delta (balance monitor)",
+        balance.get("cell_delta_mv"),
+    )
+    yield gauge(
+        "cell_delta_avg_4w_millivolts",
+        "Average of the last four balance readings",
+        balance.get("delta_avg_4w_mv"),
+    )
+    status = GaugeMetricFamily(
+        f"{name}_balance_status", "1 for the balance monitor's status", labels=["status"]
+    )
+    if balance.get("status") is not None:
+        for s in BALANCE_STATUSES:
+            status.add_metric([s], 1.0 if s == balance["status"] else 0.0)
+    yield status
+    mode = balance.get("balancing_mode")
+    yield gauge(
+        "balancing_mode",
+        "1 while Omnibattery's balancing mode is on",
+        None if mode is None else (1.0 if mode else 0.0),
+    )
+    last_read = balance.get("last_read_at")
+    yield gauge(
+        "last_balance_read_timestamp_seconds",
+        "Unix time of the last valid balance measurement",
+        None if last_read is None else datetime.fromisoformat(last_read).timestamp(),
+    )
+    yield gauge(
+        "last_balance_read_age_seconds",
+        "Seconds since the last valid balance measurement",
+        balance.get("last_read_age_s"),
+    )
 
 
 def _actuator_families(a: dict[str, Any]) -> Iterable[Metric]:

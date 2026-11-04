@@ -24,6 +24,7 @@ import yaml
 from battery_optimizer._env import get_env
 
 __all__ = [
+    "BATTERY_HEALTH_DOMAINS",
     "BATTERY_ROLES",
     "ENTITY_ROLES",
     "SERVICE_MODES",
@@ -31,6 +32,8 @@ __all__ = [
     "ActuationEntities",
     "ActuationSettings",
     "ArchiveSettings",
+    "BatteryHealthEntities",
+    "BatteryHealthSettings",
     "ClimateShadowSettings",
     "EntityMap",
     "FullChargeEntities",
@@ -373,6 +376,70 @@ class FullChargeEntities:
         return tuple(e for k in FULL_CHARGE_DOMAINS if (e := getattr(self, k)))
 
 
+#: Battery-health entity -> required HA domain.  Every one is only read (never written).
+BATTERY_HEALTH_DOMAINS: dict[str, str] = {
+    "temperature": "sensor",
+    "cell_voltage_max": "sensor",
+    "cell_voltage_min": "sensor",
+    "cell_delta": "sensor",
+    "balance_status": "sensor",
+    "last_balance_read": "sensor",
+    "delta_trend": "sensor",
+    "delta_avg_4w": "sensor",
+    "balancing_mode": "binary_sensor",
+}
+
+
+@dataclass(frozen=True)
+class BatteryHealthEntities:
+    """Read-only battery health sensors (Omnibattery's balance monitor and the cell data).
+
+    All optional.  They may name entities that ``full_charge.entities`` also reads (the balance
+    evidence): both subscriptions share one entity store entry.
+    """
+
+    temperature: str | None = None
+    cell_voltage_max: str | None = None
+    cell_voltage_min: str | None = None
+    cell_delta: str | None = None
+    balance_status: str | None = None
+    last_balance_read: str | None = None
+    delta_trend: str | None = None
+    delta_avg_4w: str | None = None
+    balancing_mode: str | None = None
+
+    def all(self) -> tuple[str, ...]:
+        return tuple(e for k in BATTERY_HEALTH_DOMAINS if (e := getattr(self, k)))
+
+    def by_entity(self) -> dict[str, str]:
+        """Entity ID -> role, for the configured roles."""
+        return {e: k for k in BATTERY_HEALTH_DOMAINS if (e := getattr(self, k))}
+
+
+@dataclass(frozen=True)
+class BatteryHealthSettings:
+    """Read-only battery health telemetry (``service/battery_health.py``).
+
+    Active when at least one entity is configured; no write path.  Charge sessions need
+    ``actuation.entities.battery_ac_power`` and ``actuation.battery_ac_power_sign`` (the same
+    entity and sign convention the actuator uses), otherwise only the other fields are reported.
+    """
+
+    entities: BatteryHealthEntities = field(default_factory=BatteryHealthEntities)
+    #: Temperatures (degC) whose exposure is counted in seconds strictly above each.
+    hot_thresholds_c: tuple[float, ...] = (35.0, 40.0)
+    #: Sign-corrected battery AC power above which the battery counts as charging (W).
+    charge_threshold_w: float = 100.0
+    #: Seconds the power must stay at or below the threshold before a session is over.
+    session_end_hold_s: float = 300.0
+    #: Longest span one advance of the clock credits to the held temperature (s).
+    max_gap_s: float = 300.0
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.entities.all())
+
+
 @dataclass(frozen=True)
 class FullChargeTaper:
     """The convex taper model of the top of the charge; ``start_soc_frac: None`` disables it."""
@@ -426,6 +493,7 @@ class ServiceConfig:
     climate_shadow: ClimateShadowSettings = field(default_factory=ClimateShadowSettings)
     actuation: ActuationSettings = field(default_factory=ActuationSettings)
     full_charge: FullChargeSettings = field(default_factory=FullChargeSettings)
+    battery_health: BatteryHealthSettings = field(default_factory=BatteryHealthSettings)
     timezone: str = "Europe/Madrid"
     mode: str = "shadow"
     source_path: str | None = None
@@ -482,6 +550,10 @@ class ServiceConfig:
                 if self.full_charge.bootstrap_last_full
                 else None,
             },
+            "battery_health": {
+                **asdict(self.battery_health),
+                "hot_thresholds_c": list(self.battery_health.hot_thresholds_c),
+            },
             "source_path": self.source_path,
         }
 
@@ -495,6 +567,7 @@ class ServiceConfig:
         public.pop("climate_shadow", None)  # nor does the climate shadow (it plans no battery)
         public.pop("actuation", None)  # nor does the way a plan is sent
         public.pop("full_charge", None)  # the full-charge scheduler is not wired to plans yet
+        public.pop("battery_health", None)  # read-only telemetry never changes a plan
         text = json.dumps(public, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode()).hexdigest()
 
@@ -999,6 +1072,68 @@ def _parse_full_charge(
     )
 
 
+_BATTERY_HEALTH_KEYS = (
+    "entities",
+    "hot_thresholds_c",
+    "charge_threshold_w",
+    "session_end_hold_s",
+    "max_gap_s",
+)
+
+
+def _parse_battery_health(raw: Mapping[str, Any]) -> BatteryHealthSettings:
+    """Validate ``battery_health:`` (all optional, read only)."""
+    name = "battery_health"
+    _keys(raw, name, _BATTERY_HEALTH_KEYS)
+    defaults = BatteryHealthSettings()
+    ents_raw = _section(raw, "entities")
+    _keys(ents_raw, f"{name}.entities", tuple(BATTERY_HEALTH_DOMAINS))
+    ents: dict[str, str | None] = {}
+    for key, domain in BATTERY_HEALTH_DOMAINS.items():
+        value = ents_raw.get(key)
+        if value is not None and (
+            not isinstance(value, str)
+            or not _ENTITY_ID.match(value)
+            or not value.startswith(f"{domain}.")
+        ):
+            raise ValueError(
+                f"service config: {name}.entities.{key} must be a {domain}.* entity ID or null"
+            )
+        ents[key] = value
+    named = [e for e in ents.values() if e]
+    if len(named) != len(set(named)):
+        raise ValueError(f"service config: {name}.entities must name distinct entities")
+
+    thresholds_raw = raw.get("hot_thresholds_c", list(defaults.hot_thresholds_c))
+    if (
+        not isinstance(thresholds_raw, list)
+        or not thresholds_raw
+        or any(isinstance(t, bool) or not isinstance(t, (int, float)) for t in thresholds_raw)
+    ):
+        raise ValueError(f"service config: {name}.hot_thresholds_c must be a list of numbers")
+    thresholds = tuple(float(t) for t in thresholds_raw)
+    if not all(math.isfinite(t) and 0 < t < 100 for t in thresholds) or list(thresholds) != sorted(
+        set(thresholds)
+    ):
+        raise ValueError(
+            f"service config: {name}.hot_thresholds_c must be strictly increasing, in (0, 100)"
+        )
+    return BatteryHealthSettings(
+        entities=BatteryHealthEntities(**ents),
+        hot_thresholds_c=thresholds,
+        charge_threshold_w=_positive(
+            raw.get("charge_threshold_w", defaults.charge_threshold_w),
+            f"{name}.charge_threshold_w",
+        ),
+        session_end_hold_s=_positive(
+            raw.get("session_end_hold_s", defaults.session_end_hold_s),
+            f"{name}.session_end_hold_s",
+            allow_zero=True,
+        ),
+        max_gap_s=_positive(raw.get("max_gap_s", defaults.max_gap_s), f"{name}.max_gap_s"),
+    )
+
+
 def _read_token() -> Secret | None:
     token = get_env("BATTERY_OPTIMIZER_HA_TOKEN")
     if token:
@@ -1151,6 +1286,7 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
         entities=entities,
         soc_source=soc_source,
     )
+    battery_health = _parse_battery_health(_section(raw, "battery_health"))
     if mode == "live" and soc_source != "entity":
         raise ValueError(
             "service config: mode=live needs planning.soc_source=entity: a plan made from a "
@@ -1173,6 +1309,7 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
         climate_shadow=climate_shadow,
         actuation=actuation,
         full_charge=full_charge,
+        battery_health=battery_health,
         freshness_s=freshness,
         timezone=timezone,
         mode=mode,

@@ -130,6 +130,11 @@ The `full_charge:` section (periodic full charge for cell balancing, **off by de
 admit the weekly-full-charge switch and its day select (seven weekday values); the section is validated in every
 mode and refuses a setup that would leave the feature half configured.
 
+The `battery_health:` section (read-only battery health telemetry: temperature exposure, charge sessions, cell
+voltages, Omnibattery's balance monitor) is documented in
+[service.md](service.md#battery-health-telemetry). All its entities are optional and null in code; it adds no
+write path, no environment variable and no credential, and is excluded from the plan's config hash.
+
 ## HA authentication
 
 HA history extraction requires a bearer token. The token is **never written to
