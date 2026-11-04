@@ -121,6 +121,30 @@ on the new window. Acceptance: all rooms stay at or above 21 degC, the hall-kitc
 the scheduled time, and kWh per heating degree-day and Kh below 22 degC are no worse than the 15 h days
 (replay: about 0.75 kWh/HDD, about 1.15 Kh/day).
 
+## KPIs
+
+Observability only; the controller is the legacy AppDaemon rule in the homelab repository, so the KPIs come from
+Home Assistant's own `hass_*` metrics. The thresholds are the section-B criteria of the
+[preregistration](../planning/climate-preregistration-2026-27.md#3-b-comfort-controller-beforeafter-design-section-12);
+the comfort controller will be judged on the same series. `{R}` stands for
+the matcher `entity=~"climate.thermostat_(bedroom|hall_kitchen|office_t)"`. Dashboard: `Climate: heat-pump controller`
+(uid `climate-heat-pump-controller`).
+
+| KPI | Where |
+|---|---|
+| Tracking: room temperature minus setpoint, K | `max by (entity) (hass_climate_current_temperature_celsius{R}) - max by (entity) (hass_climate_target_temperature_celsius{R})` |
+| Each room below 21 degC (at most 3% of time) | `avg_over_time((max by (entity) (hass_climate_current_temperature_celsius{R}) < bool 21)[1d:5m])`; offline `uv run python hack/comfort_history.py` |
+| Hall-kitchen below 23.5 degC in the weekday day window (at most 10%) | `avg_over_time((max(hass_climate_current_temperature_celsius{entity="climate.thermostat_hall_kitchen"}) < bool 23.5 and on() (hour() >= 11 and hour() < 21 and day_of_week() >= 1 and day_of_week() <= 5))[7d:5m])` (UTC 11 to 21 is local 12 to 22 in winter time, an hour off in summer time) |
+| Heating electricity per heating degree-day (at most +20% against the S3 baseline) | `sum(increase(hass_sensor_energy_kwh{entity="sensor.aquarea_heat_energy_consumed"}[1d])) / ((15 - avg_over_time(max(hass_sensor_unit_celsius{entity="sensor.aquarea_outside_ambient_temperature"})[1d:5m])) > 1)` (unit sensor, which reads low while running); offline `hack/climate_audit.py` and the replay's about 0.75 kWh/HDD |
+| Compressor starts per day (median at most 20) | `sum(increase(hass_sensor_state{entity="sensor.aquarea_compressor_start_stop_counter"}[1d]))` |
+| Rule activity: heating and hot-water hours against `min_hours` | `count_over_time((max(hass_sensor_power_w{entity="sensor.aquarea_heat_power_consumed"}) > 0)[1d:5m]) / 12` (and `dhw`) against `hass_input_number_state{entity="input_number.appdaemon_climate_min_hours_per_day"}`; `hass_input_boolean_state{entity="input_boolean.appdaemon_climate_enable"}`; `sum(increase(hass_automation_triggered_count_total{entity="automation.appdaemon_climate_watchdog"}[1d]))` |
+| Heater safety (booster stays off) | `hass_binary_sensor_state{entity=~"binary_sensor.aquarea_(internal_heater_state\|external_heater_state\|force_heater_state\|sterilization_state)"}`; `sum by (entity) (increase(hass_sensor_unit_h{entity=~"sensor.aquarea_(room\|dhw)_heater_operating_hours"}[7d]))` (hot-water heater hours unchanged) |
+| Tank never above 50 degC | `max_over_time(max(hass_sensor_unit_celsius{entity="sensor.aquarea_tank_temperature"})[1d:5m])` |
+
+Not yet measured: the share of hot-water energy inside the scheduled window (the window is not a metric), the
+band-matched comparison with the S3 baseline (offline only), and what the controller decided and why (planned
+hours, the mode it commanded): the legacy rule exports only the helpers above and the successor is not built.
+
 ## Status
 
 **valid (legacy rule), being replaced** (2026-10-30; successor designed 2026-10-31, **planned**, merge

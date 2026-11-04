@@ -51,6 +51,27 @@ Decide on evidence, not by building: after 6 to 8 weeks of new-regime data run
 what share of the P0 gap counts as material before looking. Build the interface only above it; then
 acceptance is a paired forecast-eval against LF-0 on a window after the build.
 
+## KPIs
+
+Observability only. The forecast is **not built** (the HP-plan entity is specified, not published), so there is
+no forecast error to read. What is measurable today is the load it must predict and the bar a real forecast has
+to beat: a naive "same 15 minute slot yesterday" baseline. Basis: HeishaMon power (`sensor.aquarea_power_consumed`),
+which is not the branch meter (they differ by about 1.28). Dashboard: `Climate: planned components`
+(uid `climate-planned`, row on the heat-pump consumption forecast).
+
+| KPI | Where |
+|---|---|
+| Load to predict, by kind (heat, hot water, cooling) | `hass_sensor_power_w{entity=~"sensor.aquarea_(heat\|dhw\|cool)_power_consumed"}`; per day `sum(increase(hass_sensor_energy_kwh{entity="sensor.aquarea_heat_energy_consumed"}[1d]))` (and `dhw`, `cool`) |
+| Baseline MAE and bias per 15 min slot, kWh (the bar to beat) | with `A = avg_over_time(max(hass_sensor_power_w{entity="sensor.aquarea_power_consumed"})[15m:1m]) / 4000`: `avg_over_time(abs(A - A offset 1d)[1d:15m])` and `avg_over_time((A - A offset 1d)[1d:15m])` (write `offset 1d` on the subquery) |
+| Heat-pump share of the house load | `avg_over_time(max(hass_sensor_power_w{entity="sensor.aquarea_power_consumed"})[1d:5m]) / avg_over_time(max(battery_optimizer_actuator_house_load_watts)[1d:5m])` (different meter bases; needs the actuator in `dry_run` or `live`) |
+| Consumer: whole-house load forecast error | `sum(increase(battery_optimizer_load_forecast_abs_error_kwh_total{plan="final"}[1d])) / sum(increase(battery_optimizer_load_forecast_scored_slots_total{plan="final"}[1d]))` (and `plan="day_ahead"`) ([battery-load-forecast](battery-load-forecast.md)) |
+| LF-1 against LF-0 on legacy history (offline) | `uv run battery-optimizer forecast-eval ...` ([CLI](../cli.md#forecast-eval)); headroom of the heat-pump part `uv run battery-optimizer decompose-load --features <dir> --dataset <dir>` |
+
+Not yet measured: the forecast's MAE and bias per slot, its daily energy error, its availability and age
+(`valid_until`, fallback to LF-0), and the error by kind (heat, dhw, boost). They start with the interface; when
+it is built, score them like the battery-load-forecast KPIs (per slot close, against the measured heat-pump
+energy on the plan's `meter_basis`).
+
 ## Status
 
 **planned** (2026-10-30): interface specified, not built. **LF-1 goes stale** the day the legacy rule is
