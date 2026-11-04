@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.9.0](https://github.com/pando85/home-energy-optimizer/tree/v0.9.0) - 2026-11-04
+
+### Added
+
+- service: Day-ahead plan next to the final plan, with forecast KPIs ([ba32ce1](https://github.com/pando85/home-energy-optimizer/commit/ba32ce11ba182ca7eee53a3fc41d059348db2d63))
+
 ## [v0.8.0](https://github.com/pando85/home-energy-optimizer/tree/v0.8.0) - 2026-11-04
 
 ### Added
