@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.11.0](https://github.com/pando85/home-energy-optimizer/tree/v0.11.0) - 2026-11-04
+
+### Fixed
+
+- climate: Bridge short input outages in the live shadow observer ([9c5064c](https://github.com/pando85/home-energy-optimizer/commit/9c5064c01400adf8cca6b9da71410617a2c05ae0))
+
+### Documentation
+
+- components: Add KPI sections to the climate components ([7eb38e7](https://github.com/pando85/home-energy-optimizer/commit/7eb38e7844cc360e1ddd1cd665fe9815754c0ac5))
+- Record the planned-discharge shortfall and its open fix ([6a4ebf6](https://github.com/pando85/home-energy-optimizer/commit/6a4ebf6a0d820cd92a6deb4f635bb0cdf94927d4))
+- Park derate-aware planning until the battery fans are in ([d4ef700](https://github.com/pando85/home-energy-optimizer/commit/d4ef700ef716065dcc532329942cd9e6f8449f25))
+
 ## [v0.10.0](https://github.com/pando85/home-energy-optimizer/tree/v0.10.0) - 2026-11-04
 
 ### Added
