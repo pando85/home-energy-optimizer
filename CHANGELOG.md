@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.0](https://github.com/pando85/home-energy-optimizer/tree/v0.8.0) - 2026-11-04
+
+### Added
+
+- planner: High-SOC dwell cost in the solver, planner and replay, with its study ([3a62aee](https://github.com/pando85/home-energy-optimizer/commit/3a62aee13d21815d897d79a13ae65bafbd7cff32))
+- planner: Thermal soft cap on charge power in the solver, planner and replay, with its studies ([de0690e](https://github.com/pando85/home-energy-optimizer/commit/de0690e3528131c1fac16c08907748706ec2bfe4))
+- service: Scheduler for the periodic full charge (full-charge PR 3) ([265e611](https://github.com/pando85/home-energy-optimizer/commit/265e611b683a73c0c859b89420b8f6216fd6a78a))
+
 ## [v0.7.0](https://github.com/pando85/home-energy-optimizer/tree/v0.7.0) - 2026-11-04
 
 ### Added
