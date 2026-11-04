@@ -124,6 +124,12 @@ IDs, import cap, margins, command policy, freshness) is documented in
 measured `actuation.battery_ac_power_sign`, and `live` also without `planning.soc_source: entity`. Changing the
 mode is a homelab config change of the deployed `service.yaml`, never an environment variable.
 
+The `full_charge:` section (periodic full charge for cell balancing, **off by default**) is documented in
+[service.md](service.md#periodic-full-charge-the-weekly-charge-enabler) and
+[the plan](planning/periodic-full-charge.md). Only with `full_charge.enabled: true` in `mode: live` does the guard
+admit the weekly-full-charge switch and its day select (seven weekday values); the section is validated in every
+mode and refuses a setup that would leave the feature half configured.
+
 ## HA authentication
 
 HA history extraction requires a bearer token. The token is **never written to

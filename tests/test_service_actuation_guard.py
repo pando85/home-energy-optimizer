@@ -15,6 +15,7 @@ from battery_optimizer.service.entity_store import EntityStore
 from battery_optimizer.service.ha_client import GuardedConnection, HAWebSocketClient
 from battery_optimizer.service.ha_guard import (
     ACTUATION_SERVICES,
+    WEEKDAY_OPTIONS,
     ActuationAllowlist,
     ForbiddenHACallError,
     actuation_allowlist,
@@ -193,6 +194,7 @@ def test_the_service_set_is_closed():
         ("switch", "turn_off"),
         ("number", "set_value"),
         ("input_datetime", "set_datetime"),
+        ("select", "select_option"),
     }
 
 
@@ -203,6 +205,15 @@ def test_allowlist_validates_its_own_entities():
         ActuationAllowlist(numbers={"number.x": (10.0, 0.0)})
     with pytest.raises(ValueError):
         ActuationAllowlist(datetimes=frozenset({"input_boolean.x"}))
+    with pytest.raises(ValueError):
+        ActuationAllowlist(selects={"switch.x": frozenset({"a"})})
+    with pytest.raises(ValueError):
+        ActuationAllowlist(selects={"select.x": frozenset()})
+    with pytest.raises(ValueError):
+        ActuationAllowlist(selects={"select.x": frozenset({""})})
+    with pytest.raises(ValueError):
+        ActuationAllowlist(selects={"select.x": frozenset({1})})
+    assert ActuationAllowlist().selects == {}
 
 
 @pytest.mark.parametrize(("mode", "built"), [("shadow", False), ("dry_run", False), ("live", True)])
@@ -341,3 +352,244 @@ def test_live_service_builds_a_guarded_client_and_dry_run_does_not(tmp_path):
         service._executor.shutdown(wait=True)
         service._io.shutdown(wait=True)
         service._history_pool.shutdown(wait=True)
+
+
+# ---------------------------------------------------------------------------
+# Periodic full charge (ADR-0007 amendment 2026-11-04): exactly two more entries
+# ---------------------------------------------------------------------------
+
+FC_SWITCH = "switch.omnibattery_weekly_full_charge_enabled"
+FC_DAY = "select.omnibattery_weekly_full_charge_day"
+FC_DELAY = "switch.omnibattery_weekly_full_charge_delay"
+FC_CHARGE_DELAY = "switch.omnibattery_charge_delay"
+FC_ALLOW = ActuationAllowlist(
+    switches=ALLOW.switches | {FC_SWITCH},
+    numbers=ALLOW.numbers,
+    datetimes=ALLOW.datetimes,
+    selects={FC_DAY: frozenset(WEEKDAY_OPTIONS)},
+)
+FC_ON = {**LIVE, "full_charge.enabled": True}
+
+
+def select(entity=FC_DAY, option="tuesday", **kw):
+    return call("select", "select_option", entity, service_data={"option": option}, **kw)
+
+
+def test_the_weekday_options_are_the_integrations_verbatim():
+    assert WEEKDAY_OPTIONS == (
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    )
+
+
+FC_ALLOWED = [
+    *[select(option=day) for day in WEEKDAY_OPTIONS],
+    call(entity=FC_SWITCH),
+    call(service="turn_off", entity=FC_SWITCH),
+    call(entity=FC_SWITCH, id=_MISSING),
+    call(entity=FC_SWITCH, service_data={}),
+    select(id=_MISSING),
+    call(
+        "select",
+        "select_option",
+        target=_MISSING,
+        service_data={"entity_id": FC_DAY, "option": "sunday"},
+    ),
+]
+
+
+@pytest.mark.parametrize("message", FC_ALLOWED)
+def test_the_full_charge_pair_passes_only_with_the_feature_allowlist(message):
+    check_ws_message(message, FC_ALLOW)
+    check_ws_frame(json.dumps(message, default=repr), FC_ALLOW)
+    for refused in (ALLOW, None):  # feature off (live), or shadow/dry_run (no allowlist at all)
+        with pytest.raises(ForbiddenHACallError):
+            check_ws_message(message, refused)
+        with pytest.raises(ForbiddenHACallError):
+            check_ws_frame(json.dumps(message, default=repr), refused)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # the option: only the seven lower-case names, as a string
+        select(option="sun"),
+        select(option="Sunday"),
+        select(option="MONDAY"),
+        select(option=" monday"),
+        select(option="monday "),
+        select(option=""),
+        select(option=None),
+        select(option=0),
+        select(option=True),
+        select(option=["monday"]),
+        select(option={"option": "monday"}),
+        call("select", "select_option", FC_DAY, service_data={}),
+        call("select", "select_option", FC_DAY),
+        call("select", "select_option", FC_DAY, service_data={"option": "monday", "extra": 1}),
+        call("select", "select_option", FC_DAY, service_data={"value": "monday"}),
+        call("select", "select_option", FC_DAY, service_data={"options": ["monday"]}),
+        # protocol hygiene, response and unrelated fields
+        select(return_response=True),
+        select(context={"id": "x"}),
+        select(extra=1),
+        select(id="9"),
+        # a list, a second entity, wildcards, other selectors
+        select(target={"entity_id": [FC_DAY]}),
+        select(target={"entity_id": [FC_DAY, "select.venus_work_mode"]}),
+        select(target={"entity_id": "all"}),
+        select(target={"entity_id": FC_DAY, "device_id": "d"}),
+        select(target={"area_id": "garage"}),
+        select(target={}),
+        call(
+            "select",
+            "select_option",
+            target={"entity_id": FC_DAY},
+            service_data={"entity_id": "select.venus_work_mode", "option": "monday"},
+        ),
+        # every other select, and the other select services
+        select("select.venus_work_mode"),
+        select("select.omnibattery_weekly_full_charge_day_2"),
+        select("select.anything"),
+        call("select", "select_first", FC_DAY),
+        call("select", "select_last", FC_DAY),
+        call("select", "select_next", FC_DAY),
+        call("select", "select_previous", FC_DAY),
+        call("select", "select_option", FC_SWITCH, service_data={"option": "monday"}),
+        # the switch: no data, nothing else of its domain, nothing under the wrong service
+        call(entity=FC_SWITCH, service_data={"option": "monday"}),
+        call(entity=FC_SWITCH, target={"entity_id": [FC_SWITCH]}),
+        call("switch", "toggle", FC_SWITCH),
+        call(entity=FC_DAY),
+        call("number", "set_value", FC_SWITCH, service_data={"value": 1}),
+        # read only, and never to be written: the delay switches, the cutoff numbers, buttons
+        call(entity=FC_DELAY),
+        call(service="turn_off", entity=FC_DELAY),
+        call(entity=FC_CHARGE_DELAY),
+        call(service="turn_off", entity=FC_CHARGE_DELAY),
+        call("number", "set_value", "number.venus_charging_cutoff_capacity",
+             service_data={"value": 100}),
+        call("number", "set_value", "number.venus_discharging_cutoff_capacity",
+             service_data={"value": 10}),
+        call("number", "set_value", "number.omnibattery_weekly_full_charge_delay",
+             service_data={"value": 1}),
+        call("button", "press", "button.omnibattery_force_full_charge"),
+        call("button", "press", "button.venus_reset"),
+        call("input_boolean", "turn_on", "input_boolean.battery_optimizer_live"),
+        call(entity="switch.omnibattery_weekly_full_charge_other"),
+        call(entity="switch.venus_battery_manual_mode"),
+        call("sensor", "select_option", FC_DAY, service_data={"option": "monday"}),
+    ],
+)  # fmt: skip
+def test_the_full_charge_allowlist_refuses_everything_else(message):
+    with pytest.raises(ForbiddenHACallError):
+        check_ws_message(message, FC_ALLOW)
+    with pytest.raises(ForbiddenHACallError):
+        check_ws_frame(json.dumps(message, default=repr), FC_ALLOW)
+
+
+def test_a_bad_full_charge_write_hidden_in_a_coalesced_frame_is_refused():
+    frame = json.dumps([select(), select(option="sun")])
+    with pytest.raises(ForbiddenHACallError):
+        check_ws_frame(frame, FC_ALLOW)
+    check_ws_frame(json.dumps([select(), call(entity=FC_SWITCH)]), FC_ALLOW)
+
+
+def test_actuation_request_builds_the_select_frame():
+    frame = actuation_request(7, "select", "select_option", FC_DAY, {"option": "friday"}, FC_ALLOW)
+    assert frame == {
+        "id": 7,
+        "type": "call_service",
+        "domain": "select",
+        "service": "select_option",
+        "target": {"entity_id": FC_DAY},
+        "service_data": {"option": "friday"},
+    }
+    with pytest.raises(ForbiddenHACallError):
+        actuation_request(8, "select", "select_option", FC_DAY, {"option": "fri"}, FC_ALLOW)
+    with pytest.raises(ForbiddenHACallError):
+        actuation_request(9, "select", "select_option", FC_DAY, {"option": "friday"}, ALLOW)
+    with pytest.raises(ForbiddenHACallError):
+        actuation_request(9, "select", "select_option", FC_DAY, {"option": "friday"}, None)
+
+
+@pytest.mark.parametrize("mode", ["shadow", "dry_run", "live"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_the_pair_joins_the_allowlist_only_when_enabled_and_live(tmp_path, mode, enabled):
+    config = load_service_config(
+        write_service_config(tmp_path, **{**LIVE, "mode": mode, "full_charge.enabled": enabled})
+    )
+    allowlist = actuation_allowlist(config)
+    if mode != "live":
+        assert allowlist is None  # nothing at all passes, whatever the feature says
+        for message in (select(), call(entity=FC_SWITCH)):
+            with pytest.raises(ForbiddenHACallError):
+                check_ws_message(message, allowlist)
+        return
+    assert allowlist is not None
+    ents = config.actuation.entities
+    base = {ents.allow_charge, ents.allow_discharge, ents.power_limits}
+    if not enabled:
+        assert allowlist.switches == base and dict(allowlist.selects) == {}
+        off = call(service="turn_off", entity=FC_SWITCH)
+        for message in (select(), call(entity=FC_SWITCH), off):
+            with pytest.raises(ForbiddenHACallError):
+                check_ws_message(message, allowlist)
+        return
+    fc = config.full_charge.entities
+    assert (fc.enable_switch, fc.day_select) == (FC_SWITCH, FC_DAY)
+    assert allowlist.switches == base | {FC_SWITCH}
+    assert dict(allowlist.selects) == {FC_DAY: frozenset(WEEKDAY_OPTIONS)}
+    assert allowlist.datetimes == {ents.heartbeat}
+    # nothing else of the configured full-charge surface, nor the kill switch, passes
+    for other in (fc.delay_switch, fc.charge_delay_switch, ents.kill_switch):
+        for service in ("turn_on", "turn_off"):
+            with pytest.raises(ForbiddenHACallError):
+                check_ws_message(call(service=service, entity=other), allowlist)
+    for entity in (fc.last_balance_read, fc.balancing_mode, fc.cell_delta, fc.delay_switch):
+        with pytest.raises(ForbiddenHACallError):
+            check_ws_message(select(entity), allowlist)
+    for message in FC_ALLOWED:
+        check_ws_message(message, allowlist)
+
+
+def test_no_other_entity_of_the_same_domains_passes_with_the_feature_on(tmp_path):
+    config = load_service_config(write_service_config(tmp_path, **FC_ON))
+    allowlist = actuation_allowlist(config)
+    allowed = {FC_SWITCH, FC_DAY, *allowlist.switches, *allowlist.numbers, *allowlist.datetimes}
+    candidates = {
+        *config.entities.all_entities(),
+        *config.actuation.entities.all(),
+        *config.full_charge.entities.all(),
+        "switch.anything",
+        "select.anything",
+        "number.anything",
+        "button.omnibattery_x",
+    } - allowed
+    for entity in candidates:
+        for domain, service, data in (
+            ("switch", "turn_on", None),
+            ("switch", "turn_off", None),
+            ("select", "select_option", {"option": "monday"}),
+            ("number", "set_value", {"value": 1}),
+            ("input_datetime", "set_datetime", {"timestamp": 1.7e9}),
+        ):
+            with pytest.raises(ForbiddenHACallError):
+                check_ws_message(call(domain, service, entity, service_data=data or {}), allowlist)
+
+
+def test_committed_config_has_the_full_charge_feature_off_and_adds_nothing_to_the_allowlist(
+    tmp_path,
+):
+    config = load_service_config(REPO / "config" / "service.yaml")
+    assert config.full_charge.enabled is False
+    assert config.full_charge.entities.enable_switch == FC_SWITCH
+    assert config.full_charge.entities.day_select == FC_DAY
+    live = load_service_config(write_service_config(tmp_path, **LIVE))
+    allowlist = actuation_allowlist(live)
+    assert FC_SWITCH not in allowlist.switches and not allowlist.selects

@@ -14,7 +14,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -33,6 +33,9 @@ __all__ = [
     "ArchiveSettings",
     "ClimateShadowSettings",
     "EntityMap",
+    "FullChargeEntities",
+    "FullChargeSettings",
+    "FullChargeTaper",
     "HomeAssistantSettings",
     "ObservationSettings",
     "PlanningSettings",
@@ -337,6 +340,76 @@ class ActuationSettings:
         )
 
 
+#: Full-charge entity -> required HA domain.  Only ``enable_switch`` and ``day_select`` are
+#: written (``live`` mode with ``full_charge.enabled``, through :mod:`.ha_guard`); the rest is read.
+FULL_CHARGE_DOMAINS: dict[str, str] = {
+    "enable_switch": "switch",
+    "day_select": "select",
+    "delay_switch": "switch",
+    "charge_delay_switch": "switch",
+    "last_balance_read": "sensor",
+    "balancing_mode": "binary_sensor",
+    "cell_delta": "sensor",
+}
+
+
+@dataclass(frozen=True)
+class FullChargeEntities:
+    """Omnibattery's weekly-full-charge surface (periodic full charge for cell balancing).
+
+    Written: ``enable_switch`` and ``day_select``.  Only read: ``delay_switch`` (must be off),
+    ``charge_delay_switch`` (logged) and the evidence sensors.  All required when enabled.
+    """
+
+    enable_switch: str | None = None
+    day_select: str | None = None
+    delay_switch: str | None = None
+    charge_delay_switch: str | None = None
+    last_balance_read: str | None = None
+    balancing_mode: str | None = None
+    cell_delta: str | None = None
+
+    def all(self) -> tuple[str, ...]:
+        return tuple(e for k in FULL_CHARGE_DOMAINS if (e := getattr(self, k)))
+
+
+@dataclass(frozen=True)
+class FullChargeTaper:
+    """The convex taper model of the top of the charge; ``start_soc_frac: None`` disables it."""
+
+    start_soc_frac: float | None = 0.90
+    power_kw: float = 0.2
+
+
+@dataclass(frozen=True)
+class FullChargeSettings:
+    """Periodic full charge for cell balancing (``docs/planning/periodic-full-charge.md``).
+
+    Off by default.  ``enabled`` works in every mode; the two writable entities join the
+    live allowlist only when it is true.
+    """
+
+    enabled: bool = False
+    min_interval_days: int = 5
+    max_interval_days: int = 15
+    threshold_min_eur: float = 0.01
+    threshold_scale_eur: float = 0.01
+    fixed_cost_eur: float = 0.0
+    target_soc_frac: float = 1.0
+    reached_soc_pct: float = 99.0
+    shortfall_penalty_eur_per_kwh: float = 10.0
+    completion_margin_slots: int = 2
+    arm_lead_slots: int = 1
+    arm_before_soc_frac: float = 0.93
+    ack_timeout_s: float = 90.0
+    top_hold_timeout_min: float = 120.0
+    taper: FullChargeTaper = field(default_factory=FullChargeTaper)
+    max_consecutive_failures: int = 3
+    failure_pause_days: int = 5
+    bootstrap_last_full: date | None = None
+    entities: FullChargeEntities = field(default_factory=FullChargeEntities)
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
     """Fully resolved service configuration."""
@@ -352,6 +425,7 @@ class ServiceConfig:
     archive: ArchiveSettings = field(default_factory=ArchiveSettings)
     climate_shadow: ClimateShadowSettings = field(default_factory=ClimateShadowSettings)
     actuation: ActuationSettings = field(default_factory=ActuationSettings)
+    full_charge: FullChargeSettings = field(default_factory=FullChargeSettings)
     timezone: str = "Europe/Madrid"
     mode: str = "shadow"
     source_path: str | None = None
@@ -402,6 +476,12 @@ class ServiceConfig:
             },
             "freshness_s": dict(self.freshness_s),
             "actuation": asdict(self.actuation),
+            "full_charge": {
+                **asdict(self.full_charge),
+                "bootstrap_last_full": self.full_charge.bootstrap_last_full.isoformat()
+                if self.full_charge.bootstrap_last_full
+                else None,
+            },
             "source_path": self.source_path,
         }
 
@@ -414,6 +494,7 @@ class ServiceConfig:
         public.pop("archive", None)  # passive collection never changes a plan
         public.pop("climate_shadow", None)  # nor does the climate shadow (it plans no battery)
         public.pop("actuation", None)  # nor does the way a plan is sent
+        public.pop("full_charge", None)  # the full-charge scheduler is not wired to plans yet
         text = json.dumps(public, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode()).hexdigest()
 
@@ -718,6 +799,11 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
         or not all(isinstance(h, str) and h for h in healthy)
     ):
         raise ValueError(f"service config: {name}.healthy_states must be a non-empty list")
+    if "weekly_full_charge" in healthy:
+        raise ValueError(
+            f"service config: {name}.healthy_states must not list weekly_full_charge: the "
+            "actuator accepts it only while a full-charge run is armed for today"
+        )
     settings = ActuationSettings(
         entities=ActuationEntities(**ents),
         tick_interval_s=num("tick_interval_s"),
@@ -777,6 +863,140 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
             f"service config: {name}.min_discharge_cap_w must not exceed max_discharge_cap_w"
         )
     return settings
+
+
+_FULL_CHARGE_KEYS = (
+    "enabled",
+    "min_interval_days",
+    "max_interval_days",
+    "threshold_min_eur",
+    "threshold_scale_eur",
+    "fixed_cost_eur",
+    "target_soc_frac",
+    "reached_soc_pct",
+    "shortfall_penalty_eur_per_kwh",
+    "completion_margin_slots",
+    "arm_lead_slots",
+    "arm_before_soc_frac",
+    "ack_timeout_s",
+    "top_hold_timeout_min",
+    "taper",
+    "max_consecutive_failures",
+    "failure_pause_days",
+    "bootstrap_last_full",
+    "entities",
+)
+
+
+def _parse_full_charge(
+    raw: Mapping[str, Any],
+    *,
+    actuation: ActuationSettings,
+    entities: EntityMap,
+    soc_source: str,
+) -> FullChargeSettings:
+    """Validate ``full_charge:`` (whole schema, ``docs/planning/periodic-full-charge.md``)."""
+    name = "full_charge"
+    _keys(raw, name, _FULL_CHARGE_KEYS)
+    defaults = FullChargeSettings()
+    enabled = _bool(raw.get("enabled", defaults.enabled), f"{name}.enabled")
+
+    def num(key: str, *, allow_zero: bool = False) -> float:
+        value = raw.get(key, getattr(defaults, key))
+        return _positive(value, f"{name}.{key}", allow_zero=allow_zero)
+
+    def count(key: str, minimum: int = 1) -> int:
+        return _int(raw.get(key, getattr(defaults, key)), f"{name}.{key}", minimum)
+
+    min_days, max_days = count("min_interval_days"), count("max_interval_days")
+    if not min_days < max_days <= 30:
+        raise ValueError(
+            f"service config: {name} needs 0 < min_interval_days < max_interval_days <= 30"
+        )
+    target = num("target_soc_frac")
+    arm_before = num("arm_before_soc_frac")
+    if not arm_before < target <= 1:
+        raise ValueError(
+            f"service config: {name} needs 0 < arm_before_soc_frac < target_soc_frac <= 1"
+        )
+    reached = num("reached_soc_pct")
+    if reached > 100:
+        raise ValueError(f"service config: {name}.reached_soc_pct must be <= 100")
+
+    taper_raw = _section(raw, "taper")
+    _keys(taper_raw, f"{name}.taper", ("start_soc_frac", "power_kw"))
+    start = taper_raw.get("start_soc_frac", defaults.taper.start_soc_frac)
+    if start is not None:
+        start = _positive(start, f"{name}.taper.start_soc_frac")
+        if not 0.5 < start < 1:
+            raise ValueError(f"service config: {name}.taper.start_soc_frac must be in (0.5, 1)")
+    power = _positive(taper_raw.get("power_kw", defaults.taper.power_kw), f"{name}.taper.power_kw")
+    if power > actuation.max_discharge_cap_w / 1000.0:
+        raise ValueError(
+            f"service config: {name}.taper.power_kw must not exceed "
+            "actuation.max_discharge_cap_w / 1000"
+        )
+
+    bootstrap = raw.get("bootstrap_last_full")
+    if isinstance(bootstrap, str):
+        try:
+            bootstrap = date.fromisoformat(bootstrap)
+        except ValueError:
+            pass  # still a str: refused below
+    is_date = isinstance(bootstrap, date) and not isinstance(bootstrap, datetime)
+    if bootstrap is not None and not is_date:
+        raise ValueError(f"service config: {name}.bootstrap_last_full must be a local date or null")
+
+    ents_raw = _section(raw, "entities")
+    _keys(ents_raw, f"{name}.entities", tuple(FULL_CHARGE_DOMAINS))
+    ents: dict[str, str | None] = {}
+    for key, domain in FULL_CHARGE_DOMAINS.items():
+        value = ents_raw.get(key)
+        if value is not None and (
+            not isinstance(value, str)
+            or not _ENTITY_ID.match(value)
+            or not value.startswith(f"{domain}.")
+        ):
+            raise ValueError(
+                f"service config: {name}.entities.{key} must be a {domain}.* entity ID or null"
+            )
+        if value is None and enabled:
+            raise ValueError(f"service config: {name}.enabled needs {name}.entities.{key}")
+        ents[key] = value
+    named = [e for e in ents.values() if e]
+    taken = {*actuation.entities.all(), *entities.all_entities()}
+    if len(named) != len(set(named)) or taken & set(named):
+        raise ValueError(
+            f"service config: {name}.entities must name distinct entities, none of them used "
+            "by entities or actuation.entities"
+        )
+    if enabled:
+        if soc_source != "entity":
+            raise ValueError(f"service config: {name}.enabled needs planning.soc_source=entity")
+        for key in ("integration_status", "battery_soc"):
+            if not getattr(actuation.entities, key):
+                raise ValueError(f"service config: {name}.enabled needs actuation.entities.{key}")
+    return FullChargeSettings(
+        enabled=enabled,
+        min_interval_days=min_days,
+        max_interval_days=max_days,
+        threshold_min_eur=num("threshold_min_eur", allow_zero=True),
+        threshold_scale_eur=num("threshold_scale_eur", allow_zero=True),
+        fixed_cost_eur=num("fixed_cost_eur", allow_zero=True),
+        target_soc_frac=target,
+        reached_soc_pct=reached,
+        shortfall_penalty_eur_per_kwh=num("shortfall_penalty_eur_per_kwh"),
+        completion_margin_slots=count("completion_margin_slots"),
+        arm_lead_slots=count("arm_lead_slots", 0),
+        arm_before_soc_frac=arm_before,
+        ack_timeout_s=num("ack_timeout_s"),
+        top_hold_timeout_min=num("top_hold_timeout_min"),
+        taper=FullChargeTaper(start_soc_frac=start, power_kw=power),
+        max_consecutive_failures=count("max_consecutive_failures"),
+        failure_pause_days=count("failure_pause_days"),
+        bootstrap_last_full=bootstrap,
+        entities=FullChargeEntities(**ents),
+    )
 
 
 def _read_token() -> Secret | None:
@@ -925,6 +1145,12 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
     archive = _parse_archive(_section(raw, "archive"))
     climate_shadow = _parse_climate_shadow(_section(raw, "climate_shadow"))
     actuation = _parse_actuation(_section(raw, "actuation"), mode)
+    full_charge = _parse_full_charge(
+        _section(raw, "full_charge"),
+        actuation=actuation,
+        entities=entities,
+        soc_source=soc_source,
+    )
     if mode == "live" and soc_source != "entity":
         raise ValueError(
             "service config: mode=live needs planning.soc_source=entity: a plan made from a "
@@ -946,6 +1172,7 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
         archive=archive,
         climate_shadow=climate_shadow,
         actuation=actuation,
+        full_charge=full_charge,
         freshness_s=freshness,
         timezone=timezone,
         mode=mode,
