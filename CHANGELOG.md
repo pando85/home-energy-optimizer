@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.7.0](https://github.com/pando85/home-energy-optimizer/tree/v0.7.0) - 2026-11-04
+
+### Added
+
+- actuator: Arm Omnibattery's weekly full charge for the periodic full charge ([76b04f1](https://github.com/pando85/home-energy-optimizer/commit/76b04f1610fe9a129a38f241998c0dd711dde141))
+- planner: Soft full-charge target in the solver and planner (full-charge PR 1) ([a5eb6c8](https://github.com/pando85/home-energy-optimizer/commit/a5eb6c8715d4d5bcacd8908731e593438b9dce9b))
+- service: Read-only battery health telemetry ([4753e55](https://github.com/pando85/home-energy-optimizer/commit/4753e55937e33602835a9e81ebc39c1a3d4efdd5))
+
+### Documentation
+
+- components: Record the 0.6.1 deploy time in the regime log ([156453b](https://github.com/pando85/home-energy-optimizer/commit/156453bcb955737718b7c35f009571a96b0097d3))
+- planning: Plan the periodic full charge for cell balancing ([569e186](https://github.com/pando85/home-energy-optimizer/commit/569e186f7ef478cfee9e03b9ae622bbb14f6254c))
+- planning: Amend the full-charge plan and add the battery longevity policy ([f7b12c3](https://github.com/pando85/home-energy-optimizer/commit/f7b12c354a73524958c22a35208e9040ac346cbb))
+
 ## [v0.6.1](https://github.com/pando85/home-energy-optimizer/tree/v0.6.1) - 2026-11-03
 
 ### Fixed
