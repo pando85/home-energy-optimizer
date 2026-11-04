@@ -63,6 +63,18 @@ Home Assistant PVPC sensor, fed by the homelab deployment. Roadmap: [Price Outlo
    uniform factor; on a sampled holiday the slots take the Sunday period. For the outlook, re-run
    `price-eval` before trusting `omie_period` after any OMIE or publication change.
 
+
+## KPIs
+
+Observability only ([service](../service.md#day-ahead-and-final-plan)); metrics are prefixed
+`battery_optimizer_`.
+
+| KPI | Where |
+|---|---|
+| Next-day publication time | the `prices_published` event (`service/v1/events/`) is written when the next-day prices first appear; `prices_tomorrow_published` flips to 1 at that time (first sample at 1 per local day) |
+| Horizon length | `price_horizon_seconds` (now to the end of the last published price: short just before the next-day publication, about a day and a half just after) and `plan_horizon_slots` |
+| Day-ahead lead time | `slot_plan_lead_seconds{plan="day_ahead"}`; offline `day_ahead_lead_hours` (min, mean, max) from `uv run python hack/day_ahead_kpis.py --from <day> --to <day>` |
+
 ## Status
 
 **provisional** (2026-10-30): taxes unconfirmed and holidays missing; both change reported figures, not

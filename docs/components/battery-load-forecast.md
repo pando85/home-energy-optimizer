@@ -56,6 +56,24 @@ alternating-arm weeks from every evaluation window):
    daily saving against `trailing_mean` lies above zero and the point estimate is at least 10% of the P0
    gap. Otherwise LF-0 stays. Resume triggers 2 and 3 of the plan both fire.
 
+
+## KPIs
+
+Observability only (no calibration changes). The plan's `load_kwh` is the forecast of the day-ahead plan
+(the first plan that covered the slot) and of the final plan (the plan of record at the slot open), scored at
+every slot close against the measured gross load ([service](../service.md#day-ahead-and-final-plan)). Series
+below use `plan="day_ahead"` or `"final"`; metrics are prefixed `battery_optimizer_`.
+
+| KPI | Where |
+|---|---|
+| MAE, kWh per slot | `increase(load_forecast_abs_error_kwh_total{plan}[1d]) / increase(load_forecast_scored_slots_total{plan}[1d])`; offline `load.<plan>.mae_kwh_per_slot` |
+| Bias, actual minus forecast | `increase(load_actual_kwh_total{plan}[1d]) - increase(load_forecast_kwh_total{plan}[1d])`; offline `bias_kwh_per_slot` |
+| Daily energy error % | `100 * (increase(load_forecast_kwh_total{plan}[1d]) / increase(load_actual_kwh_total{plan}[1d]) - 1)`; offline `daily[].error_pct` (complete local days only in `mean_abs_daily_error_pct`) |
+| Forecast vs actual power | `slot_load_forecast_watts{plan}` against the measured house load |
+
+Offline, per slot and over a window: `uv run python hack/day_ahead_kpis.py --from <day> --to <day>`; compare the
+two plans over the same window.
+
 ## Status
 
 **stale** (2026-11-03): the battery is commissioned, so the forecast now learns from reconstructed gross load

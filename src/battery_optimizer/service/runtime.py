@@ -123,6 +123,12 @@ from .ha_guard import actuation_allowlist
 from .history import ForecastUnavailableError, LoadHistory, forecast_load
 from .metrics import ServiceMetrics
 from .observer import SlotMeasurements, SlotObserver, normalise_value
+from .plan_tracker import (
+    DayAheadTracker,
+    SlotPlan,
+    revision_kwh,
+    slot_plans_from_result,
+)
 from .planner import (
     FullChargeSpec,
     PlanningSnapshot,
@@ -225,6 +231,10 @@ class _SlotOpen:
     decision_at_open: str = ""
     #: When a slot that opened without an intent adopted one (``None``: it did not).
     adopted_at: datetime | None = None
+    #: The first plan that covered the slot (day-ahead) and the plan of record (final), as the
+    #: plans said it: frozen at open (final also at a late adoption), ``None`` when absent.
+    day_ahead: SlotPlan | None = None
+    final: SlotPlan | None = None
 
     def intent_share(self, interval_seconds: int) -> float:
         """The share of the slot the intent was in force: 1, or less once adopted late."""
@@ -361,6 +371,8 @@ class ShadowService:
         self._generation = 0
         self._plan_sequence = int(clock.now().timestamp())
         self.plans: deque[PlanResult] = deque(maxlen=_PLAN_MEMORY)
+        #: The day-ahead plan of each slot, rebuilt from the plan files on start.
+        self.day_ahead = DayAheadTracker()
         self.last_solve: dict[str, Any] | None = None
         self._last_solve_started: datetime | None = None
         #: The last skip reason logged at INFO: a skip repeating every slot is logged once.
@@ -433,8 +445,27 @@ class ShadowService:
 
     # ------------------------------------------------------------------ lifecycle
 
+    async def rebuild_day_ahead(self) -> int:
+        """Rebuild the day-ahead tracker from the plan files of the last two UTC days.
+
+        Plans are immutable and ordered by ``(generated_at, plan_sequence)``, so this gives
+        what an uninterrupted process would hold.  A failure is logged and leaves the tracker
+        to the plans of this process: observability only, never a reason not to start.
+        """
+        now = self.clock.now()
+        try:
+            files = await asyncio.get_running_loop().run_in_executor(
+                self._io, self.day_ahead.rebuild, self.data_dir, now
+            )
+        except Exception as exc:  # noqa: BLE001 - never blocks the start
+            log.warning("day-ahead rebuild failed error=%s: %s", type(exc).__name__, exc)
+            return 0
+        log.info("day-ahead rebuilt plan_files=%d slots=%d", files, len(self.day_ahead))
+        return files
+
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
+        await self.rebuild_day_ahead()
         await self._record_event("service_started", {"soc_source": self.config.planning.soc_source})
         if self.ha is not None:
             self._tasks.append(asyncio.create_task(self.ha.run(), name="ha-websocket"))
@@ -1160,6 +1191,7 @@ class ShadowService:
         self.metrics.solves.labels(result="ok").inc()
         self.metrics.solve_duration.observe(elapsed)
         self.plans.append(result)
+        self.day_ahead.observe(slot_plans_from_result(result), completed)
         self._wake_actuator()
         self._logged_skip = None
         _log_plan(result, trigger, elapsed)
@@ -1212,6 +1244,8 @@ class ShadowService:
             reasons=tuple(r for r, _ in reasons),
             opened_at=now,
             decision_at_open=decision,
+            day_ahead=self.day_ahead.get(slot_start),
+            final=self._final_slot_plan(intent),
         )
         self._slot_open[slot_start] = opened
         self._opened_slot = slot_start
@@ -1225,7 +1259,31 @@ class ShadowService:
         self._wake_actuator()
         for old in [s for s in self._slot_open if s < slot_start - timedelta(hours=2)]:
             del self._slot_open[old]
+        self.day_ahead.prune(now)
         return opened
+
+    def _final_slot_plan(self, intent: ShadowIntent | None) -> SlotPlan | None:
+        """What the plan behind *intent* said about the intent's slot (load forecast included)."""
+        if intent is None:
+            return None
+        for result in reversed(self.plans):
+            if result.plan_id == intent.plan_id:
+                for slot_plan in slot_plans_from_result(result):
+                    if slot_plan.slot_start == intent.valid_from:
+                        return slot_plan
+        # The plan left the in-memory window: keep the intent's own numbers, no load forecast.
+        return SlotPlan(
+            plan_id=intent.plan_id,
+            plan_sequence=intent.plan_sequence,
+            generated_at=intent.generated_at,
+            slot_start=intent.valid_from,
+            interval_seconds=self._interval,
+            mode=intent.mode,
+            signed_power_w=intent.signed_power_w,
+            soc_target_frac=intent.soc_target_frac,
+            load_kwh=None,
+            expected_buy_price_eur_per_kwh=intent.expected_buy_price_eur_per_kwh,
+        )
 
     def _awaiting_slot(self, now: datetime) -> _SlotOpen | None:
         """The slot in progress when it opened without an intent and has not adopted one."""
@@ -1255,6 +1313,7 @@ class ShadowService:
         if intent is None:
             return False
         opened.intent, opened.decision, opened.adopted_at = intent, "late_intent", now
+        opened.final = self._final_slot_plan(intent)
         log.info(
             "slot adopted start=%s %s after_s=%.0f decision_at_open=%s",
             opened.slot_start.isoformat(),
@@ -1328,6 +1387,10 @@ class ShadowService:
                 measured.battery_discharge_kwh
             )
 
+        day_ahead = opened.day_ahead if opened else None
+        final = opened.final if opened else None
+        revision = self._score_plans(day_ahead, final, load)
+
         # SOC-limit check of the request against the *measured* SOC (entity mode).
         violation: bool | None = None
         step: SlotStep | None = None
@@ -1391,6 +1454,9 @@ class ShadowService:
             "inputs_ready_at_open": opened.inputs_ready if opened else None,
             "not_ready_reasons": list(opened.reasons) if opened else [],
             "intent": intent.to_dict() if intent else None,
+            "day_ahead": day_ahead.to_dict() if day_ahead else None,
+            "final": final.to_dict() if final else None,
+            "plan_revision_kwh": revision,
             "planned_charge_kwh": planned_c,
             "planned_discharge_kwh": planned_d,
             "measured": measured.to_dict(),
@@ -1412,6 +1478,32 @@ class ShadowService:
             "counterfactual_cost_eur": cf_cost,
             "code_version": self.code_version,
         }
+
+    def _score_plans(
+        self, day_ahead: SlotPlan | None, final: SlotPlan | None, load_kwh: float | None
+    ) -> float | None:
+        """Update the day-ahead / final KPI counters of a closing slot; returns the revision.
+
+        The load forecast is scored only when the slot's gross load was measured.  The final
+        plan's battery energy is the ``shadow_planned_energy`` counter already, so only the
+        day-ahead energy and the revision between the two are new.
+        """
+        m = self.metrics
+        if day_ahead is not None:
+            charge, discharge = day_ahead.energy_kwh()
+            m.shadow_day_ahead_energy.labels(direction="charge").inc(charge)
+            m.shadow_day_ahead_energy.labels(direction="discharge").inc(discharge)
+        for label, slot_plan in (("day_ahead", day_ahead), ("final", final)):
+            if slot_plan is None or slot_plan.load_kwh is None or load_kwh is None:
+                continue
+            m.load_forecast_scored_slots.labels(plan=label).inc()
+            m.load_forecast_kwh.labels(plan=label).inc(slot_plan.load_kwh)
+            m.load_actual_kwh.labels(plan=label).inc(load_kwh)
+            m.load_forecast_abs_error_kwh.labels(plan=label).inc(abs(load_kwh - slot_plan.load_kwh))
+        revision = revision_kwh(day_ahead, final)
+        if revision is not None:
+            m.plan_revision_energy.inc(revision)
+        return revision
 
     # ------------------------------------------------------------------ virtual battery
 
@@ -2232,6 +2324,7 @@ class ShadowService:
             "plan_slots": plan.plan.n if plan else None,
             "current_intent_w": intent.signed_power_w if intent else None,
             "current_intent_active": 1.0 if intent else 0.0,
+            "slot_plans": self._current_slot_plans(now),
             "worker_busy": 1.0 if self._worker_busy else 0.0,
             "history_usable_slots": self.history.usable_slots if self.history else None,
             "history_age_s": (now - self.history.fetched_at).total_seconds()
@@ -2346,12 +2439,64 @@ class ShadowService:
         at = self.archive_last_success.get(archive)
         return at.isoformat() if at else None
 
+    def _current_slot_plans(self, now: datetime) -> dict[str, SlotPlan | None] | None:
+        """The day-ahead and final plan of the slot in progress; ``None`` before it has opened."""
+        opened = self._slot_open.get(floor_slot(now, self._interval))
+        if opened is None:
+            return None
+        return {"day_ahead": opened.day_ahead, "final": opened.final}
+
+    def _slot_plans_view(self, now: datetime) -> dict[str, Any]:
+        """``current_slot`` and ``day_ahead`` of ``/plan``: day-ahead vs final, per slot."""
+        slot = floor_slot(now, self._interval)
+        opened = self._slot_open.get(slot)
+        day_ahead = opened.day_ahead if opened else self.day_ahead.get(slot)
+        final = opened.final if opened else None
+        newest: dict[datetime, SlotPlan] = {}
+        if self.plans:
+            newest = {p.slot_start: p for p in slot_plans_from_result(self.plans[-1])}
+
+        def latest(slot_plan: SlotPlan) -> dict[str, Any] | None:
+            current = newest.get(slot_plan.slot_start)
+            if current is None:
+                return None
+            return {
+                "plan_id": current.plan_id,
+                "generated_at": current.generated_at.isoformat(),
+                "signed_power_w": current.signed_power_w,
+                "soc_target_frac": current.soc_target_frac,
+                "load_forecast_w": current.load_forecast_w,
+            }
+
+        return {
+            "current_slot": {
+                "slot_start": slot.isoformat(),
+                "slot_end": (slot + timedelta(seconds=self._interval)).isoformat(),
+                "decision": opened.decision if opened else None,
+                "day_ahead": day_ahead.to_dict() if day_ahead else None,
+                "final": final.to_dict() if final else None,
+            },
+            "day_ahead": {
+                "slots": [
+                    {"slot_start": p.slot_start.isoformat(), **p.to_dict(), "latest": latest(p)}
+                    for p in self.day_ahead.upcoming(now)
+                ]
+            },
+        }
+
     def plan_view(self) -> dict[str, Any]:
         now = self.clock.now()
         plan = self.plans[-1] if self.plans else None
         intent = self.current_intent(now)
+        slots = self._slot_plans_view(now)
         if plan is None:
-            return {"shadow": True, "plan": None, "current_intent": None, "now": now.isoformat()}
+            return {
+                "shadow": True,
+                "plan": None,
+                "current_intent": None,
+                "now": now.isoformat(),
+                **slots,
+            }
         record = plan.to_record()
         record.pop("inputs", None)
         return {
@@ -2359,6 +2504,7 @@ class ShadowService:
             "now": now.isoformat(),
             "expired": plan.plan.is_expired(now),
             "current_intent": intent.to_dict() if intent else None,
+            **slots,
             "plan": record,
         }
 

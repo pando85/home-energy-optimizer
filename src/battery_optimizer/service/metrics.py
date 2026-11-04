@@ -179,6 +179,7 @@ class _RuntimeCollector(Collector):
             "Samples that arrived after their slot had been closed",
             snap.get("late_samples"),
         )
+        yield from _slot_plan_families(snap.get("slot_plans"))
         climate = snap.get("climate_shadow")
         if climate is not None:
             yield from _climate_families(climate)
@@ -191,6 +192,42 @@ class _RuntimeCollector(Collector):
         full_charge = snap.get("full_charge")
         if full_charge is not None:
             yield from _full_charge_families(full_charge)
+
+
+#: Values of the ``plan`` label: the first plan that covered a slot, and the plan of record.
+PLAN_LABELS = ("day_ahead", "final")
+
+
+def _slot_plan_families(plans: dict[str, Any] | None) -> Iterable[Metric]:
+    """Gauges of the slot in progress, per plan (``battery_optimizer_slot_*``).
+
+    Frozen at the slot open; no sample for a plan the slot does not have (no day-ahead plan after
+    a first deploy, no final intent for a slot without a decision), and none before the first
+    slot has opened.  Battery power is signed like ``current_intent_power_watts``: + charge.
+    """
+    specs = (
+        ("battery_power_watts", "Planned battery power of the slot: + charge, - discharge"),
+        ("soc_target_ratio", "Planned SOC at the end of the slot"),
+        ("load_forecast_watts", "Forecast mean house load over the slot"),
+        (
+            "plan_lead_seconds",
+            "Slot start minus the plan's generation time (negative: made inside the slot)",
+        ),
+    )
+    values: dict[str, Callable[[Any], float | None]] = {
+        "battery_power_watts": lambda p: p.signed_power_w,
+        "soc_target_ratio": lambda p: p.soc_target_frac,
+        "load_forecast_watts": lambda p: p.load_forecast_w,
+        "plan_lead_seconds": lambda p: p.lead_seconds,
+    }
+    for suffix, doc in specs:
+        family = GaugeMetricFamily(f"{PREFIX}_slot_{suffix}", doc, labels=["plan"])
+        for label in PLAN_LABELS:
+            slot_plan = (plans or {}).get(label)
+            value = None if slot_plan is None else values[suffix](slot_plan)
+            if value is not None:
+                family.add_metric([label], float(value))
+        yield family
 
 
 def _full_charge_families(f: dict[str, Any]) -> Iterable[Metric]:
@@ -582,6 +619,44 @@ class ServiceMetrics:
             ["direction"],
             registry=r,
         )
+        # Day-ahead vs final plan KPIs (docs/service.md).  The final plan's battery energy is
+        # shadow_planned_energy and the actual is shadow_actual_battery_energy; the signed load
+        # error is the difference of two counters (actual - forecast), which keeps all monotonic.
+        self.shadow_day_ahead_energy = Counter(
+            f"{PREFIX}_shadow_day_ahead_energy_kwh",
+            "Energy the day-ahead plans requested of the slots that had one",
+            ["direction"],
+            registry=r,
+        )
+        self.plan_revision_energy = Counter(
+            f"{PREFIX}_plan_revision_kwh",
+            "Sum over slots with both plans of |day-ahead - final| requested net battery energy",
+            registry=r,
+        )
+        self.load_forecast_scored_slots = Counter(
+            f"{PREFIX}_load_forecast_scored_slots",
+            "Closed slots with a measured load and a load forecast, by plan",
+            ["plan"],
+            registry=r,
+        )
+        self.load_forecast_kwh = Counter(
+            f"{PREFIX}_load_forecast_kwh",
+            "House load the plan forecast, over its scored slots",
+            ["plan"],
+            registry=r,
+        )
+        self.load_actual_kwh = Counter(
+            f"{PREFIX}_load_actual_kwh",
+            "House load measured, over the slots scored for the plan",
+            ["plan"],
+            registry=r,
+        )
+        self.load_forecast_abs_error_kwh = Counter(
+            f"{PREFIX}_load_forecast_abs_error_kwh",
+            "Sum of |actual - forecast| house load per scored slot, by plan",
+            ["plan"],
+            registry=r,
+        )
         # Gauges (cumulative since process start): PVPC can be negative, so a running
         # cost can fall, which a Counter cannot express.  The report is authoritative.
         self.shadow_native_cost = Gauge(
@@ -667,6 +742,12 @@ class ServiceMetrics:
         for direction in ("charge", "discharge"):
             self.shadow_planned_energy.labels(direction=direction)
             self.shadow_actual_energy.labels(direction=direction)
+            self.shadow_day_ahead_energy.labels(direction=direction)
+        for plan in PLAN_LABELS:
+            self.load_forecast_scored_slots.labels(plan=plan)
+            self.load_forecast_kwh.labels(plan=plan)
+            self.load_actual_kwh.labels(plan=plan)
+            self.load_forecast_abs_error_kwh.labels(plan=plan)
         if actuation:  # dry_run / live only: the shadow exposition stays as it was
             self._register_actuation()
         if full_charge:  # only with the feature enabled
