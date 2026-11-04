@@ -36,8 +36,8 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
 ## Assumptions
 
 - **The objective is unchanged; its feasible set may contain one day with a lifted ceiling and a soft
-  checkpoint** ([periodic full charge](../planning/periodic-full-charge.md), solver and planner only so far,
-  not wired to the service). On that day the SOC ceiling is 1.00 (0.95 before it), the SOC must reach 100% at
+  checkpoint** ([periodic full charge](../planning/periodic-full-charge.md), chosen by the service's
+  scheduler only with `full_charge.enabled`, off by default). On that day the SOC ceiling is 1.00 (0.95 before it), the SOC must reach 100% at
   a slot the optimizer picks, or the plan pays `shortfall_penalty_eur_per_kwh` (10, two orders of magnitude
   above any price) for the missing energy, so the plan is always feasible; the terminal value, the free
   terminal mode and the regular plan are untouched, and the regular plan is never replaced by an evaluation
@@ -150,9 +150,14 @@ above 800 W, matching `power_kw: 2.5`) and the [battery-model](battery-model.md)
 re-checked on measured data.
 
 Full-charge solver (2026-11-04, code only): `oracle.FullChargeModel` and `planner.FullChargeSpec` add the lifted
-ceiling, soft checkpoint and taper rows described above. Nothing calls them yet (the service never sets
-`full_charge` on a snapshot), so plans are byte-identical to before and no recalibration or regime-log row is due
-from this change; it extends the reason above with the taper parameters, which are provisional.
+ceiling, soft checkpoint and taper rows described above. Nothing calls them unless the scheduler is enabled, so
+plans are byte-identical to before; it extends the reason above with the taper parameters, which are provisional.
+
+Full-charge scheduler (2026-11-04, code, `full_charge.enabled: false`, [regime log](regime-log.md)): the service
+prices tomorrow once per evening after the regular plan is published (`planner.evaluate_full_charge`), chooses the
+day by the adaptive cadence of the balance readings, and from the decision on plans with the commit-mode target
+plan until the run ends. With the feature off (the committed default) nothing changes and no recalibration is due;
+the recalibration when it is switched on is the `dry_run` decision study above plus the first supervised run.
 
 High-SOC dwell cost (2026-11-04, code only): `high_soc_cost` in the solver, the planner, the service config and the
 benchmark, default 0, so plans, `inputs_hash` and `config_hash` are byte-identical until a deploy sets it (planned,

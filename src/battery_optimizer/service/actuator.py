@@ -42,6 +42,15 @@ local weekday, or a write of the pair failed; the reason is ``full_charge_refusa
 effectively armed for today.  A guard-failure safe idle neither arms nor disarms, but the kill
 switch's on -> off edge and shutdown disarm once, best effort, after their safe idle.
 
+**Settle hold** (amendment A2): once Omnibattery has completed the run, the directive carries
+``settle_until``.  Until then the actuator maps the slot to the existing idle intent (charge off,
+discharge off, neutral PD target, ``reason: settle_hold``) whatever the plan says, so the 60 s
+cell-spread measurement Omnibattery takes after the charge stops is not taken under load, and the
+weekly switch stays on.  The scheduler ends the hold early (a new reading) or by timeout by
+sending ``armed: false``; the switch then goes off in the restrictive block of the reconcile that
+resumes the normal intent.  The guard wins: a guard-failure safe idle ends the hold's effect (it
+is idle anyway), and no new entity or service is involved.
+
 Numeric targets are bounded by the entity's own ``min``/``max`` as well as ours: Omnibattery
 bounds the PD target by the batteries' summed charge limit (±2500 W here), so the effective
 charge ceiling is ``min(import_cap_w, entity max)``; ``Desired`` carries the value actually
@@ -172,10 +181,16 @@ class FullChargeDirective:
 
     armed: bool  # the actuator drives the weekly switch to this
     weekday: str | None = None  # "monday".."sunday": weekday of the run's local date
+    #: Settle hold: hold idle (no charge, no discharge) until this instant (amendment A2).
+    settle_until: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.armed and self.weekday not in WEEKDAY_OPTIONS:
             raise ValueError(f"an armed directive needs a weekday of {WEEKDAY_OPTIONS}")
+        if self.settle_until is not None and not self.armed:
+            raise ValueError("a settle hold needs an armed directive")
+        if self.settle_until is not None and self.settle_until.tzinfo is None:
+            raise ValueError("settle_until must be timezone-aware")
 
 
 @dataclass(frozen=True)
@@ -183,7 +198,7 @@ class Desired:
     """The Omnibattery state one tick wants; ``None`` fields are left untouched."""
 
     mode: str  # idle | charge | discharge | safe_idle
-    reason: str  # "intent", or a SAFE_IDLE_REASONS member
+    reason: str  # "intent", "settle_hold", or a SAFE_IDLE_REASONS member
     allow_charge: bool = False
     allow_discharge: bool = False
     pd_target_w: float | None = None
@@ -571,8 +586,28 @@ class Actuator:
                 clamped=cut > 0,
                 clamped_w=round(min(cut, power), 3),
             )
+        return self.idle_desired(readings, "intent")
+
+    def idle_desired(self, readings: Mapping[str, Any], reason: str) -> Desired:
+        """Both directions off and the neutral PD target (the planned idle, or the settle hold)."""
+        s, e = self.settings, self.settings.entities
         neutral, _ = self._number_target(e.pd_target, s.neutral_pd_target_w, 0.0, s.import_cap_w)
-        return Desired(mode="idle", reason="intent", pd_target_w=neutral, house_load_w=load)
+        return Desired(
+            mode="idle",
+            reason=reason,
+            pd_target_w=neutral,
+            house_load_w=readings.get("house_load_w"),
+        )
+
+    def _settling(self, ctx: ActuationContext) -> bool:
+        """The directive holds the battery idle for the settle window (feature on only)."""
+        directive = ctx.full_charge
+        return (
+            self._fc is not None
+            and directive is not None
+            and directive.settle_until is not None
+            and ctx.now < directive.settle_until
+        )
 
     def plan_writes(self, desired: Desired, now: datetime) -> list[Write]:
         """The writes that take the observed state to *desired*, restrictive first."""
@@ -862,7 +897,10 @@ class Actuator:
                 desired = safe_idle(reasons[0])
             else:
                 assert ctx.intent is not None
-                desired = self.desired_for(ctx.intent, readings)
+                if self._settling(ctx):
+                    desired = self.idle_desired(readings, "settle_hold")
+                else:
+                    desired = self.desired_for(ctx.intent, readings)
             if fc_armed is False or (fc_armed and desired.mode != "safe_idle"):
                 # A safe idle never arms; it disarms only when the directive says so.
                 desired = replace(
@@ -1067,6 +1105,7 @@ class Actuator:
             "delay_switch": r.get("weekly_delay"),
             "integration_status": r.get("integration_status"),
             "driven_armed": self.desired.full_charge_armed if self.desired is not None else None,
+            "settle_hold": self.desired is not None and self.desired.reason == "settle_hold",
             "refusal": self.full_charge_refusal,
         }
 

@@ -35,6 +35,9 @@ Home Assistant PVPC sensor, fed by the homelab deployment. Roadmap: [Price Outlo
   every consumer must keep it as is; the optimiser does, see
   [battery-optimizer](battery-optimizer.md) for the code references.
 - The service never forecasts unpublished prices; its horizon ends at the last published slot.
+- The periodic full-charge decision depends on the next-day publication time (about 20:15 local, measured by the
+  `pvpc_snapshots` archive): it is taken in the first solve after tomorrow's prices are published, about 3.5 h before
+  the day starts, and never on an estimated price.
 - **Hard constraint (owner-confirmed 2026-10-30):** the 5.0 kW contracted import limit is enforced by the
   smart meter, which cuts supply on overload, and this has happened. It is not a cost term and must not be
   traded against price. The trip is on **instantaneous** load, not the 15-minute average

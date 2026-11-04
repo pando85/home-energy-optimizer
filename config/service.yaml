@@ -249,13 +249,28 @@ actuation:
 # (ADR-0007 amendment 2026-11-04).  Needs planning.soc_source: entity.
 full_charge:
   enabled: false
-  min_interval_days: 5                # never before
-  max_interval_days: 15               # forced on the next priced day
-  threshold_min_eur: 0.01             # day-5 threshold, EUR per run (pre-tax, objective unit)
-  threshold_scale_eur: 0.01           # hyperbolic growth towards day 15
+  # The feature's own switch.  shadow (default): decides and records with the simulated writer and a
+  # simulated state file; beside a live service nothing about the real control path changes (the
+  # regular plan stays the plan of record, the actuator hears nothing, the two weekly entities stay
+  # refused by the guard).  live: arms Omnibattery's weekly full charge; needs the service mode: live.
+  mode: shadow
+  # Days since the last full charge, by the class of the latest valid balance readings (worst
+  # class first): unknown also means fewer than min_comparable_readings; green needs that many
+  # green readings and a trend that is not rising; yellow also covers a single orange or red;
+  # alert is orange or red on alert_consecutive readings in a row (and an owner alert).
+  cadence:
+    unknown: {min_days: 10, max_days: 14}
+    green: {min_days: 14, max_days: 28}
+    yellow: {min_days: 7, max_days: 14}
+    alert: {min_days: 5, max_days: 7}
+  min_comparable_readings: 4
+  alert_consecutive: 2
+  settle_timeout_s: 300               # idle hold after completion, waiting for the balance reading
+  threshold_min_eur: 0.01             # threshold at the row's min_days, EUR per run (pre-tax, objective unit)
+  threshold_scale_eur: 0.01           # hyperbolic growth towards the row's max_days
   fixed_cost_eur: 0.0                 # added to the forcing cost (wear / time at 100%)
   target_soc_frac: 1.0
-  reached_soc_pct: 99                 # an observed SOC at or above counts as a full charge
+  reached_soc_pct: 99                 # SOC at or above: "reached" (only a new balance reading counts as done)
   shortfall_penalty_eur_per_kwh: 10.0
   completion_margin_slots: 2          # checkpoint at least this many slots before local midnight
   arm_lead_slots: 1
@@ -265,15 +280,18 @@ full_charge:
   taper: {start_soc_frac: 0.90, power_kw: 0.2}   # provisional; start_soc_frac: null disables it
   max_consecutive_failures: 3
   failure_pause_days: 5
-  bootstrap_last_full: null           # ISO date; null: Prometheus history, then battery.commissioned_at
+  bootstrap_last_full: null           # ISO date, explicit override; null: eligible as soon as enabled
   entities:                           # required when enabled
     enable_switch: switch.omnibattery_weekly_full_charge_enabled   # written (live only)
     day_select: select.omnibattery_weekly_full_charge_day          # written (live only)
     delay_switch: switch.omnibattery_weekly_full_charge_delay      # read only, must be off
     charge_delay_switch: switch.omnibattery_charge_delay           # read only, logged
-    last_balance_read: sensor.venus_last_balance_read              # read only, evidence
+    last_balance_read: sensor.venus_last_balance_read              # read only, a new value = success
     balancing_mode: binary_sensor.venus_balancing_mode             # read only, evidence
     cell_delta: sensor.venus_cell_delta                            # read only, evidence
+    balance_status: sensor.venus_balance_status                    # read only, selects the cadence row
+    delta_trend: sensor.venus_delta_trend                          # read only: rising | stable | falling
+    delta_avg_4w: sensor.venus_delta_avg_4w                        # read only, evidence
 
 # Read-only battery health telemetry (docs/service.md): temperature exposure, charge sessions,
 # cell voltages and Omnibattery's balance monitor, in /status and battery_optimizer_battery_*

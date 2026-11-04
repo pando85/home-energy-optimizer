@@ -368,7 +368,7 @@ FC_ALLOW = ActuationAllowlist(
     datetimes=ALLOW.datetimes,
     selects={FC_DAY: frozenset(WEEKDAY_OPTIONS)},
 )
-FC_ON = {**LIVE, "full_charge.enabled": True}
+FC_ON = {**LIVE, "full_charge.enabled": True, "full_charge.mode": "live"}
 
 
 def select(entity=FC_DAY, option="tuesday", **kw):
@@ -518,11 +518,32 @@ def test_actuation_request_builds_the_select_frame():
         actuation_request(9, "select", "select_option", FC_DAY, {"option": "friday"}, None)
 
 
-@pytest.mark.parametrize("mode", ["shadow", "dry_run", "live"])
-@pytest.mark.parametrize("enabled", [False, True])
-def test_the_pair_joins_the_allowlist_only_when_enabled_and_live(tmp_path, mode, enabled):
+@pytest.mark.parametrize(
+    ("mode", "enabled", "feature_mode"),
+    [
+        ("shadow", False, "shadow"),
+        ("shadow", True, "shadow"),
+        ("dry_run", False, "shadow"),
+        ("dry_run", True, "shadow"),
+        ("live", False, "shadow"),
+        ("live", False, "live"),
+        ("live", True, "shadow"),  # live control, the feature only simulated: nothing is added
+        ("live", True, "live"),
+    ],
+)
+def test_the_pair_joins_the_allowlist_only_when_enabled_live_and_feature_live(
+    tmp_path, mode, enabled, feature_mode
+):
     config = load_service_config(
-        write_service_config(tmp_path, **{**LIVE, "mode": mode, "full_charge.enabled": enabled})
+        write_service_config(
+            tmp_path,
+            **{
+                **LIVE,
+                "mode": mode,
+                "full_charge.enabled": enabled,
+                "full_charge.mode": feature_mode,
+            },
+        )
     )
     allowlist = actuation_allowlist(config)
     if mode != "live":
@@ -534,12 +555,14 @@ def test_the_pair_joins_the_allowlist_only_when_enabled_and_live(tmp_path, mode,
     assert allowlist is not None
     ents = config.actuation.entities
     base = {ents.allow_charge, ents.allow_discharge, ents.power_limits}
-    if not enabled:
+    if not enabled or feature_mode != "live":
         assert allowlist.switches == base and dict(allowlist.selects) == {}
         off = call(service="turn_off", entity=FC_SWITCH)
-        for message in (select(), call(entity=FC_SWITCH), off):
-            with pytest.raises(ForbiddenHACallError):
+        for message in (select(), call(entity=FC_SWITCH), off, *FC_ALLOWED):
+            with pytest.raises(ForbiddenHACallError):  # both entities refused, every option
                 check_ws_message(message, allowlist)
+            with pytest.raises(ForbiddenHACallError):
+                check_ws_frame(json.dumps(message, default=repr), allowlist)
         return
     fc = config.full_charge.entities
     assert (fc.enable_switch, fc.day_select) == (FC_SWITCH, FC_DAY)
@@ -590,6 +613,7 @@ def test_committed_config_has_the_full_charge_feature_off_and_adds_nothing_to_th
     assert config.full_charge.enabled is False
     assert config.full_charge.entities.enable_switch == FC_SWITCH
     assert config.full_charge.entities.day_select == FC_DAY
+    assert config.full_charge.mode == "shadow"  # the feature's own switch is shadow by default
     live = load_service_config(write_service_config(tmp_path, **LIVE))
     allowlist = actuation_allowlist(live)
     assert FC_SWITCH not in allowlist.switches and not allowlist.selects

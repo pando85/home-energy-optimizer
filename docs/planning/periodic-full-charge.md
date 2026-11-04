@@ -3,8 +3,8 @@
 - **Status:** Plan, owner decisions recorded 2026-11-04, **amended 2026-11-04** (see the
   [amendment](#amendment-2026-11-04-success-criterion-settle-hold-and-adaptive-cadence), which supersedes the fixed 5/15
   day cadence, the SOC-99 success criterion and the bootstrap of the original text; superseded passages stay in place,
-  marked). PRs 1 and 2 are merged (#81 solver and planner, #80 actuator, guard and config); PR 3 (scheduler) is not
-  written. The feature ships off by default. Merging this plan authorises nothing on the installation: each
+  marked). PRs 1 and 2 are merged (#81 solver and planner, #80 actuator, guard and config); PR 3 (scheduler,
+  [implementation notes](#pr-3-implementation-notes)) is implemented. The feature ships off by default. Merging this plan authorises nothing on the installation: each
   implementation PR below is reviewed on its own, and the first live run is supervised.
 - **Date:** 2026-11-04
 - **Decisions:** [ADR-0007](../adr/0007-live-battery-control.md) (live control; this plan amends it, text in
@@ -147,6 +147,43 @@ extended; the rest of its content is unchanged:
 
 Then, as before: at least 7 days of `dry_run`, a supervised first live run, and the homelab watchdog follow-up
 ([section 12](#follow-up-for-the-homelab-repository-not-changed-here)).
+
+### PR 3 implementation notes
+
+Where the code differs from the text above (the code is what the tests cover):
+
+- **States.** The six states are `idle`, `scheduled`, `armed`, `charging`, `reached`, `settling`. `done`, `failed`
+  and `cancelled` are outcomes (`runs_total{outcome}`: `done`, `done_simulated`, `failed_never_armed`,
+  `failed_unacknowledged`, `failed_never_reached`, `failed_reached_unmeasured`, `cancelled`), recorded when the
+  machine returns to `idle` in the same step; `reached_timeout` is gone (a timeout starts the settle hold, and the
+  reading decides). One attempt per local day.
+- **Arming** waits for local midnight of the run's day (not one slot before it), because the merged actuator refuses
+  an arm whose weekday is not the local weekday of the tick (`not_today`). The acknowledgement clock starts when the
+  actuator reports the arm driven, so a guard-failure safe idle does not time it out.
+- **Class precedence** is worst first (alert, yellow, green, unknown), so two orange readings alert even with fewer
+  than four comparable readings, and a yellow reading selects 7/14 even before four readings exist. The green class
+  also needs a known, not rising `delta_trend` (Omnibattery: `rising`, `stable`, `falling`) and a latest reading no
+  older than the green row's `max_days`.
+- **Bootstrap `d`**: with no `L`, `d` is the `unknown` row's `min` until that many days have passed since
+  `enabled_at`, then the days since enablement (forced at `max`).
+- **Balance sensors** are `full_charge.entities` (three more than the seven of PR 2: `balance_status`, `delta_trend`,
+  `delta_avg_4w`), read from the entity store; `battery_health.entities` may name the same entities (one store entry
+  each) and the two sections must agree. No second reader and no dependency on `battery_health`.
+- **Pause** resets the failure count when it starts; a new valid reading clears the count and the pause.
+- **Writer separation** works in both directions: a state of the other writer is discarded.
+- **Evaluation** is its own worker job after the regular plan is published; a target that misses by more than
+  0.05 kWh is declined for the day; the decision is sticky once an evaluation was obtained.
+- **Feature mode (coordinator request after review).** `full_charge.mode: shadow | live` (default `shadow`;
+  `live` needs the service `mode: live`) is the feature's own switch, so the installation can stay `live` for normal
+  battery control while the feature only simulates. Service `live` with the feature `shadow`: the simulated writer and
+  a simulated state file, but the regular plan stays the plan of record (never commit mode), the actuator is built
+  without the feature and receives no directive, and the guard does not admit the two entities. Going from feature
+  `shadow` to `live` discards the simulated state (the first live run is eligible at once). In service `shadow` and
+  `dry_run` the feature behaves as before. This replaces the earlier reading of "`dry_run`: the simulated writer"
+  as the only way to study the decisions on the installation. `/status` has `full_charge.mode` and the metric
+  `full_charge_mode{mode}`.
+- **Startup checks**: Home Assistant's `time_zone` (REST `get_config`) and the weekly-entity contract suspend the
+  feature (no directive: hands off) and alert; the entity check self-heals, the time-zone check retries every 60 s.
 
 ## 1. Goal and owner decisions
 

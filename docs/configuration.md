@@ -125,10 +125,19 @@ measured `actuation.battery_ac_power_sign`, and `live` also without `planning.so
 mode is a homelab config change of the deployed `service.yaml`, never an environment variable.
 
 The `full_charge:` section (periodic full charge for cell balancing, **off by default**) is documented in
-[service.md](service.md#periodic-full-charge-the-weekly-charge-enabler) and
-[the plan](planning/periodic-full-charge.md). Only with `full_charge.enabled: true` in `mode: live` does the guard
+[service.md](service.md#periodic-full-charge-the-weekly-charge-enabler) (keys, the
+[scheduler](service.md#periodic-full-charge-the-scheduler) and
+[how to enable it](service.md#enabling-the-periodic-full-charge)) and
+[the plan](planning/periodic-full-charge.md). Only with `full_charge.enabled: true` and `full_charge.mode: live` in a service `mode: live` does the guard
 admit the weekly-full-charge switch and its day select (seven weekday values); the section is validated in every
-mode and refuses a setup that would leave the feature half configured.
+mode and refuses a setup that would leave the feature half configured. The cadence is the `cadence` table (days
+by the class of the latest balance readings; `unknown` 10/14, `green` 14/28, `yellow` 7/14, `alert` 5/7), with
+`min_comparable_readings`, `alert_consecutive` and `settle_timeout_s`; the balance sensors are in
+`full_charge.entities` and may repeat `battery_health.entities` (the two must agree). `full_charge.mode` is the feature's
+own switch, `shadow` (default) or `live`, and `live` needs the service `mode: live`: with the service live and the
+feature `shadow` the feature only simulates (decisions and a simulated state are recorded; the regular plan stays the
+plan of record, the actuator gets no directive and the guard does not admit the two entities), so the installation
+stays `live` for normal battery control while the decisions are studied.
 
 The `battery_health:` section (read-only battery health telemetry: temperature exposure, charge sessions, cell
 voltages, Omnibattery's balance monitor) is documented in

@@ -36,6 +36,9 @@ __all__ = [
     "BatteryHealthSettings",
     "ClimateShadowSettings",
     "EntityMap",
+    "FULL_CHARGE_MODES",
+    "CadenceRow",
+    "FullChargeCadence",
     "FullChargeEntities",
     "FullChargeSettings",
     "FullChargeTaper",
@@ -362,6 +365,9 @@ FULL_CHARGE_DOMAINS: dict[str, str] = {
     "last_balance_read": "sensor",
     "balancing_mode": "binary_sensor",
     "cell_delta": "sensor",
+    "balance_status": "sensor",
+    "delta_trend": "sensor",
+    "delta_avg_4w": "sensor",
 }
 
 
@@ -370,7 +376,10 @@ class FullChargeEntities:
     """Omnibattery's weekly-full-charge surface (periodic full charge for cell balancing).
 
     Written: ``enable_switch`` and ``day_select``.  Only read: ``delay_switch`` (must be off),
-    ``charge_delay_switch`` (logged) and the evidence sensors.  All required when enabled.
+    ``charge_delay_switch`` (logged) and the balance sensors (the scheduler reads
+    ``last_balance_read``, ``balance_status`` and ``delta_trend``; the rest is evidence).  All
+    required when enabled.  The balance sensors may name the same entities as
+    ``battery_health.entities`` (one entity store entry each); the two sections must then agree.
     """
 
     enable_switch: str | None = None
@@ -380,6 +389,9 @@ class FullChargeEntities:
     last_balance_read: str | None = None
     balancing_mode: str | None = None
     cell_delta: str | None = None
+    balance_status: str | None = None
+    delta_trend: str | None = None
+    delta_avg_4w: str | None = None
 
     def all(self) -> tuple[str, ...]:
         return tuple(e for k in FULL_CHARGE_DOMAINS if (e := getattr(self, k)))
@@ -457,17 +469,50 @@ class FullChargeTaper:
     power_kw: float = 0.2
 
 
+#: ``full_charge.mode``: ``shadow`` simulates the feature (nothing about the real control path
+#: changes), ``live`` lets it arm Omnibattery's weekly full charge (service ``mode: live`` only).
+FULL_CHARGE_MODES: tuple[str, ...] = ("shadow", "live")
+
+
+@dataclass(frozen=True)
+class CadenceRow:
+    """Days between full charges for one cadence class: never before ``min``, forced at ``max``."""
+
+    min_days: int
+    max_days: int
+
+
+@dataclass(frozen=True)
+class FullChargeCadence:
+    """The adaptive cadence table (amendment A3), keyed by the class of the latest valid reading."""
+
+    unknown: CadenceRow = CadenceRow(10, 14)  # also: fewer than min_comparable_readings
+    green: CadenceRow = CadenceRow(
+        14, 28
+    )  # enough comparable readings, all green, trend not rising
+    yellow: CadenceRow = CadenceRow(7, 14)  # also a single orange or red after a better reading
+    alert: CadenceRow = CadenceRow(5, 7)  # orange or red on alert_consecutive readings in a row
+
+    def row(self, name: str) -> CadenceRow:
+        return getattr(self, name)
+
+
 @dataclass(frozen=True)
 class FullChargeSettings:
     """Periodic full charge for cell balancing (``docs/planning/periodic-full-charge.md``).
 
-    Off by default.  ``enabled`` works in every mode; the two writable entities join the
-    live allowlist only when it is true.
+    Off by default.  ``enabled`` works in every service mode.  ``mode`` is the feature's own
+    switch: ``shadow`` (default) decides and records with the simulated writer and never touches
+    the real control path; ``live`` (service ``mode: live`` only) arms Omnibattery's weekly full
+    charge, and only then do the two writable entities join the live allowlist.
     """
 
     enabled: bool = False
-    min_interval_days: int = 5
-    max_interval_days: int = 15
+    mode: str = "shadow"
+    cadence: FullChargeCadence = field(default_factory=FullChargeCadence)
+    min_comparable_readings: int = 4
+    alert_consecutive: int = 2
+    settle_timeout_s: float = 300.0
     threshold_min_eur: float = 0.01
     threshold_scale_eur: float = 0.01
     fixed_cost_eur: float = 0.0
@@ -510,6 +555,16 @@ class ServiceConfig:
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
+
+    @property
+    def full_charge_writer_mode(self) -> str:
+        """``live`` only for the live service with ``full_charge.mode: live``, else simulated."""
+        return "live" if self.mode == "live" and self.full_charge.mode == "live" else "simulated"
+
+    @property
+    def full_charge_isolated(self) -> bool:
+        """The feature simulates beside live control: no plan of record, no directive, no write."""
+        return self.mode == "live" and self.full_charge.mode != "live"
 
     def freshness_for(self, role: str) -> float | None:
         """Maximum age for a role; power roles share ``battery_power``'s limit.
@@ -575,7 +630,7 @@ class ServiceConfig:
         public.pop("archive", None)  # passive collection never changes a plan
         public.pop("climate_shadow", None)  # nor does the climate shadow (it plans no battery)
         public.pop("actuation", None)  # nor does the way a plan is sent
-        public.pop("full_charge", None)  # the full-charge scheduler is not wired to plans yet
+        public.pop("full_charge", None)  # a committed plan carries its spec in its own inputs
         public.pop("battery_health", None)  # read-only telemetry never changes a plan
         if not self.planning.high_soc_cost_eur_per_kwh_h:
             # An inactive dwell cost leaves every plan alone: keep the hash from before it existed.
@@ -957,8 +1012,11 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
 
 _FULL_CHARGE_KEYS = (
     "enabled",
-    "min_interval_days",
-    "max_interval_days",
+    "mode",
+    "cadence",
+    "min_comparable_readings",
+    "alert_consecutive",
+    "settle_timeout_s",
     "threshold_min_eur",
     "threshold_scale_eur",
     "fixed_cost_eur",
@@ -978,18 +1036,58 @@ _FULL_CHARGE_KEYS = (
 )
 
 
+_CADENCE_CLASSES = ("unknown", "green", "yellow", "alert")
+
+
+def _parse_cadence(raw: Mapping[str, Any], name: str) -> FullChargeCadence:
+    """Validate the cadence table: per row ``0 < min < max <= 30``, healthier is never sooner."""
+    _keys(raw, name, _CADENCE_CLASSES)
+    defaults = FullChargeCadence()
+    rows: dict[str, CadenceRow] = {}
+    for key in _CADENCE_CLASSES:
+        row_raw = raw.get(key)
+        if row_raw is None:
+            rows[key] = defaults.row(key)
+            continue
+        if not isinstance(row_raw, Mapping):
+            raise ValueError(f"service config: {name}.{key} must be a mapping")
+        _keys(row_raw, f"{name}.{key}", ("min_days", "max_days"))
+        low = _int(row_raw.get("min_days", defaults.row(key).min_days), f"{name}.{key}.min_days")
+        high = _int(row_raw.get("max_days", defaults.row(key).max_days), f"{name}.{key}.max_days")
+        if not low < high <= 30:
+            raise ValueError(f"service config: {name}.{key} needs 0 < min_days < max_days <= 30")
+        rows[key] = CadenceRow(low, high)
+    mins = [rows[k].min_days for k in ("green", "unknown", "yellow", "alert")]
+    if mins != sorted(mins, reverse=True):
+        raise ValueError(
+            f"service config: {name} needs green.min_days >= unknown.min_days >= "
+            "yellow.min_days >= alert.min_days (a healthier battery is never measured more often)"
+        )
+    return FullChargeCadence(**rows)
+
+
 def _parse_full_charge(
     raw: Mapping[str, Any],
     *,
     actuation: ActuationSettings,
     entities: EntityMap,
     soc_source: str,
+    battery_health: BatteryHealthSettings,
+    service_mode: str,
 ) -> FullChargeSettings:
     """Validate ``full_charge:`` (whole schema, ``docs/planning/periodic-full-charge.md``)."""
     name = "full_charge"
     _keys(raw, name, _FULL_CHARGE_KEYS)
     defaults = FullChargeSettings()
     enabled = _bool(raw.get("enabled", defaults.enabled), f"{name}.enabled")
+    feature_mode = raw.get("mode", defaults.mode)
+    if feature_mode not in FULL_CHARGE_MODES:
+        raise ValueError(f"service config: {name}.mode must be one of {FULL_CHARGE_MODES}")
+    if feature_mode == "live" and service_mode != "live":
+        raise ValueError(
+            f"service config: {name}.mode=live needs the service mode=live (the weekly switch "
+            "is never written by a shadow or dry_run service)"
+        )
 
     def num(key: str, *, allow_zero: bool = False) -> float:
         value = raw.get(key, getattr(defaults, key))
@@ -998,11 +1096,12 @@ def _parse_full_charge(
     def count(key: str, minimum: int = 1) -> int:
         return _int(raw.get(key, getattr(defaults, key)), f"{name}.{key}", minimum)
 
-    min_days, max_days = count("min_interval_days"), count("max_interval_days")
-    if not min_days < max_days <= 30:
-        raise ValueError(
-            f"service config: {name} needs 0 < min_interval_days < max_interval_days <= 30"
-        )
+    cadence = _parse_cadence(_section(raw, "cadence"), f"{name}.cadence")
+    comparable = count("min_comparable_readings")
+    alert_consecutive = count("alert_consecutive", 2)
+    settle_timeout = num("settle_timeout_s")
+    if settle_timeout > 900:
+        raise ValueError(f"service config: {name}.settle_timeout_s must be <= 900")
     target = num("target_soc_frac")
     arm_before = num("arm_before_soc_frac")
     if not arm_before < target <= 1:
@@ -1060,6 +1159,15 @@ def _parse_full_charge(
             f"service config: {name}.entities must name distinct entities, none of them used "
             "by entities or actuation.entities"
         )
+    # The balance sensors are shared with the read-only telemetry (one store entry each): the two
+    # sections must name the same entity for a role, never two different ones.
+    for key in BATTERY_HEALTH_DOMAINS:
+        mine, theirs = ents.get(key), getattr(battery_health.entities, key)
+        if mine and theirs and mine != theirs:
+            raise ValueError(
+                f"service config: {name}.entities.{key} and battery_health.entities.{key} must "
+                "name the same entity"
+            )
     if enabled:
         if soc_source != "entity":
             raise ValueError(f"service config: {name}.enabled needs planning.soc_source=entity")
@@ -1068,8 +1176,11 @@ def _parse_full_charge(
                 raise ValueError(f"service config: {name}.enabled needs actuation.entities.{key}")
     return FullChargeSettings(
         enabled=enabled,
-        min_interval_days=min_days,
-        max_interval_days=max_days,
+        mode=feature_mode,
+        cadence=cadence,
+        min_comparable_readings=comparable,
+        alert_consecutive=alert_consecutive,
+        settle_timeout_s=settle_timeout,
         threshold_min_eur=num("threshold_min_eur", allow_zero=True),
         threshold_scale_eur=num("threshold_scale_eur", allow_zero=True),
         fixed_cost_eur=num("fixed_cost_eur", allow_zero=True),
@@ -1314,13 +1425,15 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
     archive = _parse_archive(_section(raw, "archive"))
     climate_shadow = _parse_climate_shadow(_section(raw, "climate_shadow"))
     actuation = _parse_actuation(_section(raw, "actuation"), mode)
+    battery_health = _parse_battery_health(_section(raw, "battery_health"))
     full_charge = _parse_full_charge(
         _section(raw, "full_charge"),
         actuation=actuation,
         entities=entities,
         soc_source=soc_source,
+        battery_health=battery_health,
+        service_mode=mode,
     )
-    battery_health = _parse_battery_health(_section(raw, "battery_health"))
     dwell_per_kwh = (
         planning.high_soc_cost_eur_per_kwh_h * planning.max_horizon_slots * interval_seconds / 3600
     )

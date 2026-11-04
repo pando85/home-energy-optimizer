@@ -57,6 +57,7 @@ mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 | `observer` | Per-slot measurements (counter energy, power averages, SOC edges) |
 | `virtual_battery` | Open-loop replay of decisions against measured load |
 | `battery_health` | Pure, read-only battery health telemetry: temperature exposure, charge sessions, cell voltages, Omnibattery balance monitor ([Battery health telemetry](#battery-health-telemetry)) |
+| `full_charge` | Pure decision rule, adaptive cadence and run state machine of the periodic full charge ([scheduler](#periodic-full-charge-the-scheduler)); the runtime does its I/O |
 | `runtime` | Scheduling, readiness, bounded executor, slot cycle, metrics snapshot |
 | `archive` | Record builders and the fetch schedule of the passive [archives](#passive-archives) |
 | `sink` | Append-only store under the data directory |
@@ -240,7 +241,7 @@ return 405). Bind address `0.0.0.0`, container port **8080**.
 |---|---|
 | `/health/live` | `{"status": "alive"}` — the process and its event loop are up |
 | `/health/ready` | `{ready, inputs_ready, reasons, details}`; 200 or 503 |
-| `/status` | Mode, adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), `battery_health` (only when a `battery_health.entities` role is configured), code version, config hash; in `dry_run`/`live` also `actuator` (kill switch, in control, guard reasons, desired and observed state, alert, last error, import-trip hold, last tick / confirmed write / heartbeat) |
+| `/status` | Mode, adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), `battery_health` (only when a `battery_health.entities` role is configured), `full_charge` (only with `full_charge.enabled`), code version, config hash; in `dry_run`/`live` also `actuator` (kill switch, in control, guard reasons, desired and observed state, alert, last error, import-trip hold, last tick / confirmed write / heartbeat) |
 | `/plan` | Latest plan with its snapshot summary, solver result and intents, plus the current intent (all flagged `shadow`) |
 | `/metrics` | Prometheus exposition |
 
@@ -311,7 +312,15 @@ ID, price, timestamp or household reading is a label.
 | `actuator_desired_pd_target_watts`, `actuator_desired_allow_charge`, `actuator_desired_allow_discharge`, `actuator_desired_max_discharge_watts` | gauge (requested) | — |
 | `actuator_observed_pd_target_watts`, `actuator_observed_battery_power_watts` (+ charge), `actuator_observed_grid_power_watts`, `actuator_house_load_watts` | gauge (observed; absent when stale) | — |
 | `actuator_clamped_watts` | gauge (W of planned battery power the last tick could not request; 0 = none cut) | — |
-| `actuator_writes_total` | counter | `role` (`allow_charge`, `allow_discharge`, `max_discharge_power`, `power_limits`, `pd_target`, `heartbeat`), `result` (`ok`, `failed`, `dry_run`) |
+| `actuator_writes_total` | counter | `role` (`allow_charge`, `allow_discharge`, `max_discharge_power`, `power_limits`, `pd_target`, `heartbeat`, `full_charge_day`, `full_charge_enable`), `result` (`ok`, `failed`, `dry_run`) |
+| `full_charge_mode` | gauge 0/1 (one-hot; only with `full_charge.enabled`, like every `full_charge_*`) | `mode` (`shadow`, `live`) |
+| `full_charge_state` | gauge 0/1 (one-hot) | `state` (`idle`, `scheduled`, `armed`, `charging`, `reached`, `settling`) |
+| `full_charge_days_since_last`, `full_charge_last_timestamp_seconds`, `full_charge_scheduled_day_timestamp_seconds` | gauge (absent while unknown / none scheduled) | — |
+| `full_charge_forcing_cost_eur`, `full_charge_threshold_eur`, `full_charge_soc_peak_percent` | gauge (last priced decision; current or last run) | — |
+| `full_charge_cadence_class` | gauge 0/1 (one-hot) | `class` (`unknown`, `green`, `yellow`, `alert`) |
+| `full_charge_cadence_min_days`, `full_charge_cadence_max_days` | gauge (the active row) | — |
+| `full_charge_alert` | gauge 0/1 | `reason` (`delay_switch_on`, `timezone_mismatch`, `entities_missing`, `never_reached`, `unacknowledged`, `reached_unmeasured`, `balance_alert`, `paused`, `state_unwritable`) |
+| `full_charge_runs_total` | counter | `outcome` (`done`, `done_simulated`, `failed_never_armed`, `failed_unacknowledged`, `failed_never_reached`, `failed_reached_unmeasured`, `cancelled`) |
 | `actuator_write_failures_total` | counter (each attempt) | `reason` (`ha_error`, `readback_timeout`, `forbidden`) |
 | `actuator_safe_idles_total` | counter | `reason` (guard reasons, `write_failed`, `shutdown`) |
 | `actuator_heartbeats_total` | counter | `result` (`ok`, `failed`, `dry_run`) |
@@ -355,6 +364,11 @@ per actuator tick; `-v`/`--verbose` adds DEBUG. Tokens never appear in it. At IN
   in `dry_run`; the heartbeat is not logged). WARNING: write failures and readback timeouts,
   `actuator import trip ...` and `actuator import trip ended`, `actuator alert=write_failed`; ERROR:
   `actuator alert=safe_idle_failed`, a failed or timed-out safe idle at shutdown;
+- periodic full charge (when enabled): `full-charge decision day=... d=... class=... forced=... accepted=...
+  forcing_cost=... vs_normal=... threshold=... shortfall=... checkpoint=...`, `full-charge state idle -> scheduled
+  reason=threshold day=...` (every transition with its reason), `full-charge outcome=done reason=balance_reading
+  day=... soc_peak=...` (WARNING for a failed outcome), `full-charge paused until ...`, `full-charge suspended
+  reason=...` / `resumed`, `full-charge time zone verified`, ERROR `full-charge disabled: Home Assistant time_zone=...`;
 - Home Assistant: `home assistant connected`, `home assistant synced states=... tracked_seen=... resyncs=...`;
   WARNING `home assistant disconnected: ...; reconnect in ...` and `connect failed` (once per distinct
   error while retrying); ERROR `home assistant auth failed`;
@@ -373,6 +387,7 @@ files `0600`, directories `0700`:
 | `slots/date=YYYY-MM-DD/slots.jsonl` | One row per closed slot: decision, measurements, price, virtual-battery step, costs (see below) |
 | `events/date=YYYY-MM-DD/events.jsonl` | Start/stop, HA sync/disconnect, solve skipped/error/timeout/discarded, history refresh, price publication |
 | `state/virtual_battery.json` | Virtual SOC (restored after a restart if younger than 6 h) |
+| `state/full_charge.json` | Periodic full charge only (mutable, atomic): the scheduler's knowledge and calendar decision, never a plan ([scheduler](#periodic-full-charge-the-scheduler)) |
 
 A slot row's `decision` is the outcome that held when the slot closed: `intent`, `late_intent`, `no_plan`,
 `plan_expired`, `not_ready` or `not_observed`. `decision_at_open` is the decision frozen at `B` (equal to
@@ -386,6 +401,7 @@ time it was in force, `1 - adopted_after_s / interval_seconds` of the slot: `pla
 | `pvpc_snapshots/date=YYYY-MM-DD/pvpc_snapshots.jsonl` | One row per PVPC sensor state change (see [Passive archives](#passive-archives)) |
 | `weather_forecasts/date=YYYY-MM-DD/weather_forecasts.jsonl` | One row per fetched HA weather forecast (see [Passive archives](#passive-archives)) |
 | `climate_{decisions,scores,days,models}/date=YYYY-MM-DD/*.jsonl` | The [climate shadow](#climate-shadow-track-b2)'s records (only when it is enabled) |
+| `full_charge/date=YYYY-MM-DD/full_charge.jsonl` | Periodic full charge only: one row per decision, reading, state transition, outcome and pause |
 | `actuation/date=YYYY-MM-DD/actuation.jsonl` | `dry_run`/`live` only: one row per actuator tick that wrote (or would write) or changed state: kill switch, guard reasons, intent, desired and observed state, each write with its result, heartbeat, alert ([Live control](#live-control-dry_run-and-live)) |
 
 JSONL rows are appended with a single `O_APPEND` write plus `fsync`; readers skip a torn last line.
@@ -730,13 +746,13 @@ The LFP cells need a charge to 100% from time to time so that the BMS balances t
 full charge does the work and limits itself (it lifts its maximum SOC to 100%, completes on its own detection,
 restores 95% and clears the run at its day rollover); the service only arms it. **Off by default**
 (`full_charge.enabled: false` in `config/service.yaml`): with it off the actuator never reads or writes the
-entities below and the guard refuses them in every mode.
+entities below and the guard refuses them in every mode (so does `full_charge.mode: shadow`, the default).
 
 This part (the guard and the actuator) is what a `FullChargeDirective` in `ActuationContext.full_charge` drives:
-`armed` and the weekday of the run's local date. The scheduler that builds the directive (the rule, the state,
-`/status`, metrics) is separate and not yet wired, so enabling the section changes nothing until it is.
+`armed`, the weekday of the run's local date and the optional `settle_until` of the settle hold. The
+[scheduler](#periodic-full-charge-the-scheduler) builds the directive.
 
-* **Writes** (`live` with `full_charge.enabled` only; roles `full_charge_day` and `full_charge_enable`, with the
+* **Writes** (`live` with `full_charge.enabled` and `full_charge.mode: live` only; roles `full_charge_day` and `full_charge_enable`, with the
   same readback, retry, `forbidden`-never-retried and `dry_run` simulation as every other role; each only on an
   edge, never rate limited): arm = `select.select_option` to the weekday, then `switch.turn_on`, both before
   the direction on-writes of the same reconcile and each skipped when it already reads back; disarm =
@@ -760,24 +776,182 @@ This part (the guard and the actuator) is what a `FullChargeDirective` in `Actua
   `delay_switch`, `integration_status`, `refusal` (and `driven_armed` in the view): the weekly readings the
   scheduler reads. In `dry_run` the switch and the day show the simulated state.
 * **Time zone.** Omnibattery decides the weekday with the container's local time; the service writes the weekday
-  of its own `timezone`. Checking that Home Assistant's `time_zone` equals the service's is the scheduler's
-  startup check, not part of the actuator.
+  of its own `timezone`. Checking that Home Assistant's `time_zone` equals the service's is the runtime's startup
+  check ([scheduler](#periodic-full-charge-the-scheduler)), not part of the actuator.
+* **Settle hold.** A directive with `settle_until` in the future makes the actuator map the slot to the idle
+  intent (`desired.reason: settle_hold`, `view()["full_charge"]["settle_hold"]`) whatever the plan says, with the
+  weekly switch still on; the guard still wins.
 
-`full_charge:` keys (the whole schema is validated now; see the comments in `config/service.yaml`):
-`enabled`, `min_interval_days` (5), `max_interval_days` (15), `threshold_min_eur` and `threshold_scale_eur`
-(0.01), `fixed_cost_eur` (0), `target_soc_frac` (1.0), `reached_soc_pct` (99), `shortfall_penalty_eur_per_kwh`
-(10), `completion_margin_slots` (2), `arm_lead_slots` (1), `arm_before_soc_frac` (0.93), `ack_timeout_s` (90),
-`top_hold_timeout_min` (120), `taper.start_soc_frac` (0.90, `null` disables it) and `taper.power_kw` (0.2),
-`max_consecutive_failures` (3), `failure_pause_days` (5), `bootstrap_last_full` (ISO date or `null`) and
-`entities.*` (seven entity IDs, all required when enabled: the two written and the delay switch, the
-charge-delay switch and three evidence sensors, read only). Validation: `0 < min_interval_days <
-max_interval_days <= 30`; thresholds, fixed cost and penalty finite and non-negative (penalty positive);
-`0 < arm_before_soc_frac < target_soc_frac <= 1`; `taper.start_soc_frac` in (0.5, 1) and `taper.power_kw` in
-`(0, max_discharge_cap_w / 1000]`; with `enabled: true` every entity set, distinct from each other and from
-`entities` and `actuation.entities`, `planning.soc_source: entity`, and `actuation.entities.integration_status`
-and `battery_soc` set. `enabled` works in every mode; the two writable entities join the allowlist only when it
-is true and the mode is `live`. The section is excluded from the plan's config hash until the scheduler
-uses it.
+`full_charge:` keys (see the comments in `config/service.yaml`): `enabled`, `mode` (`shadow` default, or `live`:
+see the [feature mode](#periodic-full-charge-the-scheduler)), `cadence` (the table of the
+[scheduler](#periodic-full-charge-the-scheduler): `unknown` 10/14, `green` 14/28, `yellow` 7/14, `alert` 5/7 days),
+`min_comparable_readings` (4), `alert_consecutive` (2), `settle_timeout_s` (300), `threshold_min_eur` and
+`threshold_scale_eur` (0.01), `fixed_cost_eur` (0), `target_soc_frac` (1.0), `reached_soc_pct` (99),
+`shortfall_penalty_eur_per_kwh` (10), `completion_margin_slots` (2), `arm_lead_slots` (1), `arm_before_soc_frac`
+(0.93), `ack_timeout_s` (90), `top_hold_timeout_min` (120), `taper.start_soc_frac` (0.90, `null` disables it) and
+`taper.power_kw` (0.2), `max_consecutive_failures` (3), `failure_pause_days` (5), `bootstrap_last_full` (ISO date or
+`null`) and `entities.*` (ten entity IDs, all required when enabled: the two written, the delay switch and the
+charge-delay switch, and six balance sensors, read only). Validation: per cadence row `0 < min_days < max_days <=
+30` and `green.min_days >= unknown.min_days >= yellow.min_days >= alert.min_days` (a healthier battery is never
+measured more often); `min_comparable_readings >= 1`; `alert_consecutive >= 2`; `0 < settle_timeout_s <= 900`;
+thresholds, fixed cost and penalty finite and non-negative (penalty positive); `0 < arm_before_soc_frac <
+target_soc_frac <= 1`; `taper.start_soc_frac` in (0.5, 1) and `taper.power_kw` in `(0, max_discharge_cap_w / 1000]`;
+with `enabled: true` every entity set, distinct from each other and from `entities` and `actuation.entities`,
+`planning.soc_source: entity`, and `actuation.entities.integration_status` and `battery_soc` set. The balance
+sensors (`cell_delta`, `balance_status`, `last_balance_read`, `delta_trend`, `delta_avg_4w`, `balancing_mode`) may name
+the same entities as `battery_health.entities` (one entity store entry each), and where both sections name a role
+they must agree. `enabled` works in every mode; the two writable entities join the allowlist
+only when it is true and the mode is `live`. The section is excluded from the plan's config hash (a committed
+plan carries its spec in its inputs).
+
+### Periodic full charge: the scheduler
+
+Pure rule and state machine in `service/full_charge.py`, I/O in `runtime.py`; plan and
+[amendment](planning/periodic-full-charge.md#amendment-2026-11-04-success-criterion-settle-hold-and-adaptive-cadence)
+A1 to A7 are the specification, this section is how it behaves. Off with `full_charge.enabled: false`: no
+decision, no state file, no new entity read, no metric, no `/status` block.
+
+**Feature mode.** `full_charge.mode` is the feature's own switch, independent of the service `mode`: `shadow`
+(default) or `live` (`live` needs the service `mode: live`; the config refuses it otherwise). With the service
+`live` and `full_charge.mode: shadow` the feature is **isolated**: decisions are evaluated and recorded, a simulated
+run advances a simulated `L` and the state file is `writer_mode: simulated`, but the regular plan stays the plan
+of record (no commit-mode target plan, no lifted SOC clamp), the actuator is built without the feature and gets
+no directive (`ActuationContext.full_charge` is `None`: the weekly switch and select are never touched, the weekly
+status is never accepted as healthy, no readings of them), and the guard allowlist does not include the two
+entities (both raise `ForbiddenHACallError`). Nothing about the real control path changes. In service `shadow` and
+`dry_run` the feature behaves as before (simulated writer; `dry_run` also records the would-be arming writes).
+Going from feature `shadow` to `live` discards the simulated state, like `dry_run` to `live`: the first live run
+is eligible at once. `/status` has `full_charge.mode` and the metric `full_charge_mode{mode}`.
+
+**Success criterion (A1).** A run counts as a full charge **only when Omnibattery records a new valid balance
+measurement**: `last_balance_read` advances past the value seen when the run was armed and `balance_status`
+is not `unknown`. SOC 99 or 100 (or Omnibattery completing) without a new reading inside the settle window is
+`failed_reached_unmeasured`: a failed attempt, `L` not moved, never reported as balanced. A stale, missing or
+`unknown` reading is unknown, never zero imbalance. Outside a run, a new valid reading stamps `L` too (an owner's
+manual charge included); SOC at 99 alone never does. The sensors are read from the entity store, one entry
+per entity (the balance sensors are shared with `battery_health`); a reading whose status follows its timestamp
+later is accepted when the status arrives inside the window.
+
+**Cadence (A3).** `min`/`max` days since `L` come from the class of the latest valid readings, worst first:
+
+| Class | When | `min` / `max` days |
+|---|---|---|
+| `alert` | orange or red on `alert_consecutive` (2) valid readings in a row; owner alert `balance_alert`, no automatic recovery | 5 / 7 |
+| `yellow` | the latest valid reading is yellow, or a single orange or red after a better one (repeat the measurement; never an alert) | 7 / 14 |
+| `green` | `min_comparable_readings` (4) valid readings, all green, the latest not older than the green row's `max`, `delta_trend` known and not `rising` | 14 / 28 |
+| `unknown` | otherwise: no valid reading, fewer than 4, a rising or unknown trend | 10 / 14 |
+
+`d < min`: nothing (no solve). `min <= d < max`: once tomorrow's prices are published and a regular plan exists,
+one evaluation solve (`planner.evaluate_full_charge`, after the regular plan is published, in the same worker)
+prices the day; it is chosen when `forcing_cost + fixed_cost_eur <= threshold(d)` with
+`threshold(d) = threshold_min_eur + threshold_scale_eur * (d - min) / (max - d)`, and a target that misses by
+more than 0.05 kWh is declined. `d >= max`: forced, no solve. The decision is sticky for the day. Bootstrap (A4):
+no `L` yet, so `d` is the `unknown` row's `min` until that many days after enablement, so the first run is eligible
+as soon as the feature is enabled and forced `max` days after it (`enabled_at` is in the state file);
+`bootstrap_last_full` is an explicit override, and a valid reading dated after `battery.commissioned_at` is honoured
+as `L`. Overdue fallback: at the first tick of a day with no decision and `d >= max`, today is chosen (forced).
+One attempt per local day; three failures in a row pause the rule for `failure_pause_days` (alert `paused`); a new
+valid reading clears the count and the pause. `cancelled` runs (a refusal) are not failures.
+
+**States**: `idle`, `scheduled` (a day was chosen; the plan of record is the commit-mode target plan from the
+decision on), `armed` (the directive says arm; the plan allows it from local midnight of the day, one slot before
+the first charge slot or before the SOC would exceed `arm_before_soc_frac`), `charging` (`integration_status` is
+`weekly_full_charge`), `reached` (SOC at or above `reached_soc_pct`), `settling` (completion seen: status left, SOC
+100 or `top_hold_timeout_min`). Every run ends in one outcome and the machine returns to `idle` in that step:
+`done`, `done_simulated`, `failed_never_armed`, `failed_unacknowledged` (no `weekly_full_charge` within
+`ack_timeout_s` of the arm being driven; a guard-failure safe idle does not start that clock),
+`failed_never_reached` (day over, or the status left below 97% peak: aborted), `failed_reached_unmeasured`,
+`cancelled`.
+
+**Settle hold (A2).** After completion the directive carries `settle_until = completion + settle_timeout_s`
+(300 s). Until then the actuator holds the existing idle intent (no charge, no discharge, neutral PD target,
+`reason: settle_hold`) and the weekly switch stays on; the scheduler ends the hold by a new reading (`done`) or at
+the deadline (`failed_reached_unmeasured`) and the same reconcile turns the switch off and resumes the plan.
+The hold is a field of the directive; it needs no entity and no service call, is subject to the kill switch and the
+guard (a guard-failure safe idle is idle anyway) and survives a restart (the deadline is in the state file). Whether
+Omnibattery records its reading before the weekly switch goes off is verified on the supervised run.
+
+**Gating.** At startup the runtime reads HA's `time_zone` (`GET /api/config`); a mismatch with the service's
+`timezone` suspends the feature (hands off, alert `timezone_mismatch`), an unanswered check keeps it suspended and
+is retried every 60 s. Once synced, the weekly switch, day select (seven weekdays in `options`) and delay switch must
+exist (`entities_missing` otherwise, self-healing). While suspended or before the first step after a sync the
+runtime passes **no** directive to the actuator (it never disarms a running run by accident after a restart).
+
+**State and restart.** `state/full_charge.json` (atomic replace, `0600`, `writer_mode`) holds knowledge and a
+calendar decision, never a plan: `L` and its source (`balance_reading`, `simulated`, `bootstrap`), the recent readings,
+the trend, the run (day, decision, armed/completed instants, SOC peak, settle deadline), failure counters, the pause.
+After a restart the directive is re-derived from the state, a plan solved by this process and the guard; the writes
+are idempotent and a persisted `armed` alone writes nothing. A corrupt or invalid file is renamed
+`full_charge.json.corrupt-<UTC time>` and the bootstrap runs; an unwritable file raises `state_unwritable` and keeps
+the state in memory. A state of the other writer (below) is discarded: the first `live` start bootstraps the real
+`L` (a reading after commissioning is honoured again), and so does a return to `dry_run`.
+
+**`shadow` and `dry_run`** use the simulated writer: decisions, plans and (dry_run) the would-be arm writes are
+recorded, nothing is sent and nothing runs on the battery; a simulated run ends as `done_simulated` at the end of its
+day and moves a simulated `L` (the actuator's refusals still cancel it, except `kill_switch_off`, which only a live
+run needs). Real readings still stamp `L`.
+
+**Records** (`full_charge/date=.../full_charge.jsonl`, append-only, one row per event): `bootstrap`, `reading`,
+`last_full`, `decision` (day, `d`, class, bounds, forced, overdue, accepted, `forcing_cost_eur`, `vs_normal_eur`,
+the normal, lifted and target objectives, threshold, shortfall, checkpoint slot, solver summaries), `transition`
+(with the evidence sensors: SOC, cell delta, 4-reading average, balancing mode, weekly switch and day, delay
+switches, `integration_status`), `outcome` (with the run), `paused`.
+
+**`/status` `full_charge`** (only when enabled): `mode`, `state`, `suspended`, `writer`, `last_full_at`,
+`last_full_local_date`, `last_full_source`, `days_since`, `cadence` (class, `min_days`, `max_days`, trend, valid
+readings), `next_eligible_day`, `forced_after_day`, `readings`, `run`, `last_decision`, `last_outcome`,
+`consecutive_failures`, `paused_until`, `alerts`, `state_problem`, `time_zone`, `entities_problem`, `directive`,
+`evidence` and the actuator's `full_charge` view.
+
+**Metrics** (`battery_optimizer_full_charge_*`, only when enabled): `state{state}` (one-hot), `days_since_last`,
+`last_timestamp_seconds`, `scheduled_day_timestamp_seconds`, `forcing_cost_eur`, `threshold_eur`,
+`soc_peak_percent`, `cadence_class{class}`, `cadence_min_days`, `cadence_max_days`, `alert{reason}` (`delay_switch_on`,
+`timezone_mismatch`, `entities_missing`, `never_reached`, `unacknowledged`, `reached_unmeasured`, `balance_alert`,
+`paused`, `state_unwritable`), `runs_total{outcome}`; the actuator's `writes_total` covers the two new roles.
+Suggested homelab alerts: `full_charge_alert == 1` for 5 m; `full_charge_days_since_last >
+full_charge_cadence_max_days + 0.5`.
+
+**Acceptance** (plan, A7): at least 7 days of `dry_run` on the installation (decisions, `forcing_cost`
+distribution, the planned arming writes, no sends), a **supervised first live run** with the owner and the kill
+switch (check that no `omnibattery` setup line appears in the HA log when the switch and select change, record the
+taper timeline and the time from completion to the reading), and the homelab watchdog follow-up before unattended
+use. Configuration to enable it: [Enabling](#enabling-the-periodic-full-charge).
+
+#### Enabling the periodic full charge
+
+Only the keys that differ from the committed defaults go into the deployed `service.yaml` (homelab); the
+committed `config/service.yaml` names the installation's entities and `planning.soc_source: entity` is already the
+deployed one.
+
+The service stays in `mode: live` for normal battery control; `full_charge.mode` decides whether the feature
+only simulates or acts.
+
+(a) Live control, feature in shadow (decisions and simulated runs recorded under `full_charge/` and in
+`state/full_charge.json`; the plan of record, the actuator and the guard are unchanged; run it for at least 7 days):
+
+```yaml
+mode: live
+full_charge:
+  enabled: true
+  mode: shadow
+```
+
+(b) Live control, feature live (after (a), with the owner present for the first run and the homelab watchdog
+extended to the weekly switch; the guard then admits exactly the weekly switch and its day select besides the
+existing allowlist):
+
+```yaml
+mode: live
+full_charge:
+  enabled: true
+  mode: live
+```
+
+`full_charge.mode` defaults to `shadow`, so (a) is `enabled: true` alone. Going from (a) to (b) discards the
+simulated state and bootstraps the real `L` (the first live run is eligible at once and forced 14 days after
+enablement; set `full_charge.bootstrap_last_full` to an ISO date to override). Setting `enabled: false` again hands
+the weekly entities back: the service stops reading and writing them. A `dry_run` service also simulates the
+feature (and stops live battery control), but is no longer needed for the decision study.
 
 ### Battery health telemetry
 
@@ -787,7 +961,7 @@ existing `state_changed` stream and the `get_states` resync, nothing else: there
 call and no change to `ha_guard`. The tracker (`service/battery_health.py`) is a pure state machine; the
 runtime feeds it each accepted or refreshed observation and a 30 s tick, and reads it for `/status` and the
 metrics. It informs only; the periodic full charge scheduler
-([plan](planning/periodic-full-charge.md)) will read the same fields.
+([plan](planning/periodic-full-charge.md)) reads the same entity store entries, not this tracker.
 
 | Key | Meaning |
 |---|---|
@@ -857,7 +1031,8 @@ group; see [`extract`](cli.md#extract-the-battery-health-group).
   switches and the power-limit switch, `number.set_value` on the PD grid target (`value` in `[0,
   import_cap_w]`) and the system discharge cap (`value` in `[min_discharge_cap_w, max_discharge_cap_w]`, so
   never the `0` that means unlimited), and `input_datetime.set_datetime` (`timestamp`) on the heartbeat. With
-  `full_charge.enabled` also `switch.turn_on`/`turn_off` on the Omnibattery weekly-full-charge switch and
+  `full_charge.enabled` and `full_charge.mode: live` also `switch.turn_on`/`turn_off` on the Omnibattery
+  weekly-full-charge switch and
   `select.select_option` on its day select, `service_data` exactly `{"option": <one of the seven lower-case
   weekdays>}` ([ADR-0007 amendment](adr/0007-live-battery-control.md#amendment-2026-11-04-periodic-full-charge));
   its delay switch, the charge-delay switch, the cutoff numbers and any button stay refused. A list

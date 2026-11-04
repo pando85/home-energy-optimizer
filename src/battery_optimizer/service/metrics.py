@@ -188,6 +188,69 @@ class _RuntimeCollector(Collector):
         actuator = snap.get("actuator")
         if actuator is not None:
             yield from _actuator_families(actuator)
+        full_charge = snap.get("full_charge")
+        if full_charge is not None:
+            yield from _full_charge_families(full_charge)
+
+
+def _full_charge_families(f: dict[str, Any]) -> Iterable[Metric]:
+    """The periodic full charge's scrape-time gauges (``battery_optimizer_full_charge_``)."""
+    from .config import FULL_CHARGE_MODES
+    from .full_charge import ALERT_REASONS, CADENCE_CLASSES, STATES
+
+    name = f"{PREFIX}_full_charge"
+
+    def gauge(suffix: str, doc: str, value: float | None) -> GaugeMetricFamily:
+        family = GaugeMetricFamily(f"{name}_{suffix}", doc, labels=[])
+        if value is not None:
+            family.add_metric([], float(value))
+        return family
+
+    mode = GaugeMetricFamily(
+        f"{name}_mode",
+        "1 for full_charge.mode (shadow simulates, live arms Omnibattery)",
+        labels=["mode"],
+    )
+    for m in FULL_CHARGE_MODES:
+        mode.add_metric([m], 1.0 if m == f.get("mode") else 0.0)
+    yield mode
+    state = GaugeMetricFamily(f"{name}_state", "1 for the scheduler's state", labels=["state"])
+    for s in STATES:
+        state.add_metric([s], 1.0 if s == f.get("state") else 0.0)
+    yield state
+    yield gauge(
+        "days_since_last",
+        "Local days since the last full charge (absent until one is known)",
+        f.get("days_since"),
+    )
+    yield gauge(
+        "last_timestamp_seconds",
+        "Unix time of the last full charge (a new valid balance reading, or a simulated run)",
+        f.get("last_timestamp"),
+    )
+    yield gauge(
+        "scheduled_day_timestamp_seconds",
+        "Unix time of the start of the local day a run is scheduled for (absent: none)",
+        f.get("scheduled_day_timestamp"),
+    )
+    yield gauge(
+        "forcing_cost_eur", "Forcing cost of the last priced decision (EUR)", f.get("forcing_cost")
+    )
+    yield gauge("threshold_eur", "Threshold of the last priced decision (EUR)", f.get("threshold"))
+    yield gauge("soc_peak_percent", "Peak SOC of the current or last run", f.get("soc_peak_pct"))
+    cadence = GaugeMetricFamily(
+        f"{name}_cadence_class", "1 for the active cadence class", labels=["class"]
+    )
+    for c in CADENCE_CLASSES:
+        cadence.add_metric([c], 1.0 if c == f.get("cadence_class") else 0.0)
+    yield cadence
+    yield gauge("cadence_min_days", "Never before this many days after the last", f.get("min_days"))
+    yield gauge("cadence_max_days", "Forced this many days after the last", f.get("max_days"))
+    alerts = set(f.get("alerts") or ())
+    alert = GaugeMetricFamily(f"{name}_alert", "1 for each active alert", labels=["reason"])
+    for reason in ALERT_REASONS:
+        alert.add_metric([reason], 1.0 if reason in alerts else 0.0)
+    yield alert
 
 
 def _health_families(h: dict[str, Any]) -> Iterable[Metric]:
@@ -444,7 +507,11 @@ def _climate_families(c: dict[str, Any]) -> Iterable[Metric]:
 
 class ServiceMetrics:
     def __init__(
-        self, snapshot: Callable[[], dict[str, Any]] | None = None, *, actuation: bool = False
+        self,
+        snapshot: Callable[[], dict[str, Any]] | None = None,
+        *,
+        actuation: bool = False,
+        full_charge: bool = False,
     ) -> None:
         # ``*_created`` series double the exposition for no use here (process-wide switch).
         disable_created_metrics()
@@ -602,6 +669,8 @@ class ServiceMetrics:
             self.shadow_actual_energy.labels(direction=direction)
         if actuation:  # dry_run / live only: the shadow exposition stays as it was
             self._register_actuation()
+        if full_charge:  # only with the feature enabled
+            self._register_full_charge()
         if snapshot is not None:
             r.register(_RuntimeCollector(snapshot))
 
@@ -648,6 +717,18 @@ class ServiceMetrics:
             self.actuator_safe_idles.labels(reason=reason)
         for result in ("ok", "failed", "dry_run"):
             self.actuator_heartbeats.labels(result=result)
+
+    def _register_full_charge(self) -> None:
+        from .full_charge import OUTCOMES
+
+        self.full_charge_runs = Counter(
+            f"{PREFIX}_full_charge_runs",
+            "Periodic full-charge runs by outcome",
+            ["outcome"],
+            registry=self.registry,
+        )
+        for outcome in OUTCOMES:
+            self.full_charge_runs.labels(outcome=outcome)
 
     def render(self) -> bytes:
         return generate_latest(self.registry)

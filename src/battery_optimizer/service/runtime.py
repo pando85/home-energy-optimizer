@@ -56,6 +56,18 @@ read-only by construction (:mod:`.ha_guard`; its single exception is the
 On start, after every reconnect and whenever an input is stale, no decision is taken
 until a fresh, complete snapshot exists; a persisted plan is never resumed.
 
+Periodic full charge
+--------------------
+With ``full_charge.enabled`` the pure scheduler (:mod:`.full_charge`) decides on which day
+Omnibattery's weekly full charge runs.  The runtime owns the I/O around it: a 10 s loop builds an
+observation from the entity store and the actuator, steps the scheduler and hands the actuator its
+directive (nothing until the first step after a Home Assistant sync and none while suspended: the
+feature is hands-off then); after a regular plan is published, one evaluation solve prices tomorrow
+(:func:`~.planner.evaluate_full_charge`); once a day is chosen the snapshot carries a ``commit``
+spec until the run ends.  State and records go to the sink; ``shadow`` and ``dry_run`` use the
+simulated writer (nothing runs on the battery).  A time zone check against Home Assistant's
+``get_config`` gates the feature.
+
 Live control (ADR-0007)
 -----------------------
 In ``dry_run`` and ``live`` an :class:`~.actuator.Actuator` maps the intent frozen for the
@@ -90,27 +102,40 @@ from .archive import (
     retry_delay_s,
     weather_forecast_record,
 )
-from .battery_health import BatteryHealth, HealthParams
+from .battery_health import BatteryHealth, HealthParams, parse_text, parse_timestamp
 from .climate_shadow import ClimateShadowJob, build_job, latest_forecast, next_run_time
 from .clock import Clock
 from .config import ServiceConfig
 from .entity_store import EntityState, EntityStore, UpdateResult
+from .full_charge import (
+    ALERT_REASONS,
+    COMMIT_STATES,
+    REFUSAL_ALERTS,
+    FullChargeScheduler,
+    FullChargeState,
+    Observation,
+    PlanSlot,
+    arm_due,
+    day_window,
+)
 from .ha_client import HACommandError, HARestClient, HAWebSocketClient, WSTransport
 from .ha_guard import actuation_allowlist
 from .history import ForecastUnavailableError, LoadHistory, forecast_load
 from .metrics import ServiceMetrics
 from .observer import SlotMeasurements, SlotObserver, normalise_value
 from .planner import (
+    FullChargeSpec,
     PlanningSnapshot,
     PlanResult,
     ShadowIntent,
     battery_spec_from_tariff,
     clamp_soc,
+    evaluate_full_charge,
     run_planner,
 )
 from .pvpc import PriceCurve, PriceParseError, parse_pvpc_state
 from .sink import ShadowSink
-from .timegrid import floor_slot, local_date, next_slot_boundary
+from .timegrid import floor_slot, local_date, local_day_bounds_utc, next_slot_boundary
 from .virtual_battery import SlotStep, intent_energy_kwh, soc_violation, step_virtual_battery
 
 __all__ = ["NotReadyError", "Readiness", "ShadowService"]
@@ -131,6 +156,10 @@ _PLAN_MEMORY = 16
 _ADOPT_RETRY_S = 15.0
 #: Period of the battery-health clock advance (well inside ``battery_health.max_gap_s``).
 _HEALTH_TICK_S = 30.0
+#: Period of the periodic full charge's observation loop (inside ``ack_timeout_s``).
+_FULL_CHARGE_TICK_S = 10.0
+#: Retry period of the Home Assistant time-zone check.
+_TZ_CHECK_RETRY_S = 60.0
 #: Longest the startup catch-up of the climate shadow waits for the first Home Assistant sync.
 CLIMATE_SYNC_TIMEOUT_S = 60.0
 
@@ -261,6 +290,17 @@ class ShadowService:
                     max_gap_s=health_cfg.max_gap_s,
                 )
             )
+        # The periodic full charge reads its balance sensors, the weekly entities and Omnibattery's
+        # status; an entity named by battery_health too keeps one store entry (dict.fromkeys).
+        fc_cfg = config.full_charge
+        full_charge_entities = (
+            (
+                *fc_cfg.entities.all(),
+                *(e for e in (config.actuation.entities.integration_status,) if e),
+            )
+            if fc_cfg.enabled
+            else ()
+        )
         self.store = EntityStore.for_entities(
             tuple(
                 dict.fromkeys(
@@ -269,6 +309,7 @@ class ShadowService:
                         *climate_entities,
                         *actuation_entities,
                         *self._health_roles,
+                        *full_charge_entities,
                     )
                 )
             )
@@ -277,7 +318,9 @@ class ShadowService:
         self.store.add_listener(self.observer.on_state)
         self.store.add_listener(self._on_state)
 
-        self.metrics = ServiceMetrics(snapshot=self.metric_snapshot, actuation=acting)
+        self.metrics = ServiceMetrics(
+            snapshot=self.metric_snapshot, actuation=acting, full_charge=fc_cfg.enabled
+        )
         from battery_optimizer import __version__
 
         self.metrics.build_info.labels(
@@ -341,6 +384,18 @@ class ShadowService:
         self.virtual_soc_origin: str | None = None
         self._init_virtual_battery()
 
+        # Periodic full charge (off by default).  ``_fc_directive`` is ``None`` (hands off) until
+        # first step after a sync, and while the feature is suspended.
+        self.full_charge: FullChargeScheduler | None = None
+        self._fc_directive: Any = None
+        self._fc_alerts: set[str] = set()  # runtime-owned alerts (the scheduler owns the rest)
+        self._fc_state_problem: str | None = None
+        self._fc_tz_ok: bool | None = None
+        self._fc_ha_time_zone: str | None = None
+        self._fc_entities_problem: str | None = None
+        self._fc_save_failed = False
+        self._init_full_charge()
+
         self._climate_sync_timeout_s = climate_sync_timeout_s
         self._ha_synced = asyncio.Event()  # set by the first HA sync; the catch-up run waits on it
         self.climate: ClimateShadowJob | None = None
@@ -361,6 +416,10 @@ class ShadowService:
                 refresh=self._refresh_entities,
                 record=self._record_actuation,
                 metrics=self.metrics,
+                # With the feature in shadow beside live control the actuator never hears of it:
+                # the weekly entities are never touched and the weekly status is never healthy.
+                full_charge=None if config.full_charge_isolated else config.full_charge,
+                tz=self._tz,
             )
         self._climate_factory = climate_job_factory or (
             lambda: build_job(
@@ -390,6 +449,10 @@ class ShadowService:
             self._tasks.append(asyncio.create_task(self._climate_loop(), name="climate-shadow"))
         if self.health is not None:
             self._tasks.append(asyncio.create_task(self._health_loop(), name="battery-health"))
+        if self.full_charge is not None:
+            self._tasks.append(
+                asyncio.create_task(self._full_charge_loop(), name="full-charge-scheduler")
+            )
         if self.actuator is not None:
             self._actuator_task = asyncio.create_task(self._actuator_loop(), name="actuator")
 
@@ -933,12 +996,20 @@ class ShadowService:
         soc_raw, soc_at, soc_source = self._soc_now(now)
         if soc_raw is None:
             raise NotReadyError("soc_stale", "SOC unavailable at snapshot time")
-        soc, clamped = clamp_soc(soc_raw, self.tariff)
+        commit_window = self._commit_window(starts)
+        soc, clamped = clamp_soc(
+            soc_raw,
+            self.tariff,
+            # A run pending inside the snapshot: a measured 98% is not planned as 95%.
+            ceiling_frac=1.0 if commit_window is not None and commit_window[0] == 0 else None,
+        )
         terminal, terminal_source = self._terminal_value()
         if terminal is None:
             raise NotReadyError("prices_missing", "no terminal value")
         try:
-            spec, import_limit, _ = battery_spec_from_tariff(self.tariff, soc)
+            # The spec's initial SOC stays inside the window; the snapshot carries a lifted SOC.
+            window_max = float(self.tariff.battery.soc_window_max or 1.0)
+            spec, import_limit, _ = battery_spec_from_tariff(self.tariff, min(soc, window_max))
         except ValueError as exc:
             raise NotReadyError("tariff_invalid", str(exc)) from exc
         self._plan_sequence += 1
@@ -970,6 +1041,9 @@ class ShadowService:
             config_hash=self.config.config_hash(),
             forecast_meta=forecast.meta,
             price_meta=self.price_curve.summary(),
+            full_charge=None
+            if commit_window is None
+            else self._full_charge_spec(spec.soc_max_frac, commit_window, "commit"),
         )
 
     def _worker_finished(self, generation: int) -> None:
@@ -1099,6 +1173,7 @@ class ShadowService:
             "solver_status": result.solver.get("status"),
         }
         await self._write(self.sink.write_plan, result.to_record())
+        await self._after_solve_full_charge(snapshot, result)
         return "ok"
 
     # ------------------------------------------------------------------ decisions
@@ -1551,6 +1626,456 @@ class ShadowService:
                 delay = 5.0
             await self.clock.sleep(delay)
 
+    # ------------------------------------------------------------------ periodic full charge
+
+    def _init_full_charge(self) -> None:
+        """Load the scheduler's state (bootstrap when missing or corrupt); off unless enabled."""
+        cfg = self.config.full_charge
+        if not cfg.enabled:
+            return
+        now = self.clock.now()
+        raw, problem = self.sink.load_full_charge(now)
+        state: FullChargeState | None = None
+        if raw is not None:
+            try:
+                state = FullChargeState.from_json(raw)
+            except (ValueError, KeyError, TypeError, AssertionError) as exc:
+                problem = f"invalid: {exc}"
+                self.sink.quarantine_full_charge(now)
+        if problem is not None:
+            self._fc_state_problem = problem
+            log.warning("full-charge state not usable, bootstrapping problem=%s", problem)
+        earliest = None
+        if self.config.source_path:
+            from battery_optimizer.battery_telemetry import load_battery_telemetry
+
+            with contextlib.suppress(ValueError, OSError):
+                earliest = load_battery_telemetry(self.config.source_path).commissioned_at
+        self.full_charge = FullChargeScheduler(
+            cfg,
+            self._tz,
+            writer_mode=self.config.full_charge_writer_mode,
+            now=now,
+            state=state,
+            earliest_reading=earliest,
+        )
+        # No decision, evaluation or commit plan until Home Assistant's time zone is verified.
+        self.full_charge.suspend("timezone_unverified")
+        if self.full_charge.reset_reason:
+            log.info("full-charge state discarded reason=%s", self.full_charge.reset_reason)
+
+    def _commit_window(self, starts: tuple[datetime, ...]) -> tuple[int, int] | None:
+        """The run's day in a snapshot's slots while its target plan is the plan of record."""
+        fc = self.full_charge
+        if fc is None or fc.suspended is not None or fc.state.state not in COMMIT_STATES:
+            return None
+        if self.config.full_charge_isolated:
+            return None  # feature shadow beside live control: the regular plan stays the plan
+        run = fc.state.run
+        assert run is not None
+        margin = self.config.full_charge.completion_margin_slots
+        return day_window(starts, run.day, self._tz, margin)
+
+    def _full_charge_spec(
+        self, ceiling_before_frac: float, window: tuple[int, int], mode: str
+    ) -> FullChargeSpec:
+        cfg = self.config.full_charge
+        return FullChargeSpec(
+            mode=mode,  # type: ignore[arg-type]
+            window_start=window[0],
+            checkpoint_end=window[1],
+            ceiling_before_frac=ceiling_before_frac,
+            target_soc_frac=cfg.target_soc_frac,
+            shortfall_penalty_eur_per_kwh=cfg.shortfall_penalty_eur_per_kwh,
+            taper_start_soc_frac=cfg.taper.start_soc_frac,
+            taper_power_kw=cfg.taper.power_kw,
+        )
+
+    async def _after_solve_full_charge(
+        self, snapshot: PlanningSnapshot, result: PlanResult
+    ) -> None:
+        """After the regular plan is published: note a committed plan, or price tomorrow once.
+
+        The evaluation is a separate worker job so the plan of record is never delayed by it; any
+        failure is recorded and retried at the next solve.
+        """
+        fc = self.full_charge
+        if fc is None:
+            return
+        if snapshot.full_charge is not None:
+            fc.note_plan(result.plan_id)
+            if "full_charge_error" in result.solver:
+                log.warning(
+                    "full-charge commit solve failed: %s", result.solver["full_charge_error"]
+                )
+            return
+        now = self.clock.now()
+        tomorrow = bool(self.price_curve and self.price_curve.tomorrow_published)
+        day = fc.evaluation_wanted(now, tomorrow)
+        if day is None:
+            return
+        margin = self.config.full_charge.completion_margin_slots
+        window = day_window(snapshot.slot_starts, day, self._tz, margin)
+        if window is None or self._worker_busy:
+            return
+        spec = self._full_charge_spec(snapshot.spec.soc_max_frac, window, "evaluate")
+        loop = asyncio.get_running_loop()
+        generation = self._generation
+        self._worker_busy = True
+        future = self._executor.submit(
+            evaluate_full_charge, replace(snapshot, full_charge=spec), result
+        )
+
+        def _done(_f: Any, gen: int = generation) -> None:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._worker_finished, gen)
+
+        future.add_done_callback(_done)
+        try:
+            evaluation = await asyncio.wait_for(
+                asyncio.wrap_future(future), timeout=self.config.planning.solve_timeout_s
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an evaluation never costs the plan; retried
+            detail = f"{type(exc).__name__}: {exc}"[:500]
+            log.warning("full-charge evaluation failed day=%s error=%s", day.isoformat(), detail)
+            await self._record_event(
+                "full_charge_evaluation_failed", {"day": day.isoformat(), "error": detail}
+            )
+            return
+        if generation != self._generation:
+            return
+        fc.record_evaluation(day, evaluation.to_dict(), self.clock.now())
+        await self._fc_flush(self.clock.now())
+
+    # -- gating --------------------------------------------------------------------------------
+
+    async def verify_ha_timezone(self) -> bool | None:
+        """One check of Home Assistant's ``time_zone`` against the service's (``None``: no answer).
+
+        Omnibattery decides the weekday with the container's local time, which Home Assistant
+        reports as ``time_zone``: a different one would arm the wrong day, so the feature stays
+        suspended and alerts.
+        """
+        if self.rest is None:
+            return None
+        try:
+            config = await self.rest.get_config()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - retried by the caller
+            log.warning("full-charge time-zone check failed: %s", exc)
+            return None
+        zone = config.get("time_zone") if isinstance(config, Mapping) else None
+        self._fc_ha_time_zone = zone if isinstance(zone, str) else None
+        self._fc_tz_ok = zone == self.config.timezone
+        if self._fc_tz_ok:
+            self._fc_alerts.discard("timezone_mismatch")
+            log.info("full-charge time zone verified time_zone=%s", zone)
+        else:
+            self._fc_alerts.add("timezone_mismatch")
+            log.error(
+                "full-charge disabled: Home Assistant time_zone=%r differs from the service's %r",
+                zone,
+                self.config.timezone,
+            )
+            await self._record_event(
+                "full_charge_timezone_mismatch",
+                {"ha_time_zone": zone, "service_time_zone": self.config.timezone},
+            )
+        return self._fc_tz_ok
+
+    def _entities_problem(self) -> str | None:
+        """The weekly-charge contract on the entities as Home Assistant reports them."""
+        from .ha_guard import WEEKDAY_OPTIONS
+
+        f = self.config.full_charge.entities
+        for name in ("enable_switch", "day_select", "delay_switch"):
+            state = self.store.get(getattr(f, name))
+            if state is None or not state.available:
+                return f"{name} missing or unavailable"
+        day = self.store.get(f.day_select)
+        options = day.attributes.get("options") if day is not None else None
+        if not isinstance(options, list) or not set(WEEKDAY_OPTIONS) <= set(map(str, options)):
+            return "day_select does not offer the seven weekdays"
+        return None
+
+    def _update_full_charge_suspension(self, synced: bool) -> None:
+        fc = self.full_charge
+        assert fc is not None
+        reason: str | None = None
+        if self._fc_tz_ok is False:
+            reason = "timezone_mismatch"
+        elif self._fc_tz_ok is None:
+            reason = "timezone_unverified"
+        else:
+            if synced:
+                self._fc_entities_problem = self._entities_problem()
+            if self._fc_entities_problem:
+                reason = "entities_missing"
+        if reason != fc.suspended:
+            log.log(
+                logging.WARNING if reason else logging.INFO,
+                "full-charge %s reason=%s detail=%s",
+                "suspended" if reason else "resumed",
+                reason or fc.suspended,
+                self._fc_entities_problem or "-",
+            )
+        fc.suspend(reason)
+
+    # -- the loop ------------------------------------------------------------------------------
+
+    async def _full_charge_loop(self) -> None:
+        while self._fc_tz_ok is None:
+            if await self.verify_ha_timezone() is not None:
+                break
+            await self.clock.sleep(_TZ_CHECK_RETRY_S)
+        while True:
+            try:
+                await self.full_charge_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the loop must survive one bad tick
+                log.exception("full-charge tick failed")
+            await self.clock.sleep(_FULL_CHARGE_TICK_S)
+
+    async def full_charge_tick(self) -> None:
+        """Step the scheduler once and hand the actuator its directive."""
+        fc = self.full_charge
+        if fc is None:
+            return
+        now = self.clock.now()
+        synced = self.ha is not None and self.ha.stats.synced
+        self._update_full_charge_suspension(synced)
+        if not synced and fc.suspended is None:
+            return  # nothing observed is trustworthy; the directive stays as it was
+        directive = fc.step(self._full_charge_observation(now))
+        isolated = self.config.full_charge_isolated  # never a directive: nothing is driven
+        new = None if fc.suspended is not None or isolated else directive
+        if new != self._fc_directive:
+            self._fc_directive = new
+            self._wake_actuator()
+        await self._fc_flush(now)
+
+    def _full_charge_observation(self, now: datetime) -> Observation:
+        fc = self.full_charge
+        assert fc is not None
+        e = self.config.full_charge.entities
+
+        def text(entity: str | None) -> str | None:
+            state = self.store.get(entity)
+            return parse_text(state.state) if state is not None else None
+
+        soc, _, _ = self._soc_now(now)
+        status = text(self.config.actuation.entities.integration_status)
+        balance = text(e.balance_status)
+        trend = text(e.delta_trend)
+        read_state = self.store.get(e.last_balance_read)
+        driven = refusal = None
+        if self.actuator is not None:
+            refusal = self.actuator.full_charge_refusal
+            desired = self.actuator.desired
+            driven = desired is not None and desired.full_charge_armed is True
+        tomorrow = bool(self.price_curve and self.price_curve.tomorrow_published)
+        return Observation(
+            now=now,
+            soc_pct=None if soc is None else soc * 100.0,
+            integration_status=status,
+            read_at=parse_timestamp(read_state.state) if read_state is not None else None,
+            balance_status=None if balance is None else balance.lower(),
+            delta_trend=None if trend is None else trend.lower(),
+            driven_armed=driven,
+            refusal=refusal,
+            tomorrow_published=tomorrow,
+            arm_due=self._full_charge_arm_due(now),
+            evidence=self._full_charge_evidence(soc),
+        )
+
+    def _full_charge_arm_due(self, now: datetime) -> bool:
+        fc = self.full_charge
+        assert fc is not None
+        run = fc.state.run
+        if run is None or fc.state.state != "scheduled" or not self.plans:
+            return False
+        plan = self.plans[-1]
+        if plan.plan.is_expired(now):
+            return False
+        cfg = self.config.full_charge
+        return arm_due(
+            now,
+            local_day_bounds_utc(run.day, self._tz)[0],
+            [PlanSlot(i.valid_from, i.mode == "charge", i.soc_target_frac) for i in plan.intents],
+            interval_seconds=self._interval,
+            arm_lead_slots=cfg.arm_lead_slots,
+            arm_before_soc_frac=cfg.arm_before_soc_frac,
+        )
+
+    def _full_charge_evidence(self, soc: float | None) -> dict[str, Any]:
+        """Read-only sensors recorded next to a transition or an outcome."""
+        e = self.config.full_charge.entities
+
+        def raw(entity: str | None) -> str | None:
+            state = self.store.get(entity)
+            return state.state if state is not None and state.available else None
+
+        def number(entity: str | None) -> float | None:
+            state = self.store.get(entity)
+            return state.numeric() if state is not None else None
+
+        return {
+            "soc_pct": None if soc is None else round(soc * 100.0, 2),
+            "cell_delta_mv": number(e.cell_delta),
+            "delta_avg_4w_mv": number(e.delta_avg_4w),
+            "balancing_mode": raw(e.balancing_mode),
+            "weekly_switch": raw(e.enable_switch),
+            "weekly_day": raw(e.day_select),
+            "delay_switch": raw(e.delay_switch),
+            "charge_delay_switch": raw(e.charge_delay_switch),
+            "integration_status": raw(self.config.actuation.entities.integration_status),
+        }
+
+    async def _fc_flush(self, now: datetime) -> None:
+        """Log and record the scheduler's events, count outcomes, save the state when it changed."""
+        fc = self.full_charge
+        assert fc is not None
+        replan = False
+        for event in fc.drain_events():
+            kind = event["event"]
+            if kind == "decision":
+                log.info(
+                    "full-charge decision day=%s d=%s class=%s forced=%s accepted=%s "
+                    "forcing_cost=%s vs_normal=%s threshold=%s shortfall=%s checkpoint=%s",
+                    event["day"],
+                    event["d"],
+                    event["cadence_class"],
+                    event["forced"],
+                    event["accepted"],
+                    _fmt(event.get("forcing_cost_eur"), 4),
+                    _fmt(event.get("vs_normal_eur"), 4),
+                    _fmt(event.get("threshold_eur"), 4),
+                    _fmt(event.get("shortfall_kwh"), 3),
+                    event.get("checkpoint_slot") or "-",
+                )
+            elif kind == "transition":
+                log.info(
+                    "full-charge state %s -> %s reason=%s day=%s",
+                    event["from_state"],
+                    event["to_state"],
+                    event["reason"],
+                    event["day"],
+                )
+                replan = replan or event["to_state"] in ("scheduled", "idle")
+            elif kind == "outcome":
+                self.metrics.full_charge_runs.labels(outcome=event["outcome"]).inc()
+                log.log(
+                    logging.INFO if event["outcome"].startswith("done") else logging.WARNING,
+                    "full-charge outcome=%s reason=%s day=%s soc_peak=%s",
+                    event["outcome"],
+                    event["reason"],
+                    event["day"],
+                    _fmt(event.get("soc_peak_pct"), 1),
+                )
+            elif kind == "paused":
+                log.warning("full-charge paused until %s", event["paused_until"])
+            await self._write(self.sink.append_full_charge, now, event)
+        if fc.dirty:
+            fc.dirty = False
+            await self._save_full_charge()
+        if replan:
+            self._request_replan("full_charge")
+
+    async def _save_full_charge(self) -> None:
+        fc = self.full_charge
+        assert fc is not None
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(self._io, self.sink.save_full_charge, fc.state.to_json())
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._fc_save_failed = True
+            self.sink.write_errors += 1
+            self.metrics.sink_errors.inc()
+            log.error("full-charge state not saved: %s", exc)
+        else:
+            self._fc_save_failed = False
+
+    def _full_charge_alerts(self, now: datetime) -> set[str]:
+        fc = self.full_charge
+        assert fc is not None
+        alerts = fc.alerts(now) | self._fc_alerts
+        if self._fc_entities_problem and fc.suspended == "entities_missing":
+            alerts.add("entities_missing")
+        if self._fc_save_failed:
+            alerts.add("state_unwritable")
+        refusal = self.actuator.full_charge_refusal if self.actuator is not None else None
+        alert = REFUSAL_ALERTS.get(refusal) if refusal is not None else None
+        if alert:
+            alerts.add(alert)
+        return alerts & set(ALERT_REASONS)
+
+    def _full_charge_metric(self, now: datetime) -> dict[str, Any]:
+        fc = self.full_charge
+        assert fc is not None
+        view = fc.view(now)
+        st = fc.state
+        run = st.run
+        decision = st.last_decision or {}
+        threshold = decision.get("threshold_eur")
+        finite = threshold is not None and abs(threshold) != float("inf")
+        return {
+            "mode": self.config.full_charge.mode,
+            "state": st.state,
+            "days_since": view["days_since"],
+            "last_timestamp": None if st.last_full_at is None else st.last_full_at.timestamp(),
+            "scheduled_day_timestamp": local_day_bounds_utc(run.day, self._tz)[0].timestamp()
+            if run is not None
+            else None,
+            "forcing_cost": decision.get("forcing_cost_eur"),
+            "threshold": threshold if finite else None,
+            "soc_peak_pct": run.soc_peak_pct
+            if run is not None
+            else (st.last_outcome or {}).get("soc_peak_pct"),
+            "cadence_class": view["cadence"]["class"],
+            "min_days": view["cadence"]["min_days"],
+            "max_days": view["cadence"]["max_days"],
+            "alerts": sorted(self._full_charge_alerts(now)),
+        }
+
+    def _full_charge_status(self, now: datetime) -> dict[str, Any]:
+        fc = self.full_charge
+        assert fc is not None
+        actuator = self.actuator.view().get("full_charge") if self.actuator is not None else None
+        directive = self._fc_directive
+        return {
+            "enabled": True,
+            "mode": self.config.full_charge.mode,
+            "writer": "live"
+            if fc.writer_mode == "live"
+            else "simulated (nothing is sent)"
+            if not self.config.full_charge_isolated
+            else "simulated (beside live control: no target plan, no directive, no write)",
+            **fc.view(now),
+            "alerts": sorted(self._full_charge_alerts(now)),
+            "state_problem": self._fc_state_problem,
+            "time_zone": {
+                "service": self.config.timezone,
+                "home_assistant": self._fc_ha_time_zone,
+                "ok": self._fc_tz_ok,
+            },
+            "entities_problem": self._fc_entities_problem,
+            "directive": None
+            if directive is None
+            else {
+                "armed": directive.armed,
+                "weekday": directive.weekday,
+                "settle_until": directive.settle_until.isoformat()
+                if directive.settle_until
+                else None,
+            },
+            "evidence": self._full_charge_evidence(self._soc_now(now)[0]),
+            "actuator": actuator,
+        }
+
     # ------------------------------------------------------------------ actuation
 
     def _wake_actuator(self) -> None:
@@ -1602,6 +2127,7 @@ class ShadowService:
             decision=decision,
             plan_from_this_process=own,
             price_fresh=price_fresh,
+            full_charge=self._fc_directive,
         )
 
     async def _send_actuation(
@@ -1717,6 +2243,11 @@ class ShadowService:
             "climate_shadow": self._climate_view(),
             **({"battery_health": self.health.snapshot(now)} if self.health is not None else {}),
             **({"actuator": self.actuator.snapshot()} if self.actuator is not None else {}),
+            **(
+                {"full_charge": self._full_charge_metric(now)}
+                if self.full_charge is not None
+                else {}
+            ),
         }
 
     def status(self) -> dict[str, Any]:
@@ -1780,6 +2311,11 @@ class ShadowService:
             **({"battery_health": self._health_status(now)} if self.health is not None else {}),
             "config_hash": self.config.config_hash(),
             **({"actuator": self.actuator.view()} if self.actuator is not None else {}),
+            **(
+                {"full_charge": self._full_charge_status(now)}
+                if self.full_charge is not None
+                else {}
+            ),
         }
 
     def _health_status(self, now: datetime) -> dict[str, Any]:
