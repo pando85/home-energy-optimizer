@@ -65,7 +65,7 @@ mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 
 ### What is reused from the offline code
 
-* **Optimizer:** `oracle.solve_oracle(terminal_mode="free", terminal_value, floor_kwh, throughput_cost)`
+* **Optimizer:** `oracle.solve_oracle(terminal_mode="free", terminal_value, floor_kwh, throughput_cost, high_soc_cost)`
   — the call `rolling_horizon.run_rolling_horizon` makes per event — then
   `dispatch.intents_from_schedule`, which re-checks the plan against the battery kernel.
 * **Battery parameters:** `benchmark.resolve_battery_assumptions` on `tariff.yaml` (`sqrt(RTE)` per

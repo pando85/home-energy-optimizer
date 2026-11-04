@@ -112,7 +112,7 @@ from .load_forecast import (
     resolve_forecaster_params,
     run_forecaster,
 )
-from .oracle import OracleError, solve_oracle
+from .oracle import OracleError, solve_oracle, validate_high_soc_cost
 from .policies import (
     DayAheadDay,
     _clip_plan_to_model_bounds,
@@ -1453,6 +1453,7 @@ def run_day_ahead_with_frozen_forecast(
     mip_rel_gap: float = 1e-6,
     mip_abs_gap: float = 1e-9,
     throughput_cost_eur_per_kwh: float = 0.0,
+    high_soc_cost: tuple[float, float] | None = None,
 ) -> tuple[Schedule, dict[str, Any]]:
     """Run the existing day-ahead policy using a frozen load forecast.
 
@@ -1501,6 +1502,7 @@ def run_day_ahead_with_frozen_forecast(
         mip_rel_gap=mip_rel_gap,
         mip_abs_gap=mip_abs_gap,
         throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
+        high_soc_cost=high_soc_cost,
     )
 
 
@@ -1541,6 +1543,7 @@ def run_rolling_horizon(
     price_outlook_params: Mapping[str, Any] | None = None,
     load_forecaster_side: SideInputs | None = None,
     price_outlook_side: OutlookSide | None = None,
+    high_soc_cost: tuple[float, float] | None = None,
 ) -> RollingResult:
     """Run the rolling horizon dispatcher.
 
@@ -1590,6 +1593,11 @@ def run_rolling_horizon(
     every plan bit-identical to a run without the argument; a non-zero value is a
     planning-only term and never enters the reported (true-price) cost.
 
+    ``high_soc_cost`` (default ``None``) is ``(threshold_frac, eur_per_kwh_h)``, the
+    high-SOC dwell cost of :func:`battery_optimizer.oracle.solve_oracle` applied to every
+    solve.  ``None`` or a zero cost leaves every plan bit-identical; like the throughput
+    cost it is planning-only and never enters the reported cost.
+
     ``forecast_window_days`` (default ``28``) is the trailing window in local days
     for the causal mode's slot means.  Ignored in frozen mode (the frozen profile
     has its own window baked in at build time).
@@ -1629,6 +1637,7 @@ def run_rolling_horizon(
             f"throughput_cost_eur_per_kwh must be finite and >= 0, got "
             f"{throughput_cost_eur_per_kwh!r}"
         )
+    validate_high_soc_cost(high_soc_cost)
     if replan_interval_slots is not None and replan_interval_slots < 1:
         raise ValueError(f"replan_interval_slots must be >= 1, got {replan_interval_slots}")
     if horizon_slots is not None and horizon_slots < 1:
@@ -1942,6 +1951,7 @@ def run_rolling_horizon(
                 terminal_value_eur_per_kwh=value,
                 floor_kwh=horizon_floor_kwh,
                 throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
+                high_soc_cost=high_soc_cost,
             )
         except OracleError as exc:
             text = str(exc).lower()
@@ -2090,6 +2100,12 @@ def run_rolling_horizon(
         "load_forecast_mode": load_forecast_mode,
         "per_event": per_event,
     }
+    if validate_high_soc_cost(high_soc_cost) is not None:
+        # Only an active dwell cost adds a key, so the canonical telemetry is unchanged.
+        telemetry["high_soc_cost"] = {
+            "threshold_frac": float(high_soc_cost[0]),
+            "eur_per_kwh_h": float(high_soc_cost[1]),
+        }
     if not exact_outlook:
         # Only a non-default outlook adds keys, so the canonical telemetry is unchanged.
         telemetry["price_outlook"] = {

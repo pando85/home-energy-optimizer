@@ -958,6 +958,8 @@ class ShadowService:
             terminal_value_eur_per_kwh=terminal,
             terminal_value_source=terminal_source,
             throughput_cost_eur_per_kwh=self.config.planning.throughput_cost_eur_per_kwh,
+            high_soc_threshold_frac=self.config.planning.high_soc_threshold_frac,
+            high_soc_cost_eur_per_kwh_h=self.config.planning.high_soc_cost_eur_per_kwh_h,
             solver_time_limit_s=self.config.planning.solver_time_limit_s,
             plan_sequence=self._plan_sequence,
             expires_at=first + self.config.planning.plan_ttl_slots * step,

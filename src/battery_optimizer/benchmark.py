@@ -1917,6 +1917,7 @@ def _oracle_kwargs(
     rel: float,
     abs_: float,
     throughput_cost_eur_per_kwh: float = 0.0,
+    high_soc_cost: tuple[float, float] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Build the solver kwargs, choosing free terminal mode only if the core has it.
 
@@ -1934,6 +1935,8 @@ def _oracle_kwargs(
         params = {}
     if "throughput_cost_eur_per_kwh" in params:
         kwargs["throughput_cost_eur_per_kwh"] = float(throughput_cost_eur_per_kwh)
+    if high_soc_cost is not None and "high_soc_cost" in params:
+        kwargs["high_soc_cost"] = high_soc_cost
     if terminal_mode != "free":
         return kwargs, "fixed_default"
     if "terminal_mode" not in params:
@@ -2042,6 +2045,7 @@ def _run_policies(
     day_ahead: DayAheadInputs | None = None,
     rolling_horizon: RollingHorizonInputs | None = None,
     throughput_cost_eur_per_kwh: float = 0.0,
+    high_soc_cost: tuple[float, float] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any], dict[str, dict[str, np.ndarray]]]:
     """Evaluate every selected policy on one horizon with one mask."""
     try:
@@ -2064,6 +2068,7 @@ def _run_policies(
         mip_rel_gap,
         mip_abs_gap,
         throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
+        high_soc_cost=high_soc_cost,
     )
     if POLICY_DAY_AHEAD in selected and day_ahead is None:
         raise BenchmarkInputError(
@@ -2139,6 +2144,7 @@ def _run_policies(
                     mip_rel_gap=mip_rel_gap,
                     mip_abs_gap=mip_abs_gap,
                     throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
+                    **({} if high_soc_cost is None else {"high_soc_cost": high_soc_cost}),
                 )
             elif name == POLICY_ROLLING_HORIZON:
                 if rolling_horizon is None:  # pragma: no cover - guarded above
@@ -2171,6 +2177,7 @@ def _run_policies(
                     horizon_slots=rolling_horizon.horizon_slots,
                     load_forecast_mode=rolling_horizon.load_forecast_mode,
                     throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
+                    **({} if high_soc_cost is None else {"high_soc_cost": high_soc_cost}),
                     forecast_window_days=rolling_horizon.forecast_window_days,
                     load_forecaster=rolling_horizon.load_forecaster,
                     load_forecaster_params=rolling_horizon.load_forecaster_params or None,
@@ -3103,6 +3110,7 @@ def benchmark_dataset(
     rolling_horizon_price_outlook: str = DEFAULT_ROLLING_HORIZON_PRICE_OUTLOOK,
     eval_end: datetime | str | None = None,
     data_dir: Path | str | None = None,
+    high_soc_cost: tuple[float, float] | None = None,
 ) -> Path:
     """Run the selected policies on a built dataset and write an immutable run.
 
@@ -3205,6 +3213,12 @@ def benchmark_dataset(
             basis (default ``0.0``).  ``0.0`` leaves every plan bit-identical to a run
             without the argument; it is a planning-only term and never enters the
             reported (true-price) cost.  Recorded in the run identity.
+        high_soc_cost: optional ``(threshold_frac, eur_per_kwh_h)`` dwell cost on SOC above
+            the threshold (:func:`battery_optimizer.oracle.solve_oracle`), applied to the
+            oracle, day-ahead and rolling-horizon planning objectives.  ``None`` (default)
+            or a zero cost leaves every plan bit-identical and the run identity unchanged;
+            an active cost is planning-only, never in the reported cost, and is added to
+            the run identity.
         load_forecaster: registered load forecaster
             (:mod:`battery_optimizer.load_forecast`) that ``day_ahead`` and the causal
             ``rolling_horizon`` rung plan on.  ``"trailing_mean"`` (default, LF-0) adds
@@ -3264,6 +3278,12 @@ def benchmark_dataset(
             "throughput_cost_eur_per_kwh must be finite and >= 0, got "
             f"{throughput_cost_eur_per_kwh!r}"
         )
+    try:
+        from battery_optimizer.oracle import validate_high_soc_cost
+
+        high_soc_cost = validate_high_soc_cost(high_soc_cost)
+    except ValueError as exc:
+        raise BenchmarkInputError(str(exc)) from exc
     if POLICY_DAY_AHEAD in selected or POLICY_ROLLING_HORIZON in selected:
         # Only checked when at least one policy is actually run: an unrelated run
         # must not be refused over a knob it never uses.
@@ -3560,6 +3580,7 @@ def benchmark_dataset(
         day_ahead=day_ahead,
         rolling_horizon=rolling_horizon,
         throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
+        high_soc_cost=high_soc_cost,
     )
     if not records:
         raise BenchmarkError(
@@ -3661,6 +3682,10 @@ def benchmark_dataset(
     # possible if new knobs are conditional.  Note that `code_version` is also part of the
     # identity, so any commit changes every run id anyway; what's preserved here is that
     # no new knob enters a non-rolling run's hashed params.
+    if high_soc_cost is not None:
+        # Only an active dwell cost enters the identity, so a run without it keeps its id.
+        identity["high_soc_threshold_frac"] = float(high_soc_cost[0])
+        identity["high_soc_cost_eur_per_kwh_h"] = float(high_soc_cost[1])
     if POLICY_ROLLING_HORIZON in selected:
         identity["rolling_horizon_replan_interval_slots"] = rolling_horizon_replan_interval_slots
         identity["rolling_horizon_horizon_slots"] = rolling_horizon_horizon_slots

@@ -87,11 +87,19 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
   budget ([sweep table and warranty](battery-model.md#wear-cost-decision-2026-10-31)). At 0.0 every marginal
   cycle that clears the 0.80 round trip was taken. The sweep used the benchmark's two-publication rolling
   horizon, not the live 15-minute re-solve; the live planner's behaviour at 0.01 is unmeasured.
+- **High-SOC dwell cost (off, 2026-11-04).** `planning.high_soc_cost_eur_per_kwh_h` (0 = off) prices every
+  kWh of end-of-slot SOC above `planning.high_soc_threshold_frac` (0.90) per hour held, in every solve (the
+  full-charge ones too, so the 100% checkpoint finishes close to the discharge; the checkpoint's shortfall penalty
+  must exceed the dwell cost over the longest horizon, checked at solve and at config load). Planning only: the
+  reported cost excludes it and the dual bound is dropped, as for the throughput cost. Replay study
+  ([high-soc dwell cost](../planning/high-soc-dwell-cost.md)): 0.01 EUR/kWh/h cuts the hours above 90% by 46% and
+  those at or above 95% by 70% for 0.08% of cost (0.41% of the saving); a hard 20-90 window costs 3.3% of the
+  saving. Measured on the benchmark's rolling horizon, not the live 15-minute re-solve (one season checked).
 - Omnibattery's own price features will be off, so this is the only battery price reactor.
 
 ## Invalidated when
 
-- Any [battery-model](battery-model.md) parameter changes, or the wear cost is changed.
+- Any [battery-model](battery-model.md) parameter changes, or the wear cost or the high-SOC dwell cost is changed.
 - [tariff-prices](tariff-prices.md) changes (taxes confirmed, holidays added, new publication timing).
 - The load forecast changes regime (comfort schedule, boost): re-check floor-hit share and clipping.
 - At go-live: measured SOC replaces simulated SOC; the charge adapter caps the grid target below the
@@ -136,6 +144,12 @@ Full-charge solver (2026-11-04, code only): `oracle.FullChargeModel` and `planne
 ceiling, soft checkpoint and taper rows described above. Nothing calls them yet (the service never sets
 `full_charge` on a snapshot), so plans are byte-identical to before and no recalibration or regime-log row is due
 from this change; it extends the reason above with the taper parameters, which are provisional.
+
+High-SOC dwell cost (2026-11-04, code only): `high_soc_cost` in the solver, the planner, the service config and the
+benchmark, default 0, so plans, `inputs_hash` and `config_hash` are byte-identical until a deploy sets it (planned,
+regime log). Merging changes nothing observable and nothing goes stale; enabling it changes the plans (less time
+above 90%, same cost within 0.1%) and is recorded in the regime log when it happens, with the dependants checked
+then (the replay benchmark and the dry-run decision study are recomputed on plans made with it).
 
 Slot decisions (2026-11-04, code only, regime log): a slot that opened without an intent adopts one later in
 the slot (`late_intent`, see [service](../service.md#scheduling-and-the-slot-cycle)), and a solve inside such a
