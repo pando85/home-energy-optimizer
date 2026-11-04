@@ -396,8 +396,10 @@ opened not ready because the day's load history is fetched just after it.
 
 ## Amendment 2026-11-04 (periodic full charge)
 
-Decision 3's allowlist is widened by **exactly two entries, and only when `full_charge.enabled` is true in
-`mode: live`**; nothing else changes (kill switch, heartbeat, mode gating, readback, retry, `forbidden` never retried,
+Decision 3's allowlist is widened by **exactly two entries, and only when `full_charge.enabled` is true and
+`full_charge.mode` is `live` in `mode: live`** (`full_charge.mode: shadow`, the default, simulates the feature beside
+live control and adds nothing: both entities stay refused, the actuator gets no directive and the weekly status is
+never healthy); nothing else changes (kill switch, heartbeat, mode gating, readback, retry, `forbidden` never retried,
 one entity per call, no `return_response`, REST GET-only):
 
 | Service | Entity | `service_data` |
@@ -414,3 +416,10 @@ entity. Decision 6 gains one healthy status: `weekly_full_charge`, accepted only
 the current local day. The service owns the two entities while the feature is enabled (it turns the switch off
 whenever no run is armed). Decision 7 is unchanged: the persisted full-charge state is a calendar decision and a
 timestamp, never a plan. A homelab watchdog follow-up turns the switch off on heartbeat loss.
+
+The scheduler that arms it (amendment of the plan, 2026-11-04) adds **no write path**: after Omnibattery completes the
+run the actuator holds the existing idle intent (charge off, discharge off, neutral PD target) for
+`full_charge.settle_timeout_s` (default 300 s) or until a new balance reading arrives, keeping the weekly switch on
+until then, and only afterwards turns it off. The hold is a field of the directive, subject to the kill switch and the
+guard like any intent; a guard failure ends its effect (it is idle anyway). The service reads the balance sensors and
+Home Assistant's `time_zone` (`GET /api/config`, already allowed) and writes nothing else.

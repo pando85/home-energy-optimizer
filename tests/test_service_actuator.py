@@ -37,6 +37,7 @@ from battery_optimizer.service.clock import FakeClock, SystemClock
 from battery_optimizer.service.config import (
     ActuationEntities,
     ActuationSettings,
+    FullChargeCadence,
     FullChargeEntities,
     FullChargeSettings,
     load_service_config,
@@ -1270,6 +1271,9 @@ FC_ENTS = FullChargeEntities(
     last_balance_read="sensor.venus_last_balance_read",
     balancing_mode="binary_sensor.venus_balancing_mode",
     cell_delta="sensor.venus_cell_delta",
+    balance_status="sensor.venus_balance_status",
+    delta_trend="sensor.venus_delta_trend",
+    delta_avg_4w="sensor.venus_delta_avg_4w",
 )
 FC = FullChargeSettings(enabled=True, entities=FC_ENTS)
 TODAY = WEEKDAY_OPTIONS[NOW.astimezone(TZ).weekday()]  # local Tuesday
@@ -1785,6 +1789,7 @@ def test_view_and_snapshot_expose_the_weekly_readings():
         "delay_switch": False,
         "integration_status": WEEKLY,
         "driven_armed": True,
+        "settle_hold": False,
         "refusal": None,
     }
     assert actuator.view()["full_charge"] == expected
@@ -1819,15 +1824,117 @@ def test_the_directive_follows_the_local_weekday_across_midnight():
     assert fc_calls(ha) == [("turn_off", "omnibattery_weekly_full_charge_enabled", None)]
 
 
+# ---- the settle hold (amendment A2) -----------------------------------------------------------
+
+
+def hold(clock, seconds=300):
+    return FullChargeDirective(True, TODAY, clock.now() + timedelta(seconds=seconds))
+
+
+def test_a_settle_hold_needs_an_armed_directive_and_an_aware_deadline():
+    with pytest.raises(ValueError, match="armed"):
+        FullChargeDirective(False, None, NOW + timedelta(seconds=300))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        FullChargeDirective(True, TODAY, datetime(2026, 11, 4, 12, 0))
+    assert FullChargeDirective(True, TODAY).settle_until is None
+
+
+@pytest.mark.parametrize("planned", ["charge", "discharge"])
+def test_the_settle_hold_idles_whatever_the_plan_says_and_keeps_the_switch_on(planned):
+    clock = FakeClock(NOW)
+    store = fc_world(
+        clock, weekly="on", day=TODAY, status="balanced", charge="on", discharge="off", pd=1400
+    )
+    if planned == "discharge":
+        store.apply(entity_state(ENTS.allow_charge, "off", clock.now()))
+        store.apply(entity_state(ENTS.allow_discharge, "on", clock.now()))
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    record = tick(actuator, ctx(clock, intent(planned, 1500), full_charge=hold(clock)))
+    assert record["desired"]["mode"] == "idle" and record["desired"]["reason"] == "settle_hold"
+    assert store.get(ENTS.allow_charge).state == "off"
+    assert store.get(ENTS.allow_discharge).state == "off"
+    assert float(store.get(ENTS.pd_target).state) == 0.0  # the neutral target
+    assert store.get(FC_ENTS.enable_switch).state == "on"  # the weekly switch is not turned off yet
+    assert [c for c in fc_calls(ha) if c[0] == "turn_off"] == []
+    assert actuator.view()["full_charge"]["settle_hold"] is True
+    assert record["guard_reasons"] == [] and len(ha.heartbeats()) == 1
+
+
+def test_the_hold_ends_by_the_directive_disarming_after_it_in_the_same_reconcile():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, status="balanced", pd=0)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=hold(clock)))
+    assert actuator.desired.reason == "settle_hold"
+    clock.advance(20)  # the reading arrived: the scheduler drops the hold and disarms
+    calls = len(ha.calls)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=DISARMED))
+    writes = [(c[1], c[2]) for c in ha.calls[calls:] if c[0] != "input_datetime"]
+    assert writes[0] == ("turn_off", FC_ENTS.enable_switch)  # disarm moves behind the hold
+    assert ("turn_on", ENTS.allow_charge) in writes  # and the normal intent resumes
+    assert (
+        actuator.desired.mode == "charge" and actuator.view()["full_charge"]["settle_hold"] is False
+    )
+
+
+def test_the_hold_lapses_at_its_deadline_even_without_a_new_directive():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, status="balanced", pd=0)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    directive = hold(clock, 60)
+    tick(actuator, ctx(clock, intent("charge", 1000), full_charge=directive))
+    assert actuator.desired.reason == "settle_hold"
+    clock.advance(61)
+    for entity, value in ((GRID, 400), (ENTS.battery_ac_power, 0)):
+        store.apply(entity_state(entity, value, clock.now()))
+    tick(actuator, ctx(clock, intent("charge", 1000, valid_from=SLOT), full_charge=directive))
+    assert (
+        actuator.desired.mode == "charge"
+    )  # the scheduler is expected to disarm; idle is not forever
+
+
+def test_a_guard_failure_during_the_hold_still_wins():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, status="balanced", charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    clock.advance(400)  # grid and SOC readings are stale now
+    record = tick(actuator, ctx(clock, intent("charge", 1000), full_charge=hold(clock)))
+    assert record["desired"]["mode"] == "safe_idle"
+    assert "grid_power_stale" in record["guard_reasons"]
+    assert store.get(ENTS.allow_charge).state == "off"
+    assert store.get(FC_ENTS.enable_switch).state == "on"  # a safe idle neither arms nor disarms
+
+
+def test_the_hold_is_the_same_in_dry_run_and_sends_nothing():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, weekly="on", day=TODAY, status="balanced", charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store, mode="dry_run", full_charge=FC)
+    record = tick(actuator, ctx(clock, intent("charge", 1500), full_charge=hold(clock)))
+    assert record["desired"]["reason"] == "settle_hold" and ha.calls == []
+    assert [w["role"] for w in record["writes"]] == ["allow_charge", "pd_target"]
+    assert all(w["result"] == "dry_run" for w in record["writes"])
+
+
+def test_a_settle_deadline_is_ignored_while_the_feature_is_off():
+    clock = FakeClock(NOW)
+    store = fc_world(clock, status="balanced")
+    actuator, ha, _ = make(clock, store)  # no full_charge settings
+    record = tick(actuator, ctx(clock, intent("charge", 1000), full_charge=hold(clock)))
+    assert record["desired"]["mode"] == "charge"
+    assert fc_calls(ha) == []
+
+
 # ---- configuration ----------------------------------------------------------------------------
 
-FC_ON = {**LIVE, "full_charge.enabled": True}
+FC_ON = {**LIVE, "full_charge.enabled": True}  # full_charge.mode stays shadow
 
 
 def test_the_committed_full_charge_section_is_off_and_names_the_installation_entities():
     fc = load_service_config(REPO / "config" / "service.yaml").full_charge
     assert fc == FullChargeSettings(enabled=False, entities=FC_ENTS)
-    assert (fc.min_interval_days, fc.max_interval_days) == (5, 15)
+    assert fc.mode == "shadow"
+    assert fc.cadence == FullChargeCadence()  # the amendment's table: 10/14, 14/28, 7/14, 5/7
+    assert (fc.min_comparable_readings, fc.alert_consecutive, fc.settle_timeout_s) == (4, 2, 300.0)
     assert (fc.threshold_min_eur, fc.threshold_scale_eur, fc.fixed_cost_eur) == (0.01, 0.01, 0.0)
     assert (fc.taper.start_soc_frac, fc.taper.power_kw) == (0.90, 0.2)
     assert fc.bootstrap_last_full is None and fc.reached_soc_pct == 99
@@ -1856,6 +1963,21 @@ def test_the_full_charge_section_does_not_change_the_plan_identity(tmp_path):
 def test_the_feature_can_be_enabled_in_every_mode(tmp_path, mode):
     config = load_service_config(write_service_config(tmp_path, **{**FC_ON, "mode": mode}))
     assert config.mode == mode and config.full_charge.enabled
+    assert config.full_charge.mode == "shadow"
+    assert config.full_charge_writer_mode == "simulated"
+    assert config.full_charge_isolated is (mode == "live")  # live control, feature simulated
+
+
+def test_the_feature_can_go_live_only_in_a_live_service(tmp_path):
+    config = load_service_config(
+        write_service_config(tmp_path, **{**FC_ON, "full_charge.mode": "live"})
+    )
+    assert config.full_charge.mode == "live" and config.full_charge_writer_mode == "live"
+    assert config.full_charge_isolated is False
+    assert config.public_dict()["full_charge"]["mode"] == "live"
+    # the mode is part of /status but not of the plan identity
+    base = load_service_config(write_service_config(tmp_path, **FC_ON))
+    assert base.config_hash() == config.config_hash()
 
 
 def test_a_bootstrap_date_and_a_disabled_taper_are_accepted(tmp_path):
@@ -1881,11 +2003,31 @@ def test_a_bootstrap_date_and_a_disabled_taper_are_accepted(tmp_path):
         ({"full_charge.entities.bogus": "switch.x"}, "unknown full_charge.entities keys"),
         ({"full_charge.taper.bogus": 1}, "unknown full_charge.taper keys"),
         ({"full_charge.enabled": "yes"}, "full_charge.enabled must be true or false"),
-        ({"full_charge.min_interval_days": 0}, "min_interval_days"),
-        ({"full_charge.min_interval_days": 15}, "min_interval_days < max_interval_days"),
-        ({"full_charge.min_interval_days": 2.5}, "min_interval_days"),
-        ({"full_charge.max_interval_days": 31}, "max_interval_days <= 30"),
-        ({"full_charge.max_interval_days": 4}, "min_interval_days < max_interval_days"),
+        ({"full_charge.min_interval_days": 5}, "unknown full_charge keys"),
+        ({"full_charge.mode": "dry_run"}, "full_charge.mode must be one of"),
+        ({"full_charge.mode": True}, "full_charge.mode must be one of"),
+        ({"full_charge.mode": "live"}, "full_charge.mode=live needs the service mode=live"),
+        (
+            {"mode": "dry_run", "full_charge.mode": "live"},
+            "full_charge.mode=live needs the service mode=live",
+        ),
+        ({"full_charge.cadence.bogus": {}}, "unknown full_charge.cadence keys"),
+        ({"full_charge.cadence.green": 14}, "cadence.green must be a mapping"),
+        ({"full_charge.cadence.green.bogus": 1}, "unknown full_charge.cadence.green keys"),
+        ({"full_charge.cadence.green.min_days": 0}, "cadence.green.min_days"),
+        ({"full_charge.cadence.green.min_days": 28}, "cadence.green needs 0 < min_days < max_days"),
+        ({"full_charge.cadence.green.max_days": 31}, "cadence.green needs .* <= 30"),
+        ({"full_charge.cadence.yellow.min_days": 2.5}, "cadence.yellow.min_days"),
+        ({"full_charge.cadence.green.min_days": 9}, "green.min_days >= unknown.min_days"),
+        ({"full_charge.cadence.yellow.min_days": 4}, "yellow.min_days >= alert.min_days"),
+        ({"full_charge.min_comparable_readings": 0}, "min_comparable_readings"),
+        ({"full_charge.alert_consecutive": 1}, "alert_consecutive"),
+        ({"full_charge.settle_timeout_s": 0}, "settle_timeout_s"),
+        ({"full_charge.settle_timeout_s": 901}, "settle_timeout_s must be <= 900"),
+        (
+            {"battery_health.entities.balance_status": "sensor.some_other_status"},
+            "balance_status and battery_health.entities.balance_status must name the same",
+        ),
         ({"full_charge.threshold_min_eur": -0.01}, "threshold_min_eur"),
         ({"full_charge.threshold_min_eur": float("nan")}, "threshold_min_eur"),
         ({"full_charge.threshold_scale_eur": float("inf")}, "threshold_scale_eur"),
@@ -1943,6 +2085,9 @@ def test_invalid_full_charge_config_is_refused(tmp_path, override, message):
         ({"full_charge.entities.day_select": None}, "needs full_charge.entities.day_select"),
         ({"full_charge.entities.delay_switch": None}, "needs full_charge.entities.delay_switch"),
         ({"full_charge.entities.cell_delta": None}, "needs full_charge.entities.cell_delta"),
+        ({"full_charge.entities.balance_status": None}, "needs full_charge.entities.balance_st"),
+        ({"full_charge.entities.delta_trend": None}, "needs full_charge.entities.delta_trend"),
+        ({"full_charge.entities.delta_avg_4w": None}, "needs full_charge.entities.delta_avg_4w"),
         ({"planning.soc_source": "simulated"}, "needs planning.soc_source=entity"),
         ({"actuation.entities.integration_status": None}, "integration_status"),
         ({"actuation.entities.battery_soc": None}, "battery_soc"),

@@ -48,7 +48,8 @@ names>}`` for ``select.select_option`` (the periodic full charge, below).  ``ret
 any other field raise.  The only builder is :func:`actuation_request`.
 
 The periodic full charge (ADR-0007, amendment 2026-11-04) widens that list by exactly two
-entries, and only when ``full_charge.enabled`` in ``mode: live``: ``switch.turn_on/off`` on the
+entries, and only in ``mode: live`` with ``full_charge.enabled`` and ``full_charge.mode: live``
+(``shadow``, the default, adds nothing): ``switch.turn_on/off`` on the
 Omnibattery weekly-full-charge switch and ``select.select_option`` on its day select (the seven
 weekday values of :data:`WEEKDAY_OPTIONS`).  Its delay switch, the charge-delay switch, the
 cutoff numbers, any button and every other entity of those domains stay refused.
@@ -253,8 +254,9 @@ def actuation_allowlist(config: Any) -> ActuationAllowlist | None:
     The two direction switches and the power-limit switch; the PD grid target bounded to
     ``[0, import_cap_w]`` (never an export target, never above the cap); the system
     discharge cap bounded to ``[min_discharge_cap_w, max_discharge_cap_w]`` (never 0, which
-    Omnibattery reads as *unlimited*); the heartbeat helper.  With ``full_charge.enabled`` also
-    the weekly-full-charge switch and its day select (the seven weekdays).  Nothing else — in
+    Omnibattery reads as *unlimited*); the heartbeat helper.  With ``full_charge.enabled`` and
+    ``full_charge.mode: live`` also the weekly-full-charge switch and its day select (the seven
+    weekdays); with ``full_charge.mode: shadow`` (the default) neither.  Nothing else — in
     particular not the kill switch, which only the owner flips, nor the weekly delay switch.
     """
     if getattr(config, "mode", None) != "live":
@@ -264,7 +266,7 @@ def actuation_allowlist(config: Any) -> ActuationAllowlist | None:
     switches = {ents.allow_charge, ents.allow_discharge, ents.power_limits}
     selects: dict[str, frozenset[str]] = {}
     full_charge = getattr(config, "full_charge", None)
-    if full_charge is not None and full_charge.enabled:
+    if full_charge is not None and full_charge.enabled and full_charge.mode == "live":
         switches.add(full_charge.entities.enable_switch)
         selects[full_charge.entities.day_select] = frozenset(WEEKDAY_OPTIONS)
     return ActuationAllowlist(

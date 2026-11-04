@@ -242,6 +242,36 @@ HA is down: during an outage it neither follows the house load (a discharge can 
 nor backs off a charge on a load step (the import cap is not regulated). Live mode needs a failsafe that does
 not depend on HA. See ADR-0007.
 
+### Periodic full charge: what the installation does not expose or has not shown yet
+
+[Plan](planning/periodic-full-charge.md), [scheduler](service.md#periodic-full-charge-the-scheduler). Off by default.
+
+- **No weekly-status entity.** `sensor.omnibattery_weekly_full_charge_status` (idle, disabled, charging, complete,
+  with a completion reason) exists only when the weekly feature is enabled while the integration loads, and
+  toggling the switch does not reload it, so it is not in this installation's registry. The scheduler does not
+  depend on it: a run is acknowledged by `integration_status == weekly_full_charge`, completed when that status
+  leaves (or SOC 100, or `top_hold_timeout_min`), and counted only by a new `last_balance_read`.
+- **Guard conflict, solved with a condition.** During a weekly run `integration_status` is `weekly_full_charge`,
+  which the unmodified guard holds as `integration_unhealthy` safe idle for the whole run (the battery would never
+  charge). The guard accepts it only while the service's directive is armed for today. The flip side: if the
+  weekly switch is on and the day matches while the service has no armed directive (the owner flipped it by hand, or
+  the service restarted and has not stepped yet), the battery holds safe idle until the service drives the switch off.
+  The runtime passes no directive until its first step after a Home Assistant sync, so a restart does not disarm a
+  running run, but it also does not take part until it has stepped.
+- **Not measured yet.** The order of Omnibattery's balance reading and the weekly switch going off (the settle hold
+  keeps the switch on until the reading arrives or 300 s; the amendment asks to verify this on the supervised run),
+  the time from completion to the reading, and the taper timeline. The `delta_trend` vocabulary is taken from
+  Omnibattery's documentation (`rising`, `stable`, `falling`); any other text (or an unavailable sensor) never selects
+  the long green cadence.
+- **Feature `shadow` beside live control.** `full_charge.mode: shadow` (default) simulates the feature without
+  touching the real control path (no target plan, no directive, entities refused by the guard). A simulated run
+  therefore never exercises the arming writes, the guard's `weekly_full_charge` acceptance or the settle hold; only
+  the supervised live run does.
+- **Dwell on the day.** The high-SOC dwell cost (`planning.high_soc_cost_eur_per_kwh_h`, amendment A5) applies to
+  the committed target plan too, so the checkpoint moves towards the expected discharge; with it at 0 (the shape
+  of the plan before that change) the checkpoint sits at the end of the cheapest block. The config refuses a
+  `shortfall_penalty_eur_per_kwh` that the dwell cost over the longest horizon could outweigh.
+
 ### Omnibattery can stay in `backup_mode` after the grid returns
 
 After a grid return the inverter goes back to Bypass, but Omnibattery v1.5.0 can stay in its `backup_mode`

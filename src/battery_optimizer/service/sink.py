@@ -15,7 +15,12 @@ Layout (partitioned by **UTC** day, so a DST day is never split or doubled)::
     service/v1/actuation/date=YYYY-MM-DD/actuation.jsonl  dry_run / live only: one row per
                                                        actuator tick that wrote (or would
                                                        write) or changed state (ADR-0007)
+    service/v1/full_charge/date=YYYY-MM-DD/full_charge.jsonl
+                                                       periodic full charge (only when enabled):
+                                                       one row per decision, reading, transition,
+                                                       outcome and pause
     service/v1/state/virtual_battery.json              the virtual battery's SOC (mutable)
+    service/v1/state/full_charge.json                  the full-charge scheduler's state (mutable)
 
 Plans are written with :func:`battery_optimizer.paths.write_part_atomic` (temp
 file, fsync, no-clobber hard link) — the store convention of the offline pipeline.
@@ -98,6 +103,9 @@ class ShadowSink:
     def append_actuation(self, at: datetime, record: dict[str, Any]) -> Path:
         return self._append("actuation", at, record)
 
+    def append_full_charge(self, at: datetime, record: dict[str, Any]) -> Path:
+        return self._append("full_charge", at, record)
+
     def append_climate(self, kind: str, at: datetime, record: dict[str, Any]) -> Path:
         if kind not in CLIMATE_KINDS:
             raise ValueError(f"unknown climate record kind {kind!r}")
@@ -105,11 +113,44 @@ class ShadowSink:
 
     # -- mutable state -------------------------------------------------------------
 
-    def _state_path(self) -> Path:
-        return self.root / "state" / "virtual_battery.json"
+    def _state_path(self, name: str = "virtual_battery") -> Path:
+        return self.root / "state" / f"{name}.json"
 
     def save_virtual_battery(self, state: dict[str, Any]) -> None:
-        path = self._state_path()
+        self._save_state(self._state_path(), state)
+
+    def save_full_charge(self, state: dict[str, Any]) -> None:
+        self._save_state(self._state_path("full_charge"), state)
+
+    def load_full_charge(self, at: datetime) -> tuple[dict[str, Any] | None, str | None]:
+        """``(state, problem)``: a missing file is ``(None, None)``; a corrupt one is renamed aside
+        (``full_charge.json.corrupt-<UTC time>``) and reported as ``(None, problem)``."""
+        path = self._state_path("full_charge")
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            return None, None
+        except OSError as exc:
+            return None, f"unreadable: {exc}"
+        try:
+            state = json.loads(text)
+            if not isinstance(state, dict):
+                raise ValueError("not a JSON object")
+            return state, None
+        except ValueError as exc:
+            self.quarantine_full_charge(at)
+            return None, f"corrupt: {exc}"
+
+    def quarantine_full_charge(self, at: datetime) -> None:
+        """Rename an unusable state file aside so the bootstrap can write a fresh one."""
+        path = self._state_path("full_charge")
+        aside = path.with_name(f"{path.name}.corrupt-{at.astimezone(UTC):%Y%m%dT%H%M%SZ}")
+        try:
+            path.rename(aside)
+        except OSError:
+            pass
+
+    def _save_state(self, path: Path, state: dict[str, Any]) -> None:
         _ensure_private_dir(path.parent)
         fd, tmp = tempfile.mkstemp(prefix=".vb.", suffix=".tmp", dir=path.parent)
         try:
@@ -135,7 +176,7 @@ def iter_records(
     data_dir: Path, kind: str, since: datetime, until: datetime
 ) -> Iterator[dict[str, Any]]:
     """Records of *kind* (``slots``/``events``/``plans``/``pvpc_snapshots``/
-    ``weather_forecasts``/``climate_*``/``actuation``) from the UTC-day partitions
+    ``weather_forecasts``/``climate_*``/``actuation``/``full_charge``) from the UTC-day partitions
     overlapping ``[since, until)``; torn or corrupt lines are skipped."""
     root = data_dir / _ROOT / kind
     day = since.astimezone(UTC).date() - timedelta(days=1)

@@ -91,7 +91,7 @@ changes behaviour.
    - **seconds above 35 degC and above 40 degC** (counters, not only a daily maximum), and the **peak temperature of each
      charge session** with its mean power and SOC range;
    - the same entities added to the dataset extract so that the replays below can use them.
-4. **PR 3, the scheduler**, with the amendments of the full-charge plan (adaptive cadence, new-reading success criterion,
+4. **PR 3, the scheduler** (implemented, feature off, [notes](periodic-full-charge.md#pr-3-implementation-notes)), with the amendments of the full-charge plan (adaptive cadence, new-reading success criterion,
    settle hold in the actuator, balance telemetry consumed from step 3). Acceptance: at least **7 days of `dry_run`**, a
    **supervised first live run** with the owner and the kill switch, and the **homelab watchdog follow-up** (the watchdog
    also turns the weekly switch off on heartbeat loss) before any unattended use.
