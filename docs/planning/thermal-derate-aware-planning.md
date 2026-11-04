@@ -1,6 +1,7 @@
 # Derate-aware planning: Omnibattery's Temperature Charge Limit in the planner
 
-- **Status:** study and design. **PR 2 is implemented** as a read-only shadow (`planning.thermal.mode: shadow`,
+- **Status:** PR 1–2 done (shadow deployed in 0.10.0); PR 3–7 parked (owner, 2026-11-04: fans to be added; may be
+  deprecated). Study and design; **PR 2 is implemented** as a read-only shadow (`planning.thermal.mode: shadow`,
   default `off`; see [service.md](../service.md#thermal-shadow-derate-prediction)): inputs, thermal state with a
   guarded refit, per-plan prediction, metrics. Nothing else is: the planner, the solver and the actuator do not use
   it, and no allowlist is widened. The study is `hack/battery_thermal_derate.py` (with
@@ -334,6 +335,20 @@ the per-slot columns as a `thermal` key of the plan file (no sibling record; the
 slot close covers the end temperature at three leads and the achievable charge power in derate slots. The online
 ambient estimate, the plan temperature error stratified by power, the derate-conformance KPI (it needs the written
 set power, not read yet) and the exposure threshold at 45 degC are not part of PR 2.
+
+**Parked (owner decision, 2026-11-04).** The owner will add fans to the battery, so the thermal analysis is not prioritised
+and may be deprecated later.
+
+- PRs 3 to 7 are parked: per-slot bounds, the derate-aware solve, the replay thermal plant, the aware plan driving intents
+  and the joint rows. Do not start them.
+- The read-only shadow of PR 2 (`planning.thermal.mode: shadow`, deployed in 0.10.0) keeps running for now. It costs nothing,
+  and its daily refit gives a before/after measurement of the fans: time constant and charge gain.
+- Decide on `planning.thermal.mode: off`, and on deprecating the component, once the fans have run for about two weeks.
+- The fan installation is a plant change: add a regime-log row and mark `battery-thermal` (and `battery-model`, if it depends
+  on it) `stale`, following [docs/components/README.md](../components/README.md).
+- Revisit the 1.5 kW charge soft cap after the fans; its longevity reason stays.
+- The Omnibattery temperature limit (40 degC, charge only; the discharge variant is off) stays the owner's setting. The
+  optimizer only reads it.
 
 PRs 2 and 3 are independent and can proceed in parallel. PR 1 changes no service code and PRs 2 to 4 change no plan while
 `mode` is `off`. The first deployment decision is the owner's, as for the soft cap and the dwell cost.
