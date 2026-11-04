@@ -25,7 +25,9 @@ Two deliberate differences from the benchmark, both forced by running live:
 
 An optional :class:`FullChargeSpec` on the snapshot prices (``evaluate``) or plans
 (``commit``) a day with a lifted SOC ceiling and a soft checkpoint at 100%
-(docs/planning/periodic-full-charge.md); without it nothing below changes.
+(docs/planning/periodic-full-charge.md); without it nothing below changes.  An optional high-SOC
+dwell cost (``planning.high_soc_*``, off at 0) prices the hours spent above a threshold SOC in every
+solve of the snapshot, the full-charge ones included.
 
 Everything the solve depends on is frozen in :class:`PlanningSnapshot` before it
 is handed to the worker thread, and its canonical hash (``inputs_hash``) is stored
@@ -187,6 +189,9 @@ class PlanningSnapshot:
     forecast_meta: dict[str, Any] = field(default_factory=dict)
     price_meta: dict[str, Any] = field(default_factory=dict)
     full_charge: FullChargeSpec | None = None
+    #: High-SOC dwell cost (``planning.high_soc_*``): EUR per kWh above the threshold per hour.
+    high_soc_threshold_frac: float = 0.90
+    high_soc_cost_eur_per_kwh_h: float = 0.0
 
     def __post_init__(self) -> None:
         n = len(self.slot_starts)
@@ -227,6 +232,13 @@ class PlanningSnapshot:
         }
         if self.full_charge is not None:
             payload["full_charge"] = asdict(self.full_charge)
+        if self.high_soc_cost_eur_per_kwh_h > 0.0:
+            # Only an active dwell cost joins the inputs, so the hash of a plan without it is
+            # the hash it always was.
+            payload["high_soc_cost"] = {
+                "threshold_frac": self.high_soc_threshold_frac,
+                "eur_per_kwh_h": self.high_soc_cost_eur_per_kwh_h,
+            }
         return payload
 
     def inputs_hash(self) -> str:
@@ -407,6 +419,11 @@ def _solve(
         floor_kwh=spec.soc_bound_kwh("min"),
         throughput_cost_eur_per_kwh=snapshot.throughput_cost_eur_per_kwh,
         full_charge=full_charge,
+        high_soc_cost=(
+            (snapshot.high_soc_threshold_frac, snapshot.high_soc_cost_eur_per_kwh_h)
+            if snapshot.high_soc_cost_eur_per_kwh_h > 0.0
+            else None
+        ),
     )
 
 

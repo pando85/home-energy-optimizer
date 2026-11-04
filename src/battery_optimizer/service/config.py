@@ -173,6 +173,10 @@ class PlanningSettings:
     load_forecaster: str = "trailing_mean"
     terminal_value: str | float = "trailing_mean"
     throughput_cost_eur_per_kwh: float = 0.0
+    #: High-SOC dwell cost: EUR per kWh of SOC above ``high_soc_threshold_frac`` per hour held.
+    #: 0 (the default) is off and leaves the plan, and :meth:`ServiceConfig.config_hash`, as before.
+    high_soc_threshold_frac: float = 0.90
+    high_soc_cost_eur_per_kwh_h: float = 0.0
     replan_soc_change_frac: float = 0.05
     replan_debounce_s: float = 30.0
     replan_min_interval_s: float = 120.0
@@ -568,6 +572,10 @@ class ServiceConfig:
         public.pop("actuation", None)  # nor does the way a plan is sent
         public.pop("full_charge", None)  # the full-charge scheduler is not wired to plans yet
         public.pop("battery_health", None)  # read-only telemetry never changes a plan
+        if not self.planning.high_soc_cost_eur_per_kwh_h:
+            # An inactive dwell cost leaves every plan alone: keep the hash from before it existed.
+            public["planning"].pop("high_soc_threshold_frac", None)
+            public["planning"].pop("high_soc_cost_eur_per_kwh_h", None)
         text = json.dumps(public, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode()).hexdigest()
 
@@ -1231,6 +1239,11 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
     interval_seconds = _int(pl_raw.get("interval_seconds", 900), "interval_seconds", 60)
     if 3600 % interval_seconds:
         raise ValueError("service config: interval_seconds must divide an hour")
+    high_soc_threshold = _positive(
+        pl_raw.get("high_soc_threshold_frac", 0.90), "high_soc_threshold_frac"
+    )
+    if high_soc_threshold >= 1.0:
+        raise ValueError("service config: high_soc_threshold_frac must be below 1")
     planning = PlanningSettings(
         soc_source=soc_source,
         interval_seconds=interval_seconds,
@@ -1245,6 +1258,12 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
         terminal_value=terminal_value,
         throughput_cost_eur_per_kwh=_positive(
             pl_raw.get("throughput_cost_eur_per_kwh", 0.0), "throughput_cost", allow_zero=True
+        ),
+        high_soc_threshold_frac=high_soc_threshold,
+        high_soc_cost_eur_per_kwh_h=_positive(
+            pl_raw.get("high_soc_cost_eur_per_kwh_h", 0.0),
+            "high_soc_cost_eur_per_kwh_h",
+            allow_zero=True,
         ),
         replan_soc_change_frac=_positive(
             replan.get("soc_change_frac", 0.05), "replan.soc_change_frac"
@@ -1287,6 +1306,15 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
         soc_source=soc_source,
     )
     battery_health = _parse_battery_health(_section(raw, "battery_health"))
+    dwell_per_kwh = (
+        planning.high_soc_cost_eur_per_kwh_h * planning.max_horizon_slots * interval_seconds / 3600
+    )
+    if full_charge.enabled and full_charge.shortfall_penalty_eur_per_kwh <= dwell_per_kwh:
+        raise ValueError(
+            "service config: full_charge.shortfall_penalty_eur_per_kwh must exceed "
+            "planning.high_soc_cost_eur_per_kwh_h times the longest horizon in hours "
+            f"({dwell_per_kwh:.6g}), or the dwell cost could outweigh reaching the target"
+        )
     if mode == "live" and soc_source != "entity":
         raise ValueError(
             "service config: mode=live needs planning.soc_source=entity: a plan made from a "

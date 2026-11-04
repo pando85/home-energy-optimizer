@@ -128,6 +128,20 @@ Optional full-charge day
   ``charge[t] <= h*(p_tap + (P - p_tap)*(cap - soc[t-1])/(cap*(1 - x0)))``, a ramp
   from the full power ``P`` at ``x0`` down to ``p_tap`` at the top.
 
+Optional high-SOC dwell cost
+----------------------------
+``high_soc_cost=(threshold_frac, eur_per_kwh_h)`` of :func:`build_model` and
+:func:`solve_oracle` (``None`` or a zero cost: the model above, byte for byte) prices the
+**time** spent above ``threshold_frac * capacity`` (LFP calendar aging is worse at high
+SOC).  After every other column there is one continuous ``e[t] >= 0`` per slot, with the
+row ``e[t] - soc[t] >= -threshold * capacity`` and ``+ cost * h * e[t]`` in the objective, so
+the solver pays ``cost`` per kWh of end-of-slot SOC above the threshold per hour held.  It is
+a planning convention like the throughput cost, not a fitted aging model.  The shortfall
+penalty of a full-charge checkpoint must dominate it (``penalty > cost * horizon hours``,
+checked), so the checkpoint is still reached whatever the dwell price; the dwell cost then
+only decides *when* the plan climbs to the target, which is what makes it finish close to
+the discharge.
+
 Prices are pretax, and a uniform tax factor scales energy cost without changing
 the argmin, so this optimum is also the tax-multiplied optimum.
 
@@ -191,7 +205,9 @@ __all__ = [
     "build_model",
     "checkpoint_outcome",
     "classify_result",
+    "high_soc_dwell_kwh_h",
     "solve_oracle",
+    "validate_high_soc_cost",
 ]
 
 # HiGHS exit statuses surfaced by ``scipy.optimize.milp``.
@@ -377,6 +393,43 @@ def checkpoint_outcome(
 # ---------------------------------------------------------------------------
 
 
+def validate_high_soc_cost(high_soc_cost) -> tuple[float, float] | None:
+    """Validate ``high_soc_cost`` and return ``(threshold_frac, cost)``, or ``None`` when inert."""
+    if high_soc_cost is None:
+        return None
+    try:
+        threshold, cost = high_soc_cost
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"high_soc_cost must be (threshold_frac, eur_per_kwh_h) or None, got {high_soc_cost!r}"
+        ) from exc
+    if isinstance(threshold, bool) or isinstance(cost, bool):
+        raise ValueError(f"high_soc_cost must hold numbers, got bool in {high_soc_cost!r}")
+    try:
+        threshold, cost = float(threshold), float(cost)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"high_soc_cost must hold numbers, got {high_soc_cost!r}") from exc
+    if not (math.isfinite(threshold) and 0.0 < threshold < 1.0):
+        raise ValueError(f"high_soc_cost threshold_frac must be in (0, 1), got {threshold!r}")
+    if not math.isfinite(cost) or cost < 0.0:
+        raise ValueError(f"high_soc_cost eur_per_kwh_h must be finite and >= 0, got {cost!r}")
+    return (threshold, cost) if cost > 0.0 else None
+
+
+def high_soc_dwell_kwh_h(
+    schedule: Schedule, spec: BatterySpec, interval_seconds: float, threshold_frac: float
+) -> float:
+    """kWh*h of end-of-slot SOC above ``threshold_frac`` of capacity in a solved plan.
+
+    The quantity the dwell cost multiplies: the plan's dwell cost is
+    ``eur_per_kwh_h * high_soc_dwell_kwh_h(...)``, recoverable from the schedule because the
+    reported ``cost_eur`` excludes it.
+    """
+    soc = np.asarray(schedule.soc_kwh, dtype=float)
+    excess = np.maximum(soc - threshold_frac * spec.capacity_kwh, 0.0)
+    return float(excess.sum() * interval_seconds / 3600.0)
+
+
 def build_model(
     spec: BatterySpec,
     horizon: Horizon,
@@ -386,6 +439,7 @@ def build_model(
     floor_kwh: float | None = None,
     throughput_cost_eur_per_kwh: float = 0.0,
     full_charge: FullChargeModel | None = None,
+    high_soc_cost: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, Bounds, list[LinearConstraint]]:
     """Assemble the MILP: ``(objective, integrality, bounds, constraints)``.
 
@@ -435,6 +489,12 @@ def build_model(
     of :class:`FullChargeModel`.  The extra columns come last (``z`` for each
     checkpoint slot, then the shortfall ``s``) and the extra rows after every
     historical row, so no existing index moves.
+
+    ``high_soc_cost`` (default ``None``: the model above, byte for byte) is
+    ``(threshold_frac, eur_per_kwh_h)``; a positive cost appends one continuous excess
+    column ``e[t]`` per slot (after the full-charge columns, so ``z`` and the shortfall keep
+    their indices), the row ``e[t] - soc[t] >= -threshold * capacity`` after every other row,
+    and ``cost * h`` on each ``e[t]``.  See the module section "Optional high-SOC dwell cost".
     """
     _check_terminal_mode(terminal_mode)
     free = terminal_mode == _TERMINAL_FREE
@@ -454,9 +514,12 @@ def build_model(
         )
     tp = float(throughput_cost_eur_per_kwh)
 
+    dwell = validate_high_soc_cost(high_soc_cost)
     n = horizon.n
     n_checkpoints = 0 if full_charge is None else len(full_charge.checkpoint_slots)
-    n_vars = 4 * n + (n_checkpoints + 1 if n_checkpoints else 0)
+    n_fc_cols = n_checkpoints + 1 if n_checkpoints else 0
+    e0 = 4 * n + n_fc_cols
+    n_vars = e0 + (n if dwell is not None else 0)
     limit = spec.interval_energy_limit_kwh(horizon.interval_seconds)
     # Free mode shares the causal floor (cannot spend the seed); fixed mode uses
     # the bare window floor and pins the terminal SOC instead.  An explicit
@@ -482,6 +545,17 @@ def build_model(
     ceil_kwh = spec.soc_bound_kwh("max")
     if full_charge is not None:
         _validate_full_charge(full_charge, spec, horizon.n, floor_kwh, ceil_kwh)
+        horizon_h = horizon.n * horizon.interval_seconds / 3600.0
+        if (
+            dwell is not None
+            and full_charge.checkpoint_slots
+            and full_charge.shortfall_penalty_eur_per_kwh <= dwell[1] * horizon_h
+        ):
+            raise ValueError(
+                "full_charge.shortfall_penalty_eur_per_kwh must exceed the high-SOC dwell cost "
+                f"over the horizon ({dwell[1] * horizon_h:.6g} EUR/kWh): the checkpoint must "
+                "dominate the dwell cost"
+            )
     soc_init = spec.soc_bound_kwh("init")
     terminal_kwh = spec.soc_bound_kwh("terminal")
     eta_c = spec.charge_efficiency
@@ -603,6 +677,15 @@ def build_model(
             ub=ub,
             integrality=integrality,
         )
+
+    if dwell is not None:
+        threshold_kwh = dwell[0] * spec.capacity_kwh
+        h = horizon.interval_seconds / 3600.0
+        e_cols = e0 + t_of
+        ub[e_cols] = max(ceil_kwh - threshold_kwh, 0.0)
+        obj[e_cols] = dwell[1] * h
+        for t in range(n):
+            add_row([(e0 + t, 1.0), (_soc_idx(n, t), -1.0)], -threshold_kwh, np.inf)
 
     a = coo_array((rows_v, (rows_i, rows_j)), shape=(len(con_lb), n_vars), dtype=float)
     constraints = [LinearConstraint(a, np.asarray(con_lb), np.asarray(con_ub))]
@@ -736,6 +819,7 @@ def solve_oracle(
     floor_kwh: float | None = None,
     throughput_cost_eur_per_kwh: float = 0.0,
     full_charge: FullChargeModel | None = None,
+    high_soc_cost: tuple[float, float] | None = None,
 ) -> Schedule:
     """Cost-minimising dispatch over the whole horizon with perfect information.
 
@@ -791,6 +875,14 @@ def solve_oracle(
             penalised objective.  Read the checkpoint and shortfall back with
             :func:`checkpoint_outcome`.  The spec must already carry the lifted
             ``soc_max_frac`` (the kernel re-trace validates against it).
+        high_soc_cost: Optional ``(threshold_frac, eur_per_kwh_h)`` dwell cost on SOC above
+            the threshold (see "Optional high-SOC dwell cost" in the module docstring).
+            ``None`` or a zero cost is the historical model.  Like the throughput cost it is
+            a planning-only term: the reported ``cost_eur`` is the real cost (dwell
+            excluded), recoverable as ``eur_per_kwh_h * high_soc_dwell_kwh_h(...)``, and the
+            dual bound is discarded because it belongs to the penalised objective.  With a
+            full-charge checkpoint, the shortfall penalty must exceed the dwell cost over
+            the horizon (``ValueError`` otherwise).
 
     Raises:
         ValueError: If *spec* is not physically meaningful, a tolerance or the
@@ -835,6 +927,7 @@ def solve_oracle(
         floor_kwh=floor_kwh,
         throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
         full_charge=full_charge,
+        high_soc_cost=high_soc_cost,
     )
     options = _solver_options(time_limit_s, mip_rel_gap, mip_abs_gap)
     with warnings.catch_warnings():
@@ -907,7 +1000,8 @@ def solve_oracle(
     # basis with the constants the objective dropped (load term and, in free
     # mode, the terminal_value * initial_SOC offset).  value == 0 in fixed mode.
     #
-    # HOWEVER: when throughput_cost > 0, the solver's primal/dual bounds are for
+    # HOWEVER: when throughput_cost > 0 (or a high-SOC dwell cost is active, which prices the
+    # plan the same way), the solver's primal/dual bounds are for
     # the **penalized** objective (meter_cost + throughput_penalty + inventory),
     # not the reported meter-cost objective (meter_cost + inventory).  Subtracting
     # the incumbent's throughput from the dual bound is NOT a valid lower bound
@@ -922,7 +1016,8 @@ def solve_oracle(
     # bound.  Keeping it avoids downstream damage (benchmark savings calculations
     # and policies.days_at_time_limit need a finite upper bound).
     upper: float | None = total_cost
-    if throughput_cost_eur_per_kwh > 0.0:
+    dwell_active = validate_high_soc_cost(high_soc_cost) is not None
+    if throughput_cost_eur_per_kwh > 0.0 or dwell_active:
         lower = None
         # upper stays total_cost — the incumbent's unpenalized cost is a valid
         # (loose) upper bound; we discard only the dual bound because it belongs
@@ -935,7 +1030,11 @@ def solve_oracle(
         # Zero throughput cost: dual bound is valid for the reported cost.
         load_term = _load_cost_term(horizon)
         lower = None if dual is None else load_term + value * initial_kwh + float(dual)
-    if full_charge is not None and full_charge.checkpoint_slots and x[-1] > _TOL_KWH:
+    if (
+        full_charge is not None
+        and full_charge.checkpoint_slots
+        and x[4 * n + len(full_charge.checkpoint_slots)] > _TOL_KWH
+    ):
         # A missed target puts the penalty in the solver's objective: the dual bound
         # no longer bounds the reported (penalty-free) cost.
         lower = None

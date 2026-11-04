@@ -141,7 +141,7 @@ from .battery import (
     simulate,
     validate_spec,
 )
-from .oracle import OracleError, solve_oracle
+from .oracle import OracleError, solve_oracle, validate_high_soc_cost
 
 __all__ = [
     "DEFAULT_FORECAST_WINDOW_DAYS",
@@ -775,6 +775,7 @@ def policy_day_ahead(
     mip_rel_gap: float,
     mip_abs_gap: float,
     throughput_cost_eur_per_kwh: float = 0.0,
+    high_soc_cost: tuple[float, float] | None = None,
 ) -> tuple[Schedule, dict[str, Any]]:
     """Rolling day-ahead optimiser: one MILP per local day, executed, SOC rolled forward.
 
@@ -927,6 +928,7 @@ def policy_day_ahead(
             f"throughput_cost_eur_per_kwh must be finite and >= 0, got "
             f"{throughput_cost_eur_per_kwh!r}"
         )
+    validate_high_soc_cost(high_soc_cost)
     if not math.isfinite(time_limit_s) or time_limit_s <= 0:
         raise ValueError(f"time_limit_s must be > 0, got {time_limit_s}")
     if mip_rel_gap <= 0 or mip_abs_gap <= 0:
@@ -1112,6 +1114,7 @@ def policy_day_ahead(
                 # The horizon's seed floor, not this day's opening SOC: see the docstring.
                 floor_kwh=floor_kwh,
                 throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
+                high_soc_cost=high_soc_cost,
             )
         except OracleError as exc:
             text = str(exc).lower()
@@ -1309,4 +1312,14 @@ def policy_day_ahead(
         ),
         "per_day": per_day,
     }
+    if validate_high_soc_cost(high_soc_cost) is not None:
+        # Only an active dwell cost adds keys, so the canonical telemetry is unchanged.
+        telemetry["high_soc_cost"] = {
+            "threshold_frac": float(high_soc_cost[0]),
+            "eur_per_kwh_h": float(high_soc_cost[1]),
+            "role": (
+                "planning-only dwell price on SOC above the threshold, added to each daily "
+                "MILP objective; never in the reported Schedule.cost_eur"
+            ),
+        }
     return schedule, telemetry

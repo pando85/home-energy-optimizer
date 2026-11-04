@@ -132,6 +132,12 @@ planning:
   # saving within 5% of the 0-cost saving in S2 winter, S3 winter and summer);
   # see docs/components/battery-model.md.  Re-run hack/throughput_sweep.py on real battery data.
   throughput_cost_eur_per_kwh: 0.01
+  # High-SOC dwell cost: EUR per kWh of SOC above high_soc_threshold_frac, per hour held (planning
+  # only, never in reported cost; LFP calendar aging is worse at high SOC).  0 = off, today's
+  # behaviour.  Applies on a full-charge day too, so the 100% checkpoint finishes close to the
+  # discharge.  Value chosen by hack/high_soc_dwell_sweep.py, see docs/planning/high-soc-dwell-cost.md.
+  high_soc_threshold_frac: 0.90
+  high_soc_cost_eur_per_kwh_h: 0.0
   replan:
     soc_change_frac: 0.05
     debounce_s: 30
