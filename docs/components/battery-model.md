@@ -113,6 +113,19 @@ uv run python hack/throughput_sweep.py --dataset <store>/analysis/v1/<dataset_id
   --data-dir <store> --run-id <fresh-name>
 ```
 
+
+## KPIs
+
+Observability only; they show whether the battery does what the model assumes. Metrics are prefixed
+`battery_optimizer_`; the offline tool is `uv run python hack/day_ahead_kpis.py --from <day> --to <day>`.
+
+| KPI | Where |
+|---|---|
+| Commanded against actual power | `actuator_desired_pd_target_watts` and `actuator_observed_battery_power_watts` (`dry_run`/`live`); the planned power is `slot_battery_power_watts{plan}` (+ charge), the actual from Home Assistant is negated (`sensor.venus_ac_power` is + while discharging) |
+| Planned energy not delivered (clamped) | `actuator_clamped_watts` (`dry_run`/`live`); `shadow_clipped_energy_kwh_total` for the replay's clipping; offline `battery.<series>.mae_net_kwh_per_slot` |
+| SOC tracking | offline `soc.<plan>.mae_frac` and `bias_frac` (actual SOC at the slot end minus the plan's target); `slot_soc_target_ratio{plan}` against the HA SOC sensor |
+| Round-trip efficiency | not a service metric: the AC discharge energy over the AC charge energy of a full cycle plus the SOC change, from `shadow_actual_battery_energy_kwh_total` and the SOC sensor, or offline `battery.actual.discharge_kwh / charge_kwh` over a window that starts and ends at the same SOC |
+
 ## Status
 
 **stale** (2026-11-03): the battery is commissioned and, since go-live (2026-11-03 23:45, regime log), live

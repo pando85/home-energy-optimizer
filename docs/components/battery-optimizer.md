@@ -130,6 +130,23 @@ explained before go-live; the floor-hit share on expensive cold-day slots stays 
 For the full-charge day: the existing benchmark plus the `dry_run` decision study of the plan (the distribution
 of `forcing_cost`); the benchmark ladder itself does not model the day, so no benchmark claim is made for it.
 
+
+## KPIs
+
+Observability only ([service](../service.md#day-ahead-and-final-plan)). The *day-ahead plan* of a slot is the
+first plan that covered it, the *final plan* the plan of record at the slot open. Metrics are prefixed
+`battery_optimizer_`.
+
+| KPI | Where |
+|---|---|
+| Plan revision, kWh per day (how much the plan moved between day-ahead and final) | `increase(plan_revision_kwh_total[1d])`; offline `battery.plan_revision` |
+| Daily saving against a house without the battery (pretax, before valuing the stored energy) | offline only: `battery.<series>.saving_eur` and `saving_eur_per_day` for `day_ahead`, `final` and `actual` (the live cost counters are `shadow_native_cost_eur` and `shadow_counterfactual_cost_eur`) |
+| Average price charging against average price discharging | offline `avg_price_charging_eur_per_kwh` and `avg_price_discharging_eur_per_kwh`; a working arbitrage has the second above the first by more than the round-trip loss and wear cost |
+| Planned against actual battery energy | `increase(shadow_day_ahead_energy_kwh_total{direction}[1d])`, `shadow_planned_energy_kwh_total` (final), `shadow_actual_battery_energy_kwh_total` (actual) |
+| Power and SOC target, day-ahead against final | `slot_battery_power_watts{plan}`, `slot_soc_target_ratio{plan}` |
+
+Offline: `uv run python hack/day_ahead_kpis.py --from <day> --to <day>`.
+
 ## Status
 
 **stale** (2026-11-03): live since 2026-11-03 23:45 (first live slot 22:45 UTC; [regime log](regime-log.md)),

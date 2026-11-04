@@ -62,6 +62,7 @@ mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 | `archive` | Record builders and the fetch schedule of the passive [archives](#passive-archives) |
 | `sink` | Append-only store under the data directory |
 | `shadow_report` | Shadow-vs-native comparison (`shadow-report`) |
+| `plan_tracker`, `plan_kpis` | The [day-ahead plan](#day-ahead-and-final-plan) of every slot (rebuilt from the plan files on start) and its offline KPIs (`hack/day_ahead_kpis.py`) |
 | `api`, `serve`, `metrics` | HTTP surface, uvicorn wiring, Prometheus metrics |
 
 ### What is reused from the offline code
@@ -149,6 +150,70 @@ Each plan yields one intent per slot with `plan_id`, `plan_sequence`, `valid_fro
 `shadow: true`. A plan expires `plan_ttl_slots` (2) slots after its first slot, so intents beyond the
 expiry are recorded as forecast only (`actionable: false`) and an old plan can never be "current".
 A restart never resumes a persisted plan.
+
+### Day-ahead and final plan
+
+The service replans every 15 minutes, so the plan of record for a slot (what `current_intent` and the
+Home Assistant "planned" sensors show) is made at most a quarter of an hour before the slot and hides
+the quality of the forecast. Three names are used everywhere (API fields, the `plan` label of the
+metrics, the slot rows, this page):
+
+* **day-ahead plan** of a slot: the **first** plan, by `(generated_at, plan_sequence)`, whose intents
+  covered the slot and that was generated at or before the slot's start. Usually it is the plan made the
+  previous afternoon when the next day's PVPC is published, so the lead time varies (hours to a day and a
+  half ahead, less after a late publication). A plan made inside the slot (a
+  catch-up plan) is not its day-ahead plan: the slot has none, which shows as a missing sample or `null`,
+  never as a zero. Intents beyond the plan's expiry (forecast only, `actionable: false`) count: the
+  day-ahead plan is a forecast, not a command;
+* **final plan**: the plan of record when the slot opened, i.e. the intent frozen at the open (what
+  `current_intent` is, `late_intent` included);
+* **actual**: what the slot close measured (battery energy, grid, SOC, gross load).
+
+Per slot and plan the service keeps the signed battery power (`+` charge, `-` discharge, like
+`current_intent`), the SOC target at the slot's end, the house-load forecast of the slot (the plan's
+`load_kwh` input; `inputs.load_kwh` in the plan file) and the expected buy price. Tracking is
+`service/plan_tracker.py`: one entry per slot from two hours back to the end of the longest horizon
+(bounded, past slots pruned). On start the tracker is rebuilt from the immutable plan files of the last two
+UTC days (`rebuild_day_ahead`, off the event loop, logged as `day-ahead rebuilt plan_files=... slots=...`);
+because the choice is by `(generated_at, plan_sequence)` and not by arrival, the rebuild gives what an
+uninterrupted process would hold. A failed or partial rebuild only means missing day-ahead values. Nothing
+here feeds the planner or the actuator: it is observability.
+
+`/plan` gains two keys (everything else is unchanged; HA templates reading `current_intent.signed_power_w`,
+`soc_target_frac` or `plan.intents[*]` keep working):
+
+```json
+{
+  "current_intent": {"plan_id": "...", "signed_power_w": -800.0, "soc_target_frac": 0.31, "...": "..."},
+  "current_slot": {
+    "slot_start": "2026-11-05T17:15:00+00:00",
+    "slot_end": "2026-11-05T17:30:00+00:00",
+    "decision": "intent",
+    "day_ahead": {
+      "plan_id": "<plan_id>", "plan_sequence": 1790000001,
+      "generated_at": "2026-11-04T15:00:12+00:00", "lead_seconds": 94488.0,
+      "mode": "discharge", "signed_power_w": -600.0, "soc_target_frac": 0.35,
+      "load_forecast_kwh": 0.21, "load_forecast_w": 840.0,
+      "expected_buy_price_eur_per_kwh": 0.231,
+      "charge_kwh": 0.0, "discharge_kwh": 0.15
+    },
+    "final": {"plan_id": "...", "lead_seconds": 105.0, "signed_power_w": -800.0, "...": "same keys"}
+  },
+  "day_ahead": {
+    "slots": [
+      {"slot_start": "2026-11-05T17:15:00+00:00", "...": "the day_ahead keys above",
+       "latest": {"plan_id": "...", "generated_at": "...", "signed_power_w": -800.0,
+                  "soc_target_frac": 0.31, "load_forecast_w": 800.0}}
+    ]
+  }
+}
+```
+
+`current_slot.day_ahead` / `final` are `null` when the slot has none (before the first slot has opened,
+after a first deploy, a slot without a decision). `day_ahead.slots` lists the slots that have not ended, the
+one in progress first, each with the newest plan's values as `latest` (`null` when the newest plan does not
+reach the slot), so Home Assistant can chart the day-ahead plan against the latest one. `charge_kwh` /
+`discharge_kwh` are the AC energy the plan asks for over the whole slot.
 
 ## Readiness
 
@@ -242,7 +307,7 @@ return 405). Bind address `0.0.0.0`, container port **8080**.
 | `/health/live` | `{"status": "alive"}` — the process and its event loop are up |
 | `/health/ready` | `{ready, inputs_ready, reasons, details}`; 200 or 503 |
 | `/status` | Mode, adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), `battery_health` (only when a `battery_health.entities` role is configured), `full_charge` (only with `full_charge.enabled`), code version, config hash; in `dry_run`/`live` also `actuator` (kill switch, in control, guard reasons, desired and observed state, alert, last error, import-trip hold, last tick / confirmed write / heartbeat) |
-| `/plan` | Latest plan with its snapshot summary, solver result and intents, plus the current intent (all flagged `shadow`) |
+| `/plan` | Latest plan with its snapshot summary, solver result and intents, plus the current intent (all flagged `shadow`), and the [day-ahead and final plan](#day-ahead-and-final-plan) of the current slot (`current_slot`) and of every upcoming slot (`day_ahead.slots`) |
 | `/metrics` | Prometheus exposition |
 
 Kubernetes probes: use `/health/live` for liveness **and readiness**. `/health/ready` answers 503
@@ -272,6 +337,10 @@ ID, price, timestamp or household reading is a label.
 | `solve_in_progress` | gauge | — |
 | `plan_age_seconds`, `plan_horizon_slots` | gauge | — |
 | `current_intent_power_watts`, `current_intent_active` | gauge | — |
+| `slot_battery_power_watts` (+ charge), `slot_soc_target_ratio`, `slot_load_forecast_watts` (mean over the slot), `slot_plan_lead_seconds` | gauge: the slot in progress, frozen at its open; no sample for a plan the slot does not have | `plan` (`day_ahead`, `final`) |
+| `shadow_day_ahead_energy_kwh_total` | counter: AC energy the day-ahead plans requested, over the slots that had one (the final plan's is `shadow_planned_energy_kwh_total`, the actual `shadow_actual_battery_energy_kwh_total`) | `direction` |
+| `plan_revision_kwh_total` | counter: sum over slots with both plans of `|day-ahead - final|` requested net battery energy | — |
+| `load_forecast_scored_slots_total`, `load_forecast_kwh_total`, `load_actual_kwh_total`, `load_forecast_abs_error_kwh_total` | counter, at slot close, over the slots with a forecast of that plan and a measured gross load | `plan` |
 | `history_refresh_total` | counter | `result` |
 | `history_usable_slots`, `history_age_seconds`, `terminal_value_eur_per_kwh` | gauge | — |
 | `shadow_slots_total` | counter | `decision` (`intent`, `late_intent`, `no_plan`, `plan_expired`, `not_ready`, `not_observed`) |
@@ -325,6 +394,19 @@ ID, price, timestamp or household reading is a label.
 | `actuator_safe_idles_total` | counter | `reason` (guard reasons, `write_failed`, `shutdown`) |
 | `actuator_heartbeats_total` | counter | `result` (`ok`, `failed`, `dry_run`) |
 | `actuator_last_successful_write_timestamp_seconds` | gauge (0 until the first confirmed write) | — |
+
+Day-ahead and final KPIs (per-day views: `increase(...[1d])`; the signed load error is the difference of
+two counters, so every series stays monotonic and survives restarts):
+
+* load forecast MAE (kWh per slot): `increase(battery_optimizer_load_forecast_abs_error_kwh_total{plan="day_ahead"}[1d]) / increase(battery_optimizer_load_forecast_scored_slots_total{plan="day_ahead"}[1d])`;
+* load forecast bias, actual minus forecast (kWh per day, positive = under-forecast): `increase(battery_optimizer_load_actual_kwh_total{plan="day_ahead"}[1d]) - increase(battery_optimizer_load_forecast_kwh_total{plan="day_ahead"}[1d])`;
+* daily energy error in percent (forecast against actual): `100 * (increase(battery_optimizer_load_forecast_kwh_total{plan="day_ahead"}[1d]) / increase(battery_optimizer_load_actual_kwh_total{plan="day_ahead"}[1d]) - 1)`;
+* plan revision (kWh per day): `increase(battery_optimizer_plan_revision_kwh_total[1d])`;
+* battery energy by series: `increase(battery_optimizer_shadow_day_ahead_energy_kwh_total{direction="charge"}[1d])` (day-ahead),
+  `...shadow_planned_energy_kwh_total{direction="charge"}` (final), `...shadow_actual_battery_energy_kwh_total{direction="charge"}` (actual).
+  The final and actual counters also cover slots without a day-ahead plan (after a first deploy), so compare the three
+  only over a period in which every slot had one, or use the [offline tool](#offline-day-ahead-kpis), which keeps to
+  the slots that have all three.
 
 The `battery_*` rows exist only when a `battery_health.entities` role is configured. Suggested alerts
 (homelab): `ready == 0` for 30 m; `ha_connected == 0` for 10 m;
@@ -388,6 +470,13 @@ files `0600`, directories `0700`:
 | `events/date=YYYY-MM-DD/events.jsonl` | Start/stop, HA sync/disconnect, solve skipped/error/timeout/discarded, history refresh, price publication |
 | `state/virtual_battery.json` | Virtual SOC (restored after a restart if younger than 6 h) |
 | `state/full_charge.json` | Periodic full charge only (mutable, atomic): the scheduler's knowledge and calendar decision, never a plan ([scheduler](#periodic-full-charge-the-scheduler)) |
+
+A slot row also carries `day_ahead` and `final` (the [per-slot values](#day-ahead-and-final-plan): plan ID,
+generation time, `lead_seconds`, mode, `signed_power_w`, `soc_target_frac`, `load_forecast_kwh`,
+`load_forecast_w`, expected price, and the `charge_kwh` / `discharge_kwh` the plan asks for over the whole slot,
+not pro-rated for a late adoption; `null` when the slot has none) and `plan_revision_kwh` (`|day-ahead - final|`
+requested net battery energy, `null` unless both exist), next to the measured values; every older key is
+unchanged.
 
 A slot row's `decision` is the outcome that held when the slot closed: `intent`, `late_intent`, `no_plan`,
 `plan_expired`, `not_ready` or `not_observed`. `decision_at_open` is the decision frozen at `B` (equal to
@@ -639,6 +728,25 @@ alone, per local day and overall:
 with no battery and the counterfactual is the virtual battery, which estimates the battery's value
 but does **not** satisfy exit gate C. `exit_gate.met` requires at least 14 local days with ≥ 90 %
 coverage on the `native_battery` basis.
+
+### Offline day-ahead KPIs
+
+```bash
+uv run python hack/day_ahead_kpis.py --from 2026-11-04 --to 2026-11-11 [--run-id week45] [--json]
+```
+
+Reads the plan files and the slot rows of a window of UTC days (`BATTERY_OPTIMIZER_DATA_DIR` or
+`--data-dir`) and prints the KPI summary: the load forecast MAE, bias (actual minus forecast) and daily energy
+error for the day-ahead and the final plan, the battery energy each plan asked for against what the battery
+did, the plan revision, the average price of the energy charged against the energy discharged, the saving
+against a house without the battery (`sum(price x (discharge - charge))`, pretax, before valuing the energy
+left in the battery), and the SOC target error. Battery figures use the slots that have a day-ahead plan, a
+final intent and a measured battery energy; load figures every slot where that plan has a forecast and the load
+was measured. The final plan is read from the slot row's `intent`, so rows from before the day-ahead fields
+existed work; the day-ahead plan is recomputed from the plan files (up to three UTC days before the window).
+With `--run-id` it also writes `report.json` and a per-slot `slots.csv` under
+`<data_dir>/analysis/v1/day-ahead-kpis/<run-id>/`, never in the repository. The logic is
+`service/plan_kpis.py`.
 
 ## Live control (dry_run and live)
 
