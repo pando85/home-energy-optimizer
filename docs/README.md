@@ -67,6 +67,7 @@ change leads to a recalibration instead of a silent drift.
 | [Climate flow calibration and optimization (C7-F)](planning/climate-flow-calibration-optimization.md) | Optional model-free joint field trial of permitted heating hours and water temperature; guarded flow actuation parked |
 | [Comfort controller design](planning/comfort-controller-design.md) | Homelab AppDaemon comfort controller replacing the cheapest-hours rule: run logic, schedule, software water-temperature curve, DHW rule, rollback, before/after evaluation and the shadow MPC (track B) |
 | [Climate preregistration 2026-27](planning/climate-preregistration-2026-27.md) | Criteria committed before any 2026-27 heating data: shadow thermal model and MPC (track B) and the comfort controller before/after comparison; amendments only before go-live |
+| [Periodic full charge for cell balancing](planning/periodic-full-charge.md) | Plan (not implemented, off by default): opportunistic 100% charge every 5 to 15 days chosen from next-day prices, soft-target MILP, Omnibattery weekly-full-charge as self-limiting enabler, ADR-0007 allowlist amendment, state, failure modes and the 3-PR split |
 | [Whole-system replay](planning/system-replay.md) | Offline heat-pump regime x battery replay (`hack/system_sim.py`): results as relative figures and how to reproduce them |
 
 ## Provenance
