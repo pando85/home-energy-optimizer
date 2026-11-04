@@ -110,6 +110,24 @@ Objective (minimise)
   the terminal inventory at zero" — a pure cash-flow objective, labelled
   "zero terminal-inventory value / cash-flow objective".
 
+Optional full-charge day
+------------------------
+:class:`FullChargeModel` (``full_charge=`` of :func:`build_model` and
+:func:`solve_oracle`; absent means the model above, byte for byte) adds, after the
+``4n`` columns and the rows above, so no existing index moves:
+
+* a **per-slot SOC ceiling** (``ub[soc[t]] = ceiling_kwh[t]``, never above the
+  spec's own ``soc_max_frac``);
+* a **checkpoint**: one binary ``z[k]`` per eligible slot with ``sum z = 1``, a
+  continuous shortfall ``s >= 0`` and ``soc[t_k] + s >= target - M*(1 - z[k])``
+  (``M = target - floor``), and ``+ penalty * s`` in the objective.  "SOC reaches the
+  target at *some* slot of the window" is a disjunction; the binaries make it exact,
+  and the soft slack makes the model feasible whatever the horizon (``s = 0``
+  whenever the target is reachable);
+* a convex **taper**: one half-space per slot from ``taper_first_slot``,
+  ``charge[t] <= h*(p_tap + (P - p_tap)*(cap - soc[t-1])/(cap*(1 - x0)))``, a ramp
+  from the full power ``P`` at ``x0`` down to ``p_tap`` at the top.
+
 Prices are pretax, and a uniform tax factor scales energy cost without changing
 the argmin, so this optimum is also the tax-multiplied optimum.
 
@@ -148,7 +166,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
@@ -166,10 +184,12 @@ from .battery import (
 )
 
 __all__ = [
+    "FullChargeModel",
     "OracleError",
     "OracleInfeasibleError",
     "OracleNoIncumbentError",
     "build_model",
+    "checkpoint_outcome",
     "classify_result",
     "solve_oracle",
 ]
@@ -274,6 +294,85 @@ def _validate_free_spec(spec: BatterySpec, terminal_value_eur_per_kwh) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Full-charge day (optional model extension)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FullChargeModel:
+    """A day on which the SOC ceiling is lifted and a soft checkpoint is required.
+
+    ``ceiling_kwh`` is the per-slot SOC ceiling (one entry per slot; each at most the
+    spec's ``soc_max_frac`` capacity, so the spec must already carry the lifted
+    maximum).  ``checkpoint_slots`` are the slots at whose **end** the SOC must reach
+    ``target_kwh``, the optimizer choosing which; empty means a lifted ceiling only.
+    ``shortfall_penalty_eur_per_kwh`` prices the unmet part of the target.  The taper
+    rows apply from ``taper_first_slot`` on when ``taper_start_soc_frac`` is not
+    ``None``: ``taper_power_kw`` is the charge power at 100%.
+    """
+
+    ceiling_kwh: tuple[float, ...]
+    checkpoint_slots: tuple[int, ...]
+    target_kwh: float
+    shortfall_penalty_eur_per_kwh: float
+    taper_start_soc_frac: float | None = None
+    taper_power_kw: float = 0.0
+    taper_first_slot: int = 0
+
+
+def _validate_full_charge(
+    fc: FullChargeModel, spec: BatterySpec, n: int, floor_kwh: float, ceil_kwh: float
+) -> None:
+    if len(fc.ceiling_kwh) != n:
+        raise ValueError(f"full_charge.ceiling_kwh needs {n} entries, got {len(fc.ceiling_kwh)}")
+    ceiling = np.asarray(fc.ceiling_kwh, dtype=float)
+    if not np.all(np.isfinite(ceiling)) or ceiling.max() > ceil_kwh + _TOL_KWH:
+        raise ValueError("full_charge.ceiling_kwh must be finite and within the spec's SOC window")
+    if ceiling.min() < floor_kwh - _TOL_KWH:
+        raise ValueError("full_charge.ceiling_kwh must not fall below the SOC floor")
+    if fc.checkpoint_slots:
+        slots = fc.checkpoint_slots
+        if len(set(slots)) != len(slots) or min(slots) < 0 or max(slots) >= n:
+            raise ValueError(f"full_charge.checkpoint_slots must be distinct slots in [0, {n})")
+        if not (math.isfinite(fc.target_kwh) and fc.target_kwh > floor_kwh):
+            raise ValueError("full_charge.target_kwh must be finite and above the SOC floor")
+        if ceiling[list(slots)].min() < fc.target_kwh - _TOL_KWH:
+            raise ValueError("full_charge.ceiling_kwh is below the target at a checkpoint slot")
+        if not (
+            math.isfinite(fc.shortfall_penalty_eur_per_kwh)
+            and fc.shortfall_penalty_eur_per_kwh > 0.0
+        ):
+            raise ValueError("full_charge.shortfall_penalty_eur_per_kwh must be positive")
+    if fc.taper_start_soc_frac is not None:
+        if not 0.5 < fc.taper_start_soc_frac < 1.0:
+            raise ValueError("full_charge.taper_start_soc_frac must be in (0.5, 1)")
+        if not 0.0 < fc.taper_power_kw <= spec.power_kw:
+            raise ValueError("full_charge.taper_power_kw must be in (0, spec.power_kw]")
+        if not 0 <= fc.taper_first_slot <= n:
+            raise ValueError(f"full_charge.taper_first_slot must be in [0, {n}]")
+
+
+def checkpoint_outcome(
+    schedule: Schedule, fc: FullChargeModel, *, tol: float = _TOL_KWH
+) -> tuple[int | None, float]:
+    """``(checkpoint slot, shortfall kWh)`` read back from a solved plan.
+
+    The checkpoint is the first eligible slot whose end SOC reaches the target
+    (shortfall 0), else the eligible slot with the highest SOC (the plan got as high
+    as it could).  ``(None, 0.0)`` when the model has no checkpoint.
+    """
+    if not fc.checkpoint_slots:
+        return None, 0.0
+    slots = sorted(fc.checkpoint_slots)
+    soc = np.asarray(schedule.soc_kwh, dtype=float)[slots]
+    reached = np.flatnonzero(soc >= fc.target_kwh - tol)
+    if reached.size:
+        return slots[int(reached[0])], 0.0
+    best = int(np.argmax(soc))
+    return slots[best], float(fc.target_kwh - soc[best])
+
+
+# ---------------------------------------------------------------------------
 # Model construction
 # ---------------------------------------------------------------------------
 
@@ -286,6 +385,7 @@ def build_model(
     terminal_value_eur_per_kwh: float | None = None,
     floor_kwh: float | None = None,
     throughput_cost_eur_per_kwh: float = 0.0,
+    full_charge: FullChargeModel | None = None,
 ) -> tuple[np.ndarray, np.ndarray, Bounds, list[LinearConstraint]]:
     """Assemble the MILP: ``(objective, integrality, bounds, constraints)``.
 
@@ -329,6 +429,12 @@ def build_model(
     discharge price by the same amount, making marginal arbitrage less attractive
     without changing the constraint set.  ``0.0`` is byte-identical to the
     historical model.
+
+    ``full_charge`` (default ``None``: the model above, byte for byte) appends the
+    per-slot ceiling, the checkpoint binaries and shortfall slack, and the taper rows
+    of :class:`FullChargeModel`.  The extra columns come last (``z`` for each
+    checkpoint slot, then the shortfall ``s``) and the extra rows after every
+    historical row, so no existing index moves.
     """
     _check_terminal_mode(terminal_mode)
     free = terminal_mode == _TERMINAL_FREE
@@ -349,7 +455,8 @@ def build_model(
     tp = float(throughput_cost_eur_per_kwh)
 
     n = horizon.n
-    n_vars = 4 * n
+    n_checkpoints = 0 if full_charge is None else len(full_charge.checkpoint_slots)
+    n_vars = 4 * n + (n_checkpoints + 1 if n_checkpoints else 0)
     limit = spec.interval_energy_limit_kwh(horizon.interval_seconds)
     # Free mode shares the causal floor (cannot spend the seed); fixed mode uses
     # the bare window floor and pins the terminal SOC instead.  An explicit
@@ -373,6 +480,8 @@ def build_model(
             f"{spec.soc_bound_kwh('max')}: the variable bounds would be empty"
         )
     ceil_kwh = spec.soc_bound_kwh("max")
+    if full_charge is not None:
+        _validate_full_charge(full_charge, spec, horizon.n, floor_kwh, ceil_kwh)
     soc_init = spec.soc_bound_kwh("init")
     terminal_kwh = spec.soc_bound_kwh("terminal")
     eta_c = spec.charge_efficiency
@@ -420,6 +529,9 @@ def build_model(
     if not free:
         lb[s_idx[-1]] = terminal_kwh
         ub[s_idx[-1]] = terminal_kwh
+
+    if full_charge is not None:
+        ub[s_idx] = np.minimum(ub[s_idx], np.asarray(full_charge.ceiling_kwh, dtype=float))
 
     rows_i: list[int] = []
     rows_j: list[int] = []
@@ -478,9 +590,65 @@ def build_model(
                 float(headroom_kwh[t]),
             )
 
+    if full_charge is not None:
+        _add_full_charge(
+            full_charge,
+            spec,
+            horizon,
+            n_checkpoints=n_checkpoints,
+            floor_kwh=floor_kwh,
+            soc_init=soc_init,
+            add_row=add_row,
+            obj=obj,
+            ub=ub,
+            integrality=integrality,
+        )
+
     a = coo_array((rows_v, (rows_i, rows_j)), shape=(len(con_lb), n_vars), dtype=float)
     constraints = [LinearConstraint(a, np.asarray(con_lb), np.asarray(con_ub))]
     return obj, integrality, Bounds(lb, ub), constraints
+
+
+def _add_full_charge(
+    fc: FullChargeModel,
+    spec: BatterySpec,
+    horizon: Horizon,
+    *,
+    n_checkpoints: int,
+    floor_kwh: float,
+    soc_init: float,
+    add_row,
+    obj: np.ndarray,
+    ub: np.ndarray,
+    integrality: np.ndarray,
+) -> None:
+    """Fill the checkpoint columns and append the checkpoint and taper rows."""
+    n = horizon.n
+    if n_checkpoints:
+        z0 = 4 * n
+        s_col = z0 + n_checkpoints
+        ub[z0:s_col] = 1.0
+        integrality[z0:s_col] = 1.0
+        ub[s_col] = fc.target_kwh
+        obj[s_col] = fc.shortfall_penalty_eur_per_kwh
+        big_m = fc.target_kwh - floor_kwh
+        add_row([(z0 + k, 1.0) for k in range(n_checkpoints)], 1.0, 1.0)
+        for k, t in enumerate(fc.checkpoint_slots):
+            add_row(
+                [(_soc_idx(n, t), 1.0), (s_col, 1.0), (z0 + k, -big_m)],
+                fc.target_kwh - big_m,
+                np.inf,
+            )
+    if fc.taper_start_soc_frac is not None:
+        h = horizon.interval_seconds / 3600.0
+        cap = spec.capacity_kwh
+        slope = (spec.power_kw - fc.taper_power_kw) * h / (cap * (1.0 - fc.taper_start_soc_frac))
+        rhs = h * fc.taper_power_kw + slope * cap
+        for t in range(fc.taper_first_slot, n):
+            if t == 0:
+                add_row([(_charge_idx(t), 1.0)], -np.inf, rhs - slope * soc_init)
+            else:
+                add_row([(_charge_idx(t), 1.0), (_soc_idx(n, t - 1), slope)], -np.inf, rhs)
 
 
 def _solver_options(
@@ -567,6 +735,7 @@ def solve_oracle(
     terminal_value_eur_per_kwh: float | None = None,
     floor_kwh: float | None = None,
     throughput_cost_eur_per_kwh: float = 0.0,
+    full_charge: FullChargeModel | None = None,
 ) -> Schedule:
     """Cost-minimising dispatch over the whole horizon with perfect information.
 
@@ -614,6 +783,14 @@ def solve_oracle(
             changing the constraint set.  The reported ``cost_eur`` stays the meter bill
             plus inventory adjustment; the throughput penalty is recoverable as
             ``throughput_cost_eur_per_kwh * (sum(charge) + sum(discharge))``.
+        full_charge: Optional :class:`FullChargeModel` (lifted per-slot ceiling, soft
+            checkpoint, taper).  ``None`` is the historical model.  With a checkpoint the
+            solver's objective includes the shortfall penalty, but the reported
+            ``cost_eur`` is the plan's real cost (penalty excluded); the dual bound is
+            discarded when the plan misses the target, because it then belongs to the
+            penalised objective.  Read the checkpoint and shortfall back with
+            :func:`checkpoint_outcome`.  The spec must already carry the lifted
+            ``soc_max_frac`` (the kernel re-trace validates against it).
 
     Raises:
         ValueError: If *spec* is not physically meaningful, a tolerance or the
@@ -657,6 +834,7 @@ def solve_oracle(
         terminal_value_eur_per_kwh=terminal_value_eur_per_kwh if free else None,
         floor_kwh=floor_kwh,
         throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
+        full_charge=full_charge,
     )
     options = _solver_options(time_limit_s, mip_rel_gap, mip_abs_gap)
     with warnings.catch_warnings():
@@ -757,6 +935,10 @@ def solve_oracle(
         # Zero throughput cost: dual bound is valid for the reported cost.
         load_term = _load_cost_term(horizon)
         lower = None if dual is None else load_term + value * initial_kwh + float(dual)
+    if full_charge is not None and full_charge.checkpoint_slots and x[-1] > _TOL_KWH:
+        # A missed target puts the penalty in the solver's objective: the dual bound
+        # no longer bounds the reported (penalty-free) cost.
+        lower = None
 
     return replace(
         traced,
