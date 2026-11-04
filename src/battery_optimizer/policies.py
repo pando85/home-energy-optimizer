@@ -141,7 +141,12 @@ from .battery import (
     simulate,
     validate_spec,
 )
-from .oracle import OracleError, solve_oracle, validate_high_soc_cost
+from .oracle import (
+    OracleError,
+    solve_oracle,
+    validate_charge_soft_cap,
+    validate_high_soc_cost,
+)
 
 __all__ = [
     "DEFAULT_FORECAST_WINDOW_DAYS",
@@ -776,6 +781,7 @@ def policy_day_ahead(
     mip_abs_gap: float,
     throughput_cost_eur_per_kwh: float = 0.0,
     high_soc_cost: tuple[float, float] | None = None,
+    charge_soft_cap: tuple[float, float] | None = None,
 ) -> tuple[Schedule, dict[str, Any]]:
     """Rolling day-ahead optimiser: one MILP per local day, executed, SOC rolled forward.
 
@@ -929,6 +935,7 @@ def policy_day_ahead(
             f"{throughput_cost_eur_per_kwh!r}"
         )
     validate_high_soc_cost(high_soc_cost)
+    validate_charge_soft_cap(charge_soft_cap)
     if not math.isfinite(time_limit_s) or time_limit_s <= 0:
         raise ValueError(f"time_limit_s must be > 0, got {time_limit_s}")
     if mip_rel_gap <= 0 or mip_abs_gap <= 0:
@@ -1115,6 +1122,7 @@ def policy_day_ahead(
                 floor_kwh=floor_kwh,
                 throughput_cost_eur_per_kwh=throughput_cost_eur_per_kwh,
                 high_soc_cost=high_soc_cost,
+                charge_soft_cap=charge_soft_cap,
             )
         except OracleError as exc:
             text = str(exc).lower()
@@ -1320,6 +1328,15 @@ def policy_day_ahead(
             "role": (
                 "planning-only dwell price on SOC above the threshold, added to each daily "
                 "MILP objective; never in the reported Schedule.cost_eur"
+            ),
+        }
+    if validate_charge_soft_cap(charge_soft_cap) is not None:
+        telemetry["charge_soft_cap"] = {
+            "threshold_kw": float(charge_soft_cap[0]),
+            "eur_per_kwh": float(charge_soft_cap[1]),
+            "role": (
+                "planning-only price on AC kWh charged above the threshold power per slot, added "
+                "to each daily MILP objective; never in the reported Schedule.cost_eur"
             ),
         }
     return schedule, telemetry

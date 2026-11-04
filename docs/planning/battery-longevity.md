@@ -107,6 +107,10 @@ changes behaviour.
    region. The parameters (knee and slope) come from the temperature telemetry of step 3 and a **1.5 versus 2.5 kW
    comparison** of otherwise similar charge sessions (hot-time and peak per session, relative figures). Omnibattery's
    **Temperature Charge Limit stays at its default** (owner setting) as a backstop, not as the mechanism.
+   **Status:** implemented off by default; evidence, replay study and recommended values (1.5 kW at 0.005 EUR/kWh) in
+   [thermal soft cap](thermal-charge-soft-cap.md). The thermal data was too thin for a fitted knee (21 h, two charge
+   sessions, none above 1.5 kW), so 1.5 kW is the documented conservative choice and the 1.5 versus 2.5 kW comparison
+   is still open.
 
 Steps 5 and 6 change the objective: each updates [battery-model](../components/battery-model.md) and
 [battery-optimizer](../components/battery-optimizer.md) and the regime log in its own PR, per AGENTS.md.

@@ -177,6 +177,11 @@ class PlanningSettings:
     #: 0 (the default) is off and leaves the plan, and :meth:`ServiceConfig.config_hash`, as before.
     high_soc_threshold_frac: float = 0.90
     high_soc_cost_eur_per_kwh_h: float = 0.0
+    #: Thermal soft cap on charge power: EUR per AC kWh charged above ``charge_soft_cap_kw`` in a
+    #: slot.  0 (the default) is off and leaves the plan, and :meth:`ServiceConfig.config_hash`, as
+    #: before.
+    charge_soft_cap_kw: float = 1.5
+    charge_soft_cap_eur_per_kwh: float = 0.0
     replan_soc_change_frac: float = 0.05
     replan_debounce_s: float = 30.0
     replan_min_interval_s: float = 120.0
@@ -576,6 +581,10 @@ class ServiceConfig:
             # An inactive dwell cost leaves every plan alone: keep the hash from before it existed.
             public["planning"].pop("high_soc_threshold_frac", None)
             public["planning"].pop("high_soc_cost_eur_per_kwh_h", None)
+        if not self.planning.charge_soft_cap_eur_per_kwh:
+            # Likewise an inactive thermal soft cap.
+            public["planning"].pop("charge_soft_cap_kw", None)
+            public["planning"].pop("charge_soft_cap_eur_per_kwh", None)
         text = json.dumps(public, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode()).hexdigest()
 
@@ -1265,6 +1274,12 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
             "high_soc_cost_eur_per_kwh_h",
             allow_zero=True,
         ),
+        charge_soft_cap_kw=_positive(pl_raw.get("charge_soft_cap_kw", 1.5), "charge_soft_cap_kw"),
+        charge_soft_cap_eur_per_kwh=_positive(
+            pl_raw.get("charge_soft_cap_eur_per_kwh", 0.0),
+            "charge_soft_cap_eur_per_kwh",
+            allow_zero=True,
+        ),
         replan_soc_change_frac=_positive(
             replan.get("soc_change_frac", 0.05), "replan.soc_change_frac"
         ),
@@ -1314,6 +1329,15 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
             "service config: full_charge.shortfall_penalty_eur_per_kwh must exceed "
             "planning.high_soc_cost_eur_per_kwh_h times the longest horizon in hours "
             f"({dwell_per_kwh:.6g}), or the dwell cost could outweigh reaching the target"
+        )
+    # One more stored kWh costs at most 1/eta_c AC kWh above the cap; the config does not know the
+    # efficiency, so it checks with 0.5, which no real battery is below (the solver checks exactly).
+    soft_cap_per_kwh = dwell_per_kwh + planning.charge_soft_cap_eur_per_kwh / 0.5
+    if full_charge.enabled and full_charge.shortfall_penalty_eur_per_kwh <= soft_cap_per_kwh:
+        raise ValueError(
+            "service config: full_charge.shortfall_penalty_eur_per_kwh must exceed the dwell "
+            "cost over the longest horizon plus planning.charge_soft_cap_eur_per_kwh per stored "
+            f"kWh ({soft_cap_per_kwh:.6g}), or the soft cap could outweigh reaching the target"
         )
     if mode == "live" and soc_source != "entity":
         raise ValueError(
