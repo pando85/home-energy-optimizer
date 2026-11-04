@@ -307,3 +307,37 @@ Side effects while the high threshold is in place:
    Backup Mode on loss and the return to `balanced` after the grid comes back.
 4. If it latches again, put 500 W back and reopen the upstream issue. Otherwise record the change in the
    [regime log](components/regime-log.md) and delete this workaround here and in ADR-0007.
+
+## Planned discharge is not delivered (open, waiting for data from 2026-11-04)
+
+Status: **waiting for data (from 2026-11-04)**; no fix is started, the owner chose to collect live data first.
+
+**Symptom.** The "Final plan energy not delivered" panel of the `battery-model-actuation` dashboard showed a
+large discharge shortfall over the first 24 hours of live control.
+
+**Diagnosis.**
+
+- Most of the first reading is an artefact. The planner's shadow counters ran before live control started
+  (2026-11-03 22:45 UTC) with the battery not under control, so they count planned discharge nothing delivered.
+  It leaves the 24 h window after the first live day.
+- The real live shortfall (the morning discharge window) has two causes, both by design or forecast:
+  - **No export.** Discharge is at most the house load, and the house used less than the plan assumed. The load
+    forecast ran high, visible as bias on the `battery-load-forecast` dashboard.
+  - **Import margin.** `actuation.discharge_margin_w` (200 W) keeps that much grid import while discharging, so
+    at a house load of a few hundred watts only the load minus the margin can be discharged.
+- Not involved: the per-slot discharge cap (`number.omnibattery_system_max_discharge_power`) was above the
+  house load and not binding, and the device limits (2500 W) were never reached.
+
+**Candidate fix (not started).** Bound each slot's discharge in the planner at
+`max(0, forecast house load - discharge_margin_w)`, shadow first, so the plan stops promising energy the
+actuator cannot deliver. If the load-forecast bias persists, recalibrate the load forecast
+([battery-load-forecast](components/battery-load-forecast.md)) instead or as well.
+
+**Decision criteria, after about 7 days of live data** (live days only, excluding the pre-live artefact):
+
+- daily planned against actual discharge;
+- load-forecast bias per slot in the discharge hours;
+- the share of the shortfall that falls in slots where the planned discharge exceeded
+  `forecast house load - discharge_margin_w`.
+
+If that share is large, build the planner bound; if the bias dominates, recalibrate the forecast first.

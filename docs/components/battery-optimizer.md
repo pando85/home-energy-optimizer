@@ -147,6 +147,9 @@ first plan that covered it, the *final plan* the plan of record at the slot open
 
 Offline: `uv run python hack/day_ahead_kpis.py --from <day> --to <day>`.
 
+Open: planned discharge is not fully delivered in live (waiting for data from 2026-11-04):
+[known issue](../known-issues.md#planned-discharge-is-not-delivered-open-waiting-for-data-from-2026-11-04).
+
 ## Status
 
 **stale** (2026-11-03): live since 2026-11-03 23:45 (first live slot 22:45 UTC; [regime log](regime-log.md)),
