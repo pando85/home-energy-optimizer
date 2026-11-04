@@ -249,6 +249,20 @@ extraction may not mix them with default entities (they would change the canonic
 ``dataset_id``) or with the earlier feature entities (the default feature-set id reads every
 manifest that names one of those, so shared parts would change it)."""
 
+_BATTERY_HEALTH_SPECS: tuple[EntitySpec, ...] = (
+    EntitySpec("sensor.venus_internal_temperature", "hass_sensor_temperature_celsius", "°C"),
+    EntitySpec("sensor.venus_max_cell_voltage", "hass_sensor_voltage_v", "V"),
+    EntitySpec("sensor.venus_min_cell_voltage", "hass_sensor_voltage_v", "V"),
+)
+"""Battery health series (``service.battery_health``): internal temperature and the extreme cell
+voltages.  Metrics verified against the long-term archive on 2026-11-04.  The balance monitor's
+entities (cell delta, average, status) have no numeric series there yet and are not registered."""
+
+BATTERY_HEALTH_ENTITY_IDS: tuple[str, ...] = tuple(s.entity_id for s in _BATTERY_HEALTH_SPECS)
+"""The battery-health extraction group: feature-only, extracted alone (see
+:func:`refuse_mixed_lineage`).  Not default entities, so the canonical ``dataset_id`` and the
+nightly default extraction are unchanged."""
+
 ENTITY_SPECS: dict[str, EntitySpec] = {
     spec.key: spec
     for spec in (
@@ -328,6 +342,7 @@ ENTITY_SPECS: dict[str, EntitySpec] = {
         ),
         EntitySpec("sensor.terrace_lavadora_energy_today", "hass_sensor_energy_wh", "Wh"),
         *_CLIMATE_SPECS,
+        *_BATTERY_HEALTH_SPECS,
     )
 }
 
@@ -571,7 +586,7 @@ def resolve_entity_specs(
 
 
 def refuse_mixed_lineage(specs: Iterable[EntitySpec]) -> None:
-    """Refuse an extraction that names a climate entity together with anything else.
+    """Refuse an extraction that names a climate or battery-health entity with anything else.
 
     A raw manifest that names a default entity, or an entity that is in no feature group (an
     unregistered ``entity:metric:unit`` triple, the dead duplicate price), enters the canonical
@@ -579,20 +594,25 @@ def refuse_mixed_lineage(specs: Iterable[EntitySpec]) -> None:
     earlier feature entity (outdoor temperature, heat-pump power, control states) is read by the
     default feature set, so climate parts in it would change the default ``feature_set_id``.  The
     climate group is therefore extracted alone; the climate feature set reads the shared entities
-    from the earlier feature extraction.  Other mixes are not restricted here.
+    from the earlier feature extraction.  The battery-health group (internal temperature, cell
+    voltages) follows the same rule.  Other mixes are not restricted here.
 
     Raises:
-        ValueError: a climate entity was requested with an entity outside the climate group.
+        ValueError: a group entity was requested with an entity outside its group.
     """
     ids = {s.entity_id for s in specs}
-    climate = sorted(ids.intersection(CLIMATE_ENTITY_IDS))
-    other = sorted(ids.difference(CLIMATE_ENTITY_IDS))
-    if climate and other:
-        raise ValueError(
-            "an extraction of climate entities must not include any other entity: it would "
-            "change the canonical dataset_id or the default feature_set_id; run separate "
-            f"extractions (climate: {', '.join(climate)}; other: {', '.join(other)})"
-        )
+    for label, group in (
+        ("climate", CLIMATE_ENTITY_IDS),
+        ("battery-health", BATTERY_HEALTH_ENTITY_IDS),
+    ):
+        inside = sorted(ids.intersection(group))
+        other = sorted(ids.difference(group))
+        if inside and other:
+            raise ValueError(
+                f"an extraction of {label} entities must not include any other entity: it would "
+                "change the canonical dataset_id or the default feature_set_id; run separate "
+                f"extractions ({label}: {', '.join(inside)}; other: {', '.join(other)})"
+            )
 
 
 def build_range_query(spec: EntitySpec, window_seconds: int) -> str:

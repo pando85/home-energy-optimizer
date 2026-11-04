@@ -56,6 +56,7 @@ mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 | `planner` | Snapshot → offline MPC kernel → time-bounded shadow intents |
 | `observer` | Per-slot measurements (counter energy, power averages, SOC edges) |
 | `virtual_battery` | Open-loop replay of decisions against measured load |
+| `battery_health` | Pure, read-only battery health telemetry: temperature exposure, charge sessions, cell voltages, Omnibattery balance monitor ([Battery health telemetry](#battery-health-telemetry)) |
 | `runtime` | Scheduling, readiness, bounded executor, slot cycle, metrics snapshot |
 | `archive` | Record builders and the fetch schedule of the passive [archives](#passive-archives) |
 | `sink` | Append-only store under the data directory |
@@ -208,6 +209,10 @@ both are off, so a deployed config must carry it. The `climate_shadow:` section 
 [climate shadow](#climate-shadow-track-b2); its three Home Assistant helpers are those of the homelab
 comfort controller, and each may be absent until it is deployed.
 
+The optional `battery_health:` section names the read-only battery health sensors (all optional, null in
+code; the committed file names the `sensor.venus_*` ones of the Omnibattery balance monitor and the cell data);
+see [Battery health telemetry](#battery-health-telemetry).
+
 The variables the service reads (the complete table for every command is in
 [Configuration](configuration.md#environment-variables)):
 
@@ -235,7 +240,7 @@ return 405). Bind address `0.0.0.0`, container port **8080**.
 |---|---|
 | `/health/live` | `{"status": "alive"}` — the process and its event loop are up |
 | `/health/ready` | `{ready, inputs_ready, reasons, details}`; 200 or 503 |
-| `/status` | Mode, adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), code version, config hash; in `dry_run`/`live` also `actuator` (kill switch, in control, guard reasons, desired and observed state, alert, last error, import-trip hold, last tick / confirmed write / heartbeat) |
+| `/status` | Mode, adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), `battery_health` (only when a `battery_health.entities` role is configured), code version, config hash; in `dry_run`/`live` also `actuator` (kill switch, in control, guard reasons, desired and observed state, alert, last error, import-trip hold, last tick / confirmed write / heartbeat) |
 | `/plan` | Latest plan with its snapshot summary, solver result and intents, plus the current intent (all flagged `shadow`) |
 | `/metrics` | Prometheus exposition |
 
@@ -289,6 +294,17 @@ ID, price, timestamp or household reading is a label.
 | `climate_shadow_rmse_kelvin`, `climate_shadow_skill_ratio`, `climate_shadow_abs_bias_kelvin`, `climate_shadow_origins` | gauge | `window` (`legacy`, `new`), `horizon` (`1h`, `6h`, `12h`, `24h`) |
 | `climate_shadow_daily_heat_mdape_ratio`, `climate_shadow_valid_weeks`, `climate_shadow_top_offset_share_ratio` | gauge | `window` |
 | `climate_shadow_gate` | gauge 0/1 (state set) | `window`, `criterion` (the six of the preregistration and `verdict`), `status` (`PASS`, `FAIL`, `UNDETERMINED`) |
+| `battery_temperature_celsius` | gauge (absent while unknown) | — |
+| `battery_hot_seconds_total` | counter (seconds strictly above the threshold since start) | `threshold_celsius` (`battery_health.hot_thresholds_c`, 35 and 40) |
+| `battery_hot_uncounted_seconds_total` | counter (seconds a stalled clock advance did not credit) | — |
+| `battery_charge_session_active` | gauge 0/1 | — |
+| `battery_charge_session_peak_temperature_celsius`, `battery_charge_session_duration_seconds` | gauge (the running session, else the last; absent before the first) | — |
+| `battery_charge_sessions_total` | counter (completed sessions since start) | — |
+| `battery_cell_voltage_max_volts`, `battery_cell_voltage_min_volts`, `battery_cell_voltage_spread_millivolts` | gauge (absent while unknown; the spread needs both) | — |
+| `battery_cell_delta_millivolts`, `battery_cell_delta_avg_4w_millivolts` | gauge (balance monitor; absent while `unknown`) | — |
+| `battery_balance_status` | gauge 0/1 (one-hot; absent until the entity was seen, `unknown` while HA says so) | `status` (`green`, `yellow`, `orange`, `red`, `unknown`) |
+| `battery_balancing_mode` | gauge 0/1 | — |
+| `battery_last_balance_read_timestamp_seconds`, `battery_last_balance_read_age_seconds` | gauge (absent until a valid read) | — |
 | `actuator_mode` | gauge 0/1 (`dry_run`/`live` only, like every `actuator_*`) | `mode` |
 | `actuator_kill_switch_on`, `actuator_in_control`, `actuator_guard_ok`, `actuator_alert` | gauge 0/1 | — |
 | `actuator_guard_reason` | gauge 0/1 | `reason` (the guard reasons of [Live control](#live-control-dry_run-and-live)) |
@@ -301,7 +317,8 @@ ID, price, timestamp or household reading is a label.
 | `actuator_heartbeats_total` | counter | `result` (`ok`, `failed`, `dry_run`) |
 | `actuator_last_successful_write_timestamp_seconds` | gauge (0 until the first confirmed write) | — |
 
-Suggested alerts (homelab): `ready == 0` for 30 m; `ha_connected == 0` for 10 m;
+The `battery_*` rows exist only when a `battery_health.entities` role is configured. Suggested alerts
+(homelab): `ready == 0` for 30 m; `ha_connected == 0` for 10 m;
 `input_stale{role="grid_power"} == 1` for 15 m; `plan_age_seconds > 1800`;
 `increase(solves_total{result=~"error|timeout"}[1h]) > 0`; `increase(sink_write_errors_total[1h]) > 0`;
 `history_age_seconds > 93600`; archives:
@@ -761,6 +778,60 @@ max_interval_days <= 30`; thresholds, fixed cost and penalty finite and non-nega
 and `battery_soc` set. `enabled` works in every mode; the two writable entities join the allowlist only when it
 is true and the mode is `live`. The section is excluded from the plan's config hash until the scheduler
 uses it.
+
+### Battery health telemetry
+
+Read-only. `battery_health:` in `config/service.yaml` names optional sensors; with none named the section is off
+(no metric, no `/status` block). The entities join the entity store's tracked set, so they arrive through the
+existing `state_changed` stream and the `get_states` resync, nothing else: there is no write, no new service
+call and no change to `ha_guard`. The tracker (`service/battery_health.py`) is a pure state machine; the
+runtime feeds it each accepted or refreshed observation and a 30 s tick, and reads it for `/status` and the
+metrics. It informs only; the periodic full charge scheduler
+([plan](planning/periodic-full-charge.md)) will read the same fields.
+
+| Key | Meaning |
+|---|---|
+| `entities.temperature` | `sensor.*`, degC (`sensor.venus_internal_temperature`) |
+| `entities.cell_voltage_max` / `cell_voltage_min` | `sensor.*`, V (`sensor.venus_max_cell_voltage` / `sensor.venus_min_cell_voltage`) |
+| `entities.cell_delta` | `sensor.*`, mV: last comparable settled top-of-charge delta (`sensor.venus_cell_delta`) |
+| `entities.balance_status` | `sensor.*`: `green`, `yellow`, `orange`, `red` or `unknown` (`sensor.venus_balance_status`) |
+| `entities.last_balance_read` | `sensor.*`, timestamp of the last valid measurement (`sensor.venus_last_balance_read`) |
+| `entities.delta_trend`, `entities.delta_avg_4w` | `sensor.*`: trend text, mV average of the last four readings |
+| `entities.balancing_mode` | `binary_sensor.*` (`binary_sensor.venus_balancing_mode`) |
+| `hot_thresholds_c` | Strictly increasing temperatures whose exposure is counted (default `[35, 40]`) |
+| `charge_threshold_w` | Sign-corrected AC power above which the battery is charging (100) |
+| `session_end_hold_s` | The power must stay at or below the threshold this long to end a session (300) |
+| `max_gap_s` | Most one clock advance credits to the held temperature (300) |
+
+Entities are distinct from each other but may repeat `full_charge.entities` evidence sensors (the same store
+entry serves both). The section is excluded from the plan's config hash.
+
+* **Hot seconds** are seconds *strictly above* each threshold, by sample-and-hold: the last temperature is held
+  until the next observation, the 30 s tick, a scrape or a `/status` call. HA reports a sensor only on change, so
+  a steady temperature is silent for hours and the tick is what counts it. One advance credits at most
+  `max_gap_s`; the remainder (a stalled event loop) is not counted and is reported as `uncounted_s`
+  (`hot_uncounted_seconds_total`). While the temperature is unknown or unavailable nothing is counted. The
+  counters restart at zero with the process, as Prometheus counters do (`increase()` handles it). They do not
+  stop while Home Assistant is disconnected: the last temperature is held, which is a limit of the data.
+* **Charge sessions** use `actuation.entities.battery_ac_power` and `actuation.battery_ac_power_sign` (the
+  actuator's entity and sign: positive after the sign = charging; `-1` on this installation, where
+  `sensor.venus_ac_power` is negative while charging), tracked in every mode. With no sign configured sessions are
+  not tracked (`charge_sessions_tracked: false`). A session starts above `charge_threshold_w` and ends
+  `session_end_hold_s` after the power last fell to the threshold or below (dated to the first sample below, so
+  the taper at the top is one session); an unavailable power ends it at once. Peak temperature is the highest
+  observed during the session, including the one held when it started. `/status` shows the running session, the
+  last completed one and the count; the last 20 are kept in memory.
+* **Unknown is never zero.** An unavailable, unknown or non-numeric state is `null` in `/status` and an absent
+  sample in the metrics. The balance monitor reads `unknown` until the first full charge: `balance.status` is
+  then `unknown`, every other balance field `null`. `last_read_age_s` is the staleness of the last valid
+  measurement; `spread_mv` is `null` unless both cell voltages are known and the maximum is not below the minimum.
+* **Status block.** `battery_health`: `temperature_c`, `hot_seconds` (keyed by threshold), `uncounted_s`,
+  `charge_session` (`active`, `current`, `last`, `completed`), `cell_voltage` (`max_v`, `min_v`, `spread_mv`),
+  `balance` (`cell_delta_mv`, `status`, `delta_trend`, `delta_avg_4w_mv`, `balancing_mode`, `last_read_at`,
+  `last_read_age_s`), `actuation: "none (read-only telemetry)"` and `charge_sessions_tracked`.
+
+The temperature and the two cell voltages are also extractable for offline analysis, as their own extraction
+group; see [`extract`](cli.md#extract-the-battery-health-group).
 
 ## Safety
 

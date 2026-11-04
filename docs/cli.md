@@ -94,6 +94,24 @@ already in the store are not written again, and the manifest discloses how many
 were suppressed. See [Overlapping re-extraction is deduplicated at row
 level](known-issues.md#overlapping-re-extraction-is-deduplicated-at-row-level).
 
+### Extract the battery health group
+
+```bash
+uv run battery-optimizer extract --source prometheus --config config/tariff.yaml \
+  --entities sensor.venus_internal_temperature,sensor.venus_max_cell_voltage,sensor.venus_min_cell_voltage
+```
+
+The battery's internal temperature and extreme cell voltages (`extract_prom.BATTERY_HEALTH_ENTITY_IDS`;
+metrics `hass_sensor_temperature_celsius` and `hass_sensor_voltage_v`, verified against the archive on
+2026-11-04) are registered **feature-only entities, not defaults**: `extract` without `--entities` still reads
+the four default entities, so the canonical `dataset_id` and the dataset schema are unchanged, and `build`
+ignores a manifest that names only them. Like the climate group they must be extracted **alone**: `extract`
+refuses a run that mixes one with any other entity (it would enter the canonical lineage or change the default
+`feature_set_id`). No feature set reads them yet; the nightly CronJob needs a second `extract` invocation with
+the line above to collect them. The balance monitor's sensors (cell delta, average, status) have no numeric
+series in the archive yet and are not registered; they are visible live in the service's
+[battery health telemetry](service.md#battery-health-telemetry).
+
 ### `extract --source omie` (OMIE day-ahead prices)
 
 ```bash

@@ -1973,3 +1973,65 @@ class TestLogging:
         text = "\n".join(r.getMessage() for r in caplog.records)
         assert "hass_sensor_energy_kwh" in text
         assert "token" not in text.lower()
+
+
+class TestBatteryHealthGroup:
+    """Battery temperature and cell voltages: registered, feature-only, extracted alone."""
+
+    TEMP = "sensor.venus_internal_temperature"
+    VMAX = "sensor.venus_max_cell_voltage"
+    VMIN = "sensor.venus_min_cell_voltage"
+
+    def test_the_series_are_registered_with_the_archive_metrics(self) -> None:
+        assert extract_prom.BATTERY_HEALTH_ENTITY_IDS == (self.TEMP, self.VMAX, self.VMIN)
+        assert ENTITY_SPECS[self.TEMP].metric == "hass_sensor_temperature_celsius"
+        assert ENTITY_SPECS[self.TEMP].unit == "°C"
+        for entity in (self.VMAX, self.VMIN):
+            assert ENTITY_SPECS[entity].metric == "hass_sensor_voltage_v"
+            assert ENTITY_SPECS[entity].unit == "V"
+        assert len(resolve_entity_specs(list(extract_prom.BATTERY_HEALTH_ENTITY_IDS))) == 3
+
+    def test_they_are_feature_only_so_the_default_extraction_and_dataset_id_are_unchanged(
+        self,
+    ) -> None:
+        assert not set(extract_prom.BATTERY_HEALTH_ENTITY_IDS) & set(DEFAULT_ENTITY_IDS)
+        assert set(extract_prom.BATTERY_HEALTH_ENTITY_IDS) <= set(FEATURE_ENTITY_IDS)
+        assert not set(extract_prom.BATTERY_HEALTH_ENTITY_IDS) & set(CLIMATE_ENTITY_IDS)
+        assert DEFAULT_ENTITY_IDS == (
+            "sensor.shellyem_main_channel_1_energy",
+            "sensor.shellyem_main_channel_1_energy_returned",
+            "sensor.shellyem_main_channel_1_power",
+            "sensor.esios_pvpc",
+        )
+        assert tuple(s.entity_id for s in resolve_entity_specs(None)) == DEFAULT_ENTITY_IDS
+
+    @pytest.mark.parametrize(
+        "other",
+        [
+            "sensor.shellyem_main_channel_1_energy",  # default entity
+            "sensor.aquarea_heat_power_consumed",  # earlier feature entity
+            "climate.thermostat_bedroom",  # climate group
+            "sensor.foo:hass_sensor_state:x",  # unregistered explicit triple
+        ],
+    )
+    def test_mixing_the_group_with_another_is_refused_before_any_request(
+        self, tmp_path: Path, config: Path, other: str
+    ) -> None:
+        fake = FakePrometheus([])
+        for entities in ([other, self.TEMP], [self.VMAX, other]):
+            with pytest.raises(
+                ValueError, match="(battery-health|climate) entities must not include any"
+            ):
+                run_extract(tmp_path, fake.client, config, entities=entities)
+        assert fake.requests == []
+
+    def test_the_group_alone_is_accepted(self, tmp_path: Path, config: Path) -> None:
+        fake = FakePrometheus([])
+        run_extract(
+            tmp_path,
+            fake.client,
+            config,
+            entities=list(extract_prom.BATTERY_HEALTH_ENTITY_IDS),
+            end="2024-01-01T01:00:00Z",
+        )
+        assert fake.requests

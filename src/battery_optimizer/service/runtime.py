@@ -90,6 +90,7 @@ from .archive import (
     retry_delay_s,
     weather_forecast_record,
 )
+from .battery_health import BatteryHealth, HealthParams
 from .climate_shadow import ClimateShadowJob, build_job, latest_forecast, next_run_time
 from .clock import Clock
 from .config import ServiceConfig
@@ -128,6 +129,8 @@ _ACTUATION_TEXT = {
 _PLAN_MEMORY = 16
 #: How often a slot that opened without an intent is re-evaluated for a late adoption.
 _ADOPT_RETRY_S = 15.0
+#: Period of the battery-health clock advance (well inside ``battery_health.max_gap_s``).
+_HEALTH_TICK_S = 30.0
 #: Longest the startup catch-up of the climate shadow waits for the first Home Assistant sync.
 CLIMATE_SYNC_TIMEOUT_S = 60.0
 
@@ -238,10 +241,35 @@ class ShadowService:
         if config.planning.soc_source == "entity" and config.actuation.entities.battery_liveness:
             # The entity SOC is only trusted while Omnibattery reports the battery responsive.
             actuation_entities = (*actuation_entities, config.actuation.entities.battery_liveness)
+        # Read-only battery health telemetry: the sensors and, for charge sessions, the AC power
+        # entity and sign the actuator uses (tracked in every mode, never written).
+        self.health: BatteryHealth | None = None
+        self._health_roles: dict[str, str] = {}
+        health_cfg = config.battery_health
+        if health_cfg.configured:
+            ac_entity = config.actuation.entities.battery_ac_power
+            sign = config.actuation.battery_ac_power_sign
+            self._health_roles = health_cfg.entities.by_entity()
+            if ac_entity and sign is not None:
+                self._health_roles.setdefault(ac_entity, "charge_power")
+            self.health = BatteryHealth(
+                HealthParams(
+                    hot_thresholds_c=health_cfg.hot_thresholds_c,
+                    charge_threshold_w=health_cfg.charge_threshold_w,
+                    charge_power_sign=sign if sign is not None else 1,
+                    session_end_hold_s=health_cfg.session_end_hold_s,
+                    max_gap_s=health_cfg.max_gap_s,
+                )
+            )
         self.store = EntityStore.for_entities(
             tuple(
                 dict.fromkeys(
-                    (*config.entities.all_entities(), *climate_entities, *actuation_entities)
+                    (
+                        *config.entities.all_entities(),
+                        *climate_entities,
+                        *actuation_entities,
+                        *self._health_roles,
+                    )
                 )
             )
         )
@@ -360,6 +388,8 @@ class ShadowService:
             )
         if self.config.climate_shadow.enabled:
             self._tasks.append(asyncio.create_task(self._climate_loop(), name="climate-shadow"))
+        if self.health is not None:
+            self._tasks.append(asyncio.create_task(self._health_loop(), name="battery-health"))
         if self.actuator is not None:
             self._actuator_task = asyncio.create_task(self._actuator_loop(), name="actuator")
 
@@ -422,6 +452,9 @@ class ShadowService:
         task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
     def _on_state(self, state: EntityState, result: UpdateResult) -> None:
+        health_role = self._health_roles.get(state.entity_id)
+        if self.health is not None and health_role is not None:
+            self.health.observe(health_role, state.state, self.clock.now())
         role = self.config.entities.role_of(state.entity_id)
         if self.actuator is not None:
             self._actuation_wake_on(state, role)
@@ -1443,6 +1476,13 @@ class ShadowService:
                 except ValueError:
                     self.metrics.rest_polls.labels(result="error").inc()
 
+    async def _health_loop(self) -> None:
+        """Advance the battery-health clock: a steady temperature reports nothing for hours."""
+        assert self.health is not None
+        while True:
+            await self.clock.sleep(_HEALTH_TICK_S)
+            self.health.advance(self.clock.now())
+
     async def scheduler_tick(self) -> float:
         """Run whatever is due now; return seconds until the next due action."""
         now = self.clock.now()
@@ -1671,6 +1711,7 @@ class ShadowService:
             "virtual_soc": self.virtual_soc,
             "late_samples": self.observer.late_samples,
             "climate_shadow": self._climate_view(),
+            **({"battery_health": self.health.snapshot(now)} if self.health is not None else {}),
             **({"actuator": self.actuator.snapshot()} if self.actuator is not None else {}),
         }
 
@@ -1732,8 +1773,17 @@ class ShadowService:
                 },
             },
             "climate_shadow": self._climate_status(),
+            **({"battery_health": self._health_status(now)} if self.health is not None else {}),
             "config_hash": self.config.config_hash(),
             **({"actuator": self.actuator.view()} if self.actuator is not None else {}),
+        }
+
+    def _health_status(self, now: datetime) -> dict[str, Any]:
+        assert self.health is not None
+        return {
+            "actuation": "none (read-only telemetry)",
+            "charge_sessions_tracked": "charge_power" in self._health_roles.values(),
+            **self.health.snapshot(now),
         }
 
     def _climate_status(self) -> dict[str, Any]:
