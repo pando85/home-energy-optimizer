@@ -139,3 +139,25 @@ def test_derate_check_compares_the_cap_with_the_written_power():
     assert out["first_set_after_on"]["value_w"] == 1000.0
     ev["sw"] = (np.array([100.0]), np.array([0.0]))
     assert "never on" in mod.derate_check(ev, grid, temp)["status"]
+
+
+def test_the_charge_gain_is_the_coefficient_of_the_charging_power():
+    """The study negates the sensor (negative while charging) so that + is charging; the shared
+    model must then fit the gain on that power as ``k_c`` (PR #91 had the two gains swapped)."""
+    n = 3 * 24 * 120
+    sensor_w = np.zeros(n)  # sensor.venus_ac_power: negative while charging
+    for d in range(3):
+        sensor_w[d * 2880 + 800 : d * 2880 + 1300] = -(1000.0 + 500.0 * d)
+        sensor_w[d * 2880 + 1900 : d * 2880 + 2300] = 400.0
+    a = math.exp(-mod.STEP_S / 60.0 / 45.0)
+    temp = np.empty(n)
+    temp[0] = 32.0
+    for k in range(n - 1):
+        charge, discharge = max(-sensor_w[k], 0.0) / 1000.0, max(sensor_w[k], 0.0) / 1000.0
+        temp[k + 1] = a * temp[k] + (1 - a) * (32.0 + 9.0 * charge + 3.0 * discharge)
+    p_kw = -sensor_w / 1000.0  # exactly as run() does
+    spans = [(0, 2880), (2880, 5760), (5760, 8640)]
+    fit = mod.fit_tau_profile(temp, p_kw, np.arange(n) * 30.0, spans, "split", HS)
+    coef = dict(zip(fit["names"], fit["beta"], strict=True))
+    assert coef["k_c"] == pytest.approx(9.0, rel=0.05)
+    assert coef["k_d"] == pytest.approx(3.0, rel=0.1)

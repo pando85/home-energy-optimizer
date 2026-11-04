@@ -145,6 +145,34 @@ planning:
   # docs/planning/thermal-charge-soft-cap.md.
   charge_soft_cap_kw: 1.5
   charge_soft_cap_eur_per_kwh: 0.0
+  # Read-only thermal state and derate prediction (docs/planning/thermal-derate-aware-planning.md,
+  # docs/service.md "Thermal shadow").  off (default): nothing is read, recorded or exposed, today's
+  # service byte for byte.  shadow: reads Omnibattery's Temperature Charge Limit entities and the
+  # battery temperature and AC power, keeps a first-order thermal model (daily guarded refit,
+  # persisted under service/v1/state/), and records beside every plan the predicted temperature and
+  # achievable charge power per slot, scored when the slot closes.  Observability only: no plan, hash
+  # or actuation changes in either mode, and no entity here is ever written (nothing joins the
+  # ha_guard allowlist).  Needs actuation.entities.battery_ac_power and its sign.
+  thermal:
+    mode: "off"                  # off | shadow (quote it: bare YAML off is a boolean)
+    entities:
+      # Shared with battery_health.entities.temperature (they must agree; either may be omitted).
+      temperature: sensor.venus_internal_temperature
+      limit_switch: switch.omnibattery_temp_charge_limit
+      # Optional: without it the discharge side is never derated in the prediction.
+      discharge_switch: switch.omnibattery_temp_charge_limit_discharge
+      limit_c: number.omnibattery_temp_charge_limit_c
+      band_c: number.omnibattery_temp_charge_limit_band_c
+      floor_pct: number.omnibattery_temp_charge_limit_floor_pct
+      # Optional: the curve scales with min(system cap, Venus cap); without them charge_limit_kw.
+      system_max_charge_power: number.omnibattery_system_max_charge_power
+      venus_max_charge_power: number.venus_max_charge_power
+    charge_limit_kw: 2.5         # min(system cap, Venus cap) when the cap entities are not read
+    driver_min_kw: 0.8           # Omnibattery never derates below the driver minimum
+    # The model before any accepted refit (docs/components/battery-thermal.md): tau in minutes, the
+    # idle level in degC, the charge and discharge gains in degC per kW.
+    prior: {tau_min: 44.0, t_amb_c: 32.6, k_c: 11.0, k_d: 6.9}
+    refit_hour_local: 4          # the daily refit runs at (or after) this local hour, and at start-up
   replan:
     soc_change_frac: 0.05
     debounce_s: 30

@@ -45,16 +45,26 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import lfilter
+
+from battery_optimizer.service import thermal as _thermal
+from battery_optimizer.service.thermal import (
+    derate_factor,
+    derated_cap_w,
+    equilibrium_charge_kw,
+    inputs,
+    rows,
+    score,
+)
 
 STEP_S = 30
 MAX_AGE_S = {"temp": 300.0}  # a temperature older than this is missing; the others hold
 HORIZONS_MIN = (10, 20, 30, 45, 60, 90)
 ORIGIN_STRIDE = 4  # steps between forecast origins (2 min)
-TAU_GRID_MIN = tuple(float(x) for x in np.geomspace(8.0, 480.0, 49))
+TAU_GRID_MIN = _thermal.STUDY_TAU_GRID_MIN
 SPIKE_C = 1.5  # a temperature event this far from the local median is a sensor glitch
 ACTIVE_KW = 0.1
 ONLINE_LOOKBACK_H = 3.0
@@ -151,16 +161,25 @@ def load_events(path: Path) -> dict[str, tuple[np.ndarray, np.ndarray]]:
                 v = math.nan
         raw[by_entity[row[0]]].append((t, v))
     out = {}
-    for k, rows in raw.items():
-        rows.sort()
-        arr = np.asarray(rows, dtype=float).reshape(-1, 2)
+    for k, events in raw.items():
+        events.sort()
+        arr = np.asarray(events, dtype=float).reshape(-1, 2)
         out[k] = (arr[:, 0], arr[:, 1])
     return out
 
 
 # --------------------------------------------------------------------------------------
 # pure helpers (unit-tested in tests/test_battery_thermal_derate.py)
+#
+# The model, the fit and the derate curve live in ``battery_optimizer.service.thermal`` (the
+# service refits the same model online); here they are bound to this script's 30 s grid.  The power
+# convention is the package's: positive while charging (the script negates the sensor).
 # --------------------------------------------------------------------------------------
+
+episodes = partial(_thermal.episodes, step_s=STEP_S)
+fit_tau_profile = partial(_thermal.fit_tau_profile, step_s=STEP_S)
+predict_rows = partial(_thermal.predict_rows, step_s=STEP_S)
+free_run = partial(_thermal.free_run, step_s=STEP_S)
 
 
 def despike(values: np.ndarray, *, half_window: int = 3, threshold: float = SPIKE_C) -> np.ndarray:
@@ -191,257 +210,9 @@ def zoh(t: np.ndarray, v: np.ndarray, grid: np.ndarray, max_age_s: float | None)
     return out
 
 
-def exp_filter(u: np.ndarray, a: float) -> np.ndarray:
-    """``F[k+1] = a F[k] + (1 - a) u[k]``, ``F[0] = 0`` (the start value cancels in differences)."""
-    f = lfilter([0.0, 1.0 - a], [1.0, -a], u)
-    return f
-
-
-def episodes(
-    power_kw: np.ndarray, *, step_s: float = STEP_S, gap_min: float = GAP_MIN_DEFAULT
-) -> list[tuple[int, int]]:
-    """Index ranges ``[lo, hi)`` that split the timeline at the midpoints of the idle gaps of at
-    least ``gap_min`` minutes between active stretches (``|P| > ACTIVE_KW``)."""
-    active = np.flatnonzero(np.abs(np.nan_to_num(power_kw)) > ACTIVE_KW)
-    if active.size == 0:
-        return [(0, power_kw.size)]
-    cuts = []
-    gap_steps = gap_min * 60.0 / step_s
-    for a, b in zip(active[:-1], active[1:], strict=True):
-        if b - a > gap_steps:
-            cuts.append((a + b) // 2)
-    edges = [0, *cuts, power_kw.size]
-    return list(zip(edges[:-1], edges[1:], strict=True))
-
-
-def inputs(
-    p_kw: np.ndarray, t_grid: np.ndarray, kind: str, a: float
-) -> tuple[np.ndarray, list[str]]:
-    """Filtered regressors ``F[k, j]`` of the model input columns for decay ``a``.
-
-    ``kind``: ``split`` (T_amb, k_c, k_d), ``pooled`` (T_amb, k_|P|), ``quad`` (split plus a
-    ``k_c2 * P_charge^2`` term: resistive losses grow with the square of the power), ``harmonic``
-    (split plus cos / sin of the hour of day on the ambient). Power NaN counts as idle."""
-    p = np.nan_to_num(p_kw)
-    cols = [np.ones_like(p)]
-    names = ["t_amb"]
-    if kind == "pooled":
-        cols.append(np.abs(p))
-        names.append("k_abs")
-    else:
-        cols += [np.maximum(-p, 0.0), np.maximum(p, 0.0)]
-        names += ["k_c", "k_d"]
-    if kind == "quad":
-        cols.append(np.maximum(-p, 0.0) ** 2)
-        names.append("k_c2")
-    if kind == "harmonic":
-        ang = 2.0 * math.pi * t_grid / 86400.0
-        cols += [np.cos(ang), np.sin(ang)]
-        names += ["amb_cos", "amb_sin"]
-    return np.column_stack([exp_filter(c, a) for c in cols]), names
-
-
-def rows(
-    temp: np.ndarray,
-    f: np.ndarray,
-    a: float,
-    lo: int,
-    hi: int,
-    horizons_steps: tuple[int, ...],
-    stride: int = ORIGIN_STRIDE,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Regression rows of the multi-step prediction inside ``[lo, hi)``.
-
-    Returns ``y = T[k0+h] - a^h T[k0]``, ``x = F[k0+h] - a^h F[k0]``, the origin temperature and
-    the origin index (so that ``T[k0+h] = a^h T[k0] + x . beta``)."""
-    ys, xs, t0s, ks, hs = [], [], [], [], []
-    for h in horizons_steps:
-        k0 = np.arange(lo, hi - h, stride)
-        good = ~np.isnan(temp[k0]) & ~np.isnan(temp[k0 + h])
-        k0 = k0[good]
-        ah = a**h
-        ys.append(temp[k0 + h] - ah * temp[k0])
-        xs.append(f[k0 + h] - ah * f[k0])
-        t0s.append(temp[k0])
-        ks.append(k0)
-        hs.append(np.full(k0.size, h))
-    if not ys:
-        return np.empty(0), np.empty((0, f.shape[1])), np.empty(0), np.empty(0)
-    return (
-        np.concatenate(ys),
-        np.vstack(xs),
-        np.concatenate(t0s),
-        np.column_stack([np.concatenate(ks), np.concatenate(hs)]),
-    )
-
-
-def fit_tau_profile(
-    temp: np.ndarray,
-    p_kw: np.ndarray,
-    t_grid: np.ndarray,
-    spans: list[tuple[int, int]],
-    kind: str,
-    horizons_steps: tuple[int, ...],
-    taus_min: tuple[float, ...] = TAU_GRID_MIN,
-) -> dict:
-    """Least squares of the multi-step error for each ``tau`` on the grid; the best one wins.
-
-    Returns ``{"tau_min", "beta", "names", "rmse", "n", "profile": [(tau, rmse), ...]}``."""
-    best, profile = None, []
-    for tau in taus_min:
-        a = math.exp(-STEP_S / 60.0 / tau)
-        f, names = inputs(p_kw, t_grid, kind, a)
-        parts = [rows(temp, f, a, lo, hi, horizons_steps) for lo, hi in spans]
-        y = np.concatenate([p[0] for p in parts])
-        x = np.vstack([p[1] for p in parts])
-        if y.size < x.shape[1] + 3:
-            continue
-        beta, *_ = np.linalg.lstsq(x, y, rcond=None)
-        rmse = float(np.sqrt(np.mean((y - x @ beta) ** 2)))
-        profile.append((tau, rmse))
-        if best is None or rmse < best["rmse"]:
-            best = {"tau_min": tau, "beta": beta, "names": names, "rmse": rmse, "n": int(y.size)}
-    if best is None:
-        raise ValueError("no usable rows")
-    best["profile"] = profile
-    return best
-
-
-def predict_rows(
-    fit: dict,
-    temp: np.ndarray,
-    p_kw: np.ndarray,
-    t_grid: np.ndarray,
-    kind: str,
-    span: tuple[int, int],
-    horizons_steps: tuple[int, ...],
-    beta: np.ndarray | None = None,
-) -> dict:
-    """Multi-step predictions inside ``span`` with a fitted model: arrays ``h, pred, obs, t0,
-    p_mean`` (mean absolute power over the horizon, kW)."""
-    a = math.exp(-STEP_S / 60.0 / fit["tau_min"])
-    f, _ = inputs(p_kw, t_grid, kind, a)
-    y, x, t0, idx = rows(temp, f, a, span[0], span[1], horizons_steps)
-    if y.size == 0:
-        return {k: np.empty(0) for k in ("h", "pred", "obs", "t0", "p_mean")}
-    b = fit["beta"] if beta is None else beta
-    ah = a ** idx[:, 1]
-    pabs = np.cumsum(np.concatenate([[0.0], np.abs(np.nan_to_num(p_kw))]))
-    p_mean = (pabs[idx[:, 0] + idx[:, 1]] - pabs[idx[:, 0]]) / idx[:, 1]
-    return {
-        "h": idx[:, 1] * STEP_S / 60.0,
-        "pred": ah * t0 + x @ b,
-        "obs": y + ah * t0,
-        "t0": t0,
-        "p_mean": p_mean,
-    }
-
-
-def free_run(
-    temp0: float,
-    p_kw: np.ndarray,
-    tau_min: float,
-    t_amb: float,
-    k_c: float,
-    k_d: float,
-    k_c2: float = 0.0,
-) -> np.ndarray:
-    """Exact discretisation of the first-order node on the 30 s grid from ``temp0``."""
-    a = math.exp(-STEP_S / 60.0 / tau_min)
-    p = np.nan_to_num(p_kw)
-    out = np.empty(p.size + 1)
-    out[0] = temp0
-    for k in range(p.size):
-        pc = max(-p[k], 0.0)
-        target = t_amb + k_c * pc + k_c2 * pc * pc + k_d * max(p[k], 0.0)
-        out[k + 1] = a * out[k] + (1.0 - a) * target
-    return out
-
-
-def steady_state(t_amb: float, k_c: float, kw: float) -> float:
-    return t_amb + k_c * kw
-
-
-def derate_factor(temp_c: float, limit_c: float, band_c: float, floor_pct: float) -> float:
-    """Omnibattery's documented curve: 1 up to ``limit_c``, linear to ``floor_pct / 100`` at
-    ``limit_c + band_c``, flat after; no temperature (NaN) means no derate."""
-    if math.isnan(temp_c):
-        return 1.0
-    floor = floor_pct / 100.0
-    if temp_c <= limit_c:
-        return 1.0
-    if band_c <= 0.0 or temp_c >= limit_c + band_c:
-        return floor
-    return 1.0 - (1.0 - floor) * (temp_c - limit_c) / band_c
-
-
-def derated_cap_w(
-    temp_c: float,
-    limit_w: float,
-    limit_c: float,
-    band_c: float,
-    floor_pct: float,
-    min_power_w: float = 0.0,
-) -> float:
-    """Charge power cap in W: ``limit * factor``, never below the driver's minimum power."""
-    f = derate_factor(temp_c, limit_c, band_c, floor_pct)
-    if f >= 1.0:
-        return limit_w
-    return max(limit_w * f, min(min_power_w, limit_w))
-
-
-def equilibrium_charge_kw(
-    t_amb: float, k_c: float, limit_kw: float, limit_c: float, band_c: float, floor_pct: float
-) -> tuple[float, float]:
-    """Sustained charge power and temperature where the thermal steady state meets the derate
-    curve (bisection on P; both are monotone), for a charge that is not otherwise limited."""
-    lo, hi = 0.0, limit_kw
-    for _ in range(60):
-        mid = 0.5 * (lo + hi)
-        cap = limit_kw * derate_factor(steady_state(t_amb, k_c, mid), limit_c, band_c, floor_pct)
-        if cap >= mid:
-            lo = mid
-        else:
-            hi = mid
-    p = 0.5 * (lo + hi)
-    return p, steady_state(t_amb, k_c, p)
-
-
 # --------------------------------------------------------------------------------------
 # analysis
 # --------------------------------------------------------------------------------------
-
-
-def score(pred: dict) -> dict:
-    """RMSE / bias of the model and of persistence by horizon, plus the pooled figures."""
-    out = {"by_h": {}}
-    for h in sorted(set(pred["h"].tolist())):
-        m = pred["h"] == h
-        e = pred["pred"][m] - pred["obs"][m]
-        pe = pred["t0"][m] - pred["obs"][m]
-        out["by_h"][f"{h:g}"] = {
-            "n": int(m.sum()),
-            "rmse": float(np.sqrt(np.mean(e**2))),
-            "bias": float(e.mean()),
-            "rmse_persistence": float(np.sqrt(np.mean(pe**2))),
-        }
-    if pred["h"].size:
-        e = pred["pred"] - pred["obs"]
-        pe = pred["t0"] - pred["obs"]
-        out["pooled"] = {
-            "n": int(e.size),
-            "rmse": float(np.sqrt(np.mean(e**2))),
-            "rmse_persistence": float(np.sqrt(np.mean(pe**2))),
-        }
-        hot = pred["p_mean"] > 1.0
-        if hot.sum() >= 5:
-            out["pooled_above_1kw"] = {
-                "n": int(hot.sum()),
-                "rmse": float(np.sqrt(np.mean(e[hot] ** 2))),
-                "rmse_persistence": float(np.sqrt(np.mean(pe[hot] ** 2))),
-                "bias": float(e[hot].mean()),
-            }
-    return out
 
 
 def concat_pred(parts: list[dict]) -> dict:

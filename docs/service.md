@@ -279,6 +279,9 @@ The optional `battery_health:` section names the read-only battery health sensor
 code; the committed file names the `sensor.venus_*` ones of the Omnibattery balance monitor and the cell data);
 see [Battery health telemetry](#battery-health-telemetry).
 
+The optional `planning.thermal:` section (`mode: "off"` by default; quote it, a bare YAML `off` is a boolean)
+runs the read-only [thermal shadow](#thermal-shadow-derate-prediction).
+
 The variables the service reads (the complete table for every command is in
 [Configuration](configuration.md#environment-variables)):
 
@@ -306,8 +309,8 @@ return 405). Bind address `0.0.0.0`, container port **8080**.
 |---|---|
 | `/health/live` | `{"status": "alive"}` — the process and its event loop are up |
 | `/health/ready` | `{ready, inputs_ready, reasons, details}`; 200 or 503 |
-| `/status` | Mode, adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), `battery_health` (only when a `battery_health.entities` role is configured), `full_charge` (only with `full_charge.enabled`), code version, config hash; in `dry_run`/`live` also `actuator` (kill switch, in control, guard reasons, desired and observed state, alert, last error, import-trip hold, last tick / confirmed write / heartbeat) |
-| `/plan` | Latest plan with its snapshot summary, solver result and intents, plus the current intent (all flagged `shadow`), and the [day-ahead and final plan](#day-ahead-and-final-plan) of the current slot (`current_slot`) and of every upcoming slot (`day_ahead.slots`) |
+| `/status` | Mode, adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), `battery_health` (only when a `battery_health.entities` role is configured), `thermal` (only with `planning.thermal.mode: shadow`), `full_charge` (only with `full_charge.enabled`), code version, config hash; in `dry_run`/`live` also `actuator` (kill switch, in control, guard reasons, desired and observed state, alert, last error, import-trip hold, last tick / confirmed write / heartbeat) |
+| `/plan` | Latest plan with its snapshot summary, solver result and intents, plus the current intent (all flagged `shadow`), and the [day-ahead and final plan](#day-ahead-and-final-plan) of the current slot (`current_slot`) and of every upcoming slot (`day_ahead.slots`); with `planning.thermal.mode: shadow` the plan also carries its `thermal` block and `current_slot.thermal` the newest prediction of the slot |
 | `/metrics` | Prometheus exposition |
 
 Kubernetes probes: use `/health/live` for liveness **and readiness**. `/health/ready` answers 503
@@ -364,6 +367,7 @@ ID, price, timestamp or household reading is a label.
 | `climate_shadow_rmse_kelvin`, `climate_shadow_skill_ratio`, `climate_shadow_abs_bias_kelvin`, `climate_shadow_origins` | gauge | `window` (`legacy`, `new`), `horizon` (`1h`, `6h`, `12h`, `24h`) |
 | `climate_shadow_daily_heat_mdape_ratio`, `climate_shadow_valid_weeks`, `climate_shadow_top_offset_share_ratio` | gauge | `window` |
 | `climate_shadow_gate` | gauge 0/1 (state set) | `window`, `criterion` (the six of the preregistration and `verdict`), `status` (`PASS`, `FAIL`, `UNDETERMINED`) |
+| `thermal_*` | see [Thermal shadow](#thermal-shadow-derate-prediction): only with `planning.thermal.mode: shadow`, absent otherwise | — |
 | `battery_temperature_celsius` | gauge (absent while unknown) | — |
 | `battery_hot_seconds_total` | counter (seconds strictly above the threshold since start) | `threshold_celsius` (`battery_health.hot_thresholds_c`, 35 and 40) |
 | `battery_hot_uncounted_seconds_total` | counter (seconds a stalled clock advance did not credit) | — |
@@ -469,6 +473,7 @@ files `0600`, directories `0700`:
 | `slots/date=YYYY-MM-DD/slots.jsonl` | One row per closed slot: decision, measurements, price, virtual-battery step, costs (see below) |
 | `events/date=YYYY-MM-DD/events.jsonl` | Start/stop, HA sync/disconnect, solve skipped/error/timeout/discarded, history refresh, price publication |
 | `state/virtual_battery.json` | Virtual SOC (restored after a restart if younger than 6 h) |
+| `state/thermal.json`, `state/thermal_samples.json` | Thermal shadow only (mutable, atomic): the model parameters, status and last refit; the one-minute temperature and power buffer ([thermal shadow](#thermal-shadow-derate-prediction)) |
 | `state/full_charge.json` | Periodic full charge only (mutable, atomic): the scheduler's knowledge and calendar decision, never a plan ([scheduler](#periodic-full-charge-the-scheduler)) |
 
 A slot row also carries `day_ahead` and `final` (the [per-slot values](#day-ahead-and-final-plan): plan ID,
@@ -1114,6 +1119,92 @@ entry serves both). The section is excluded from the plan's config hash.
 
 The temperature and the two cell voltages are also extractable for offline analysis, as their own extraction
 group; see [`extract`](cli.md#extract-the-battery-health-group).
+
+### Thermal shadow (derate prediction)
+
+Read-only and **observability only**. `planning.thermal.mode` is `"off"` (default: nothing is read, recorded or
+exposed; the service, its plans, hashes, metrics and `/status` are byte for byte what they were) or `shadow`.
+Design: [derate-aware planning](planning/thermal-derate-aware-planning.md) (this is its PR 2); component page:
+[battery-thermal](components/battery-thermal.md). No plan, intent or actuation changes in either mode, and the
+`ha_guard` allowlist is unchanged: the inputs join the entity store's tracked set, so they arrive through the
+existing `state_changed` stream and `get_states` resync, and no value is ever written to them (a test asserts the
+live allowlist admits none of them).
+
+| Key | Meaning |
+|---|---|
+| `mode` | `"off"` or `shadow` (needs the five required entities, `actuation.entities.battery_ac_power` and `actuation.battery_ac_power_sign`) |
+| `entities.temperature` | `sensor.venus_internal_temperature`; shared with `battery_health.entities.temperature` (they must agree; either may be omitted) |
+| `entities.limit_switch`, `limit_c`, `band_c`, `floor_pct` | Omnibattery's `switch.omnibattery_temp_charge_limit` and `number.omnibattery_temp_charge_limit_c` / `_band_c` / `_floor_pct` (required) |
+| `entities.discharge_switch` | `switch.omnibattery_temp_charge_limit_discharge` (optional: without it the discharge side is never derated) |
+| `entities.system_max_charge_power`, `venus_max_charge_power` | the two cap numbers (optional): the curve scales with their minimum; without them `charge_limit_kw` |
+| `charge_limit_kw`, `driver_min_kw` | 2.5 and 0.8: the limit when the caps are unknown, and the driver minimum the cap never falls below |
+| `prior` | `{tau_min, t_amb_c, k_c, k_d}` before any accepted refit: 44 min, 32.6 degC, 11.0 and 6.9 degC/kW (charge and discharge gain; see the component page), each within its bounds |
+| `refit_hour_local` | the daily refit runs at or after this local hour (4) and at start-up when one is due |
+
+Entities must be distinct from each other and from `entities` roles, `actuation.entities` and
+`full_charge.entities` (they may repeat `entities.observed`). The section never joins the plan's config hash.
+
+* **Derate state.** `off`: the switch is off, no derate in the model. `on`: the switch is on and the numbers are
+  valid (`band_c > 0`, `0 <= floor_pct <= 100`, `limit_c` within 25 to 60). `unknown`: the switch or a number is
+  missing, `unavailable`, `unknown` or out of range, and the model stays blind (today's behaviour, the safe
+  direction). The curve is Omnibattery's documented one: factor 1 up to the limit, linear to the floor over the
+  band, cap `max(limit x factor, driver minimum)`, at most the limit; the discharge side uses it only while its own
+  switch is on. A missing role, an unavailable state or a stale temperature (older than 10 minutes) is `null`/
+  `unknown`, never a 0 and never an error: planning and actuation never wait for it.
+* **Observation buffer.** A tick once a minute and every observation feed a one-minute grid of the temperature and the
+  signed battery AC power (positive while charging, after `actuation.battery_ac_power_sign`) over 21 days, by
+  sample-and-hold. A minute is unknown (NaN, never idle) when the temperature is older than 10 minutes, a reading
+  is unavailable, or the Home Assistant session was not synced; the downtime of a restart is unknown too. The buffer
+  and the model state are persisted (`state/thermal_samples.json` every 30 minutes and at a refit and at stop,
+  `state/thermal.json` at every refit) and restored at start; an unreadable or invalid file is ignored (reported as
+  `restore_problem`) and the prior stays.
+* **Model and refit.** One first-order node, `T' = (T_amb + k_c P_charge + k_d P_discharge - T) / tau` (the code is
+  `service/thermal.py`, shared with `hack/battery_thermal_derate.py`), starting from `prior`. Daily, in its own
+  thread, the buffer is fitted (multi-step least squares over 10 to 90 minute horizons, `tau` profiled within 20 to
+  120 minutes, a ridge towards the prior that fades with the rows, parameters clipped to `T_amb` 20 to 40, `k_c` 2
+  to 15, `k_d` 2 to 20) and judged: a gain is refitted only if its direction has at least 10 minutes above 1 kW
+  from at least three episodes, otherwise it keeps its value; the candidate is **accepted** only if its
+  leave-one-episode-out 60 minute error beats persistence by a skill of at least 0.5 and beats the current
+  parameters on the held-out rows of the last 7 days. Otherwise the parameters stay and the status is
+  `degraded`; too little data (under two episodes or 12 hours) or no excitation (60 minute persistence error under
+  1 degC) is `insufficient_data` and changes nothing. Status: `prior` (never fitted), `fitted`, `degraded`.
+* **Prediction per plan.** Each published plan is simulated from the measured temperature (`cold_start` from
+  `T_amb` when it is unknown) through its per-slot charge and discharge powers; the battery draws
+  `min(requested, cap(T))` at every simulated minute, so the derate is a feedback inside a slot and the
+  temperature follows the power actually achieved. The plan file (`plans/.../<plan_id>.json`) gains an additive
+  `thermal` key (absent when off): `derate` (state, settings, limit and driver minimum), `temperature_start_c`,
+  `cold_start`, `model`, and `slots`, columns aligned with `inputs.slot_starts`: `temp_start_c`, `temp_end_c`,
+  `temp_max_c`, `derate_factor` and `charge_cap_kw` (the lowest inside the slot), `charge_planned_kw` and
+  `charge_kw` (planned and achievable), `discharge_planned_kw`, `discharge_kw`; and a `summary`. The minutes
+  between the decision and the first slot are not simulated. A failing prediction is logged and counted and never
+  blocks planning.
+* **Scoring at slot close.** The slot row gains a `thermal` block: the measured temperature at the slot's end, for
+  each lead (`final` the plan of record, `1h` and `3h` the newest plan made at least one and three hours before the
+  slot ended) the predicted end temperature and the error, and, for the plan of record in a slot where a derate was
+  predicted or measured, the predicted achievable against the observed mean charge power. Beside a native
+  controller that does not follow the plan the power comparison mixes the model error with plan-following error.
+* **`/status` `thermal`.** `mode`, `temperature_c` and its age, `power_kw` (+ charging), `derate` (state, limit
+  settings, `limit_kw`, `factor_now`, `derating_now`), `model` (status, parameters, `fitted_at`, `prior`, the
+  quality of the last accepted fit, the last refit with its reason and candidate, `restore_problem`), `buffer`,
+  `scoring` (per lead: n, mean absolute error, rmse, bias; the derate power error) and `current_slot` (the newest
+  prediction for the slot in progress).
+
+| Metric (`battery_optimizer_thermal_`) | Type | Labels |
+|---|---|---|
+| `temperature_celsius` | gauge (absent while unknown or stale) | — |
+| `derate_state` | gauge 0/1 | `state` (`off`, `on`, `unknown`) |
+| `derate_factor`, `derating` | gauge: factor of the curve at the measured temperature; 1 while it is in force and below 1 (absent while unknown) | — |
+| `limit_setting` | gauge: the switch's numbers as read | `name` (`limit_c`, `band_c`, `floor_pct`, `limit_kw`) |
+| `predicted_temperature_celsius`, `predicted_derate_factor`, `predicted_achievable_charge_kw` | gauge: the newest prediction for the slot in progress | — |
+| `model_status` | gauge 0/1 | `status` (`prior`, `fitted`, `degraded`) |
+| `parameter` | gauge | `name` (`tau_min`, `t_amb_c`, `k_c`, `k_d`) |
+| `last_fit_timestamp_seconds`, `buffer_hours` | gauge (the first absent while `prior`) | — |
+| `refits_total` | counter | `result` (`accepted`, `rejected`, `insufficient_data`, `error`) |
+| `predictions_total` | counter | `result` (`ok`, `error`) |
+| `scored_slots_total`, `temperature_abs_error_celsius_total`, `temperature_squared_error_celsius_squared_total` | counter: slots whose predicted end temperature was scored, and the sums of the absolute and squared error | `lead` (`final`, `1h`, `3h`) |
+| `temperature_error_sum_celsius` | gauge: the signed sum (predicted minus measured; falls when the model runs cold) | `lead` |
+| `derate_scored_slots_total`, `achievable_charge_abs_error_kw_total` | counter: slots with a derate whose achievable charge was scored, and the sum of the absolute error | — |
+| `achievable_charge_error_sum_kw` | gauge: the signed sum | — |
 
 ## Safety
 

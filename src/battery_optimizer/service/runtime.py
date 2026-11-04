@@ -141,6 +141,8 @@ from .planner import (
 )
 from .pvpc import PriceCurve, PriceParseError, parse_pvpc_state
 from .sink import ShadowSink
+from .thermal import refit as refit_thermal_model
+from .thermal_tracker import ThermalTracker
 from .timegrid import floor_slot, local_date, local_day_bounds_utc, next_slot_boundary
 from .virtual_battery import SlotStep, intent_energy_kwh, soc_violation, step_virtual_battery
 
@@ -162,6 +164,9 @@ _PLAN_MEMORY = 16
 _ADOPT_RETRY_S = 15.0
 #: Period of the battery-health clock advance (well inside ``battery_health.max_gap_s``).
 _HEALTH_TICK_S = 30.0
+#: Period of the thermal shadow's buffer tick and the interval between saves of its buffer.
+_THERMAL_TICK_S = 60.0
+_THERMAL_SAVE_S = 1800.0
 #: Period of the periodic full charge's observation loop (inside ``ack_timeout_s``).
 _FULL_CHARGE_TICK_S = 10.0
 #: Retry period of the Home Assistant time-zone check.
@@ -300,6 +305,19 @@ class ShadowService:
                     max_gap_s=health_cfg.max_gap_s,
                 )
             )
+        # Read-only thermal state and derate prediction (planning.thermal.mode shadow): the
+        # Omnibattery temperature-limit entities, the temperature sensor and the AC power (the
+        # same entity and sign the actuator uses).  Tracked in every service mode, never written.
+        self.thermal: ThermalTracker | None = None
+        self._thermal_roles: dict[str, str] = {}
+        thermal_cfg = config.planning.thermal
+        if thermal_cfg.active:
+            sign = config.actuation.battery_ac_power_sign
+            ac_entity = config.actuation.entities.battery_ac_power
+            assert sign is not None and ac_entity  # validated by the config
+            self._thermal_roles = thermal_cfg.entities.by_entity()
+            self._thermal_roles[ac_entity] = "charge_power"
+            self.thermal = ThermalTracker(thermal_cfg, ac_power_sign=sign)
         # The periodic full charge reads its balance sensors, the weekly entities and Omnibattery's
         # status; an entity named by battery_health too keeps one store entry (dict.fromkeys).
         fc_cfg = config.full_charge
@@ -319,6 +337,7 @@ class ShadowService:
                         *climate_entities,
                         *actuation_entities,
                         *self._health_roles,
+                        *self._thermal_roles,
                         *full_charge_entities,
                     )
                 )
@@ -329,7 +348,10 @@ class ShadowService:
         self.store.add_listener(self._on_state)
 
         self.metrics = ServiceMetrics(
-            snapshot=self.metric_snapshot, actuation=acting, full_charge=fc_cfg.enabled
+            snapshot=self.metric_snapshot,
+            actuation=acting,
+            full_charge=fc_cfg.enabled,
+            thermal=self.thermal is not None,
         )
         from battery_optimizer import __version__
 
@@ -395,6 +417,13 @@ class ShadowService:
         self.virtual_soc: float | None = None
         self.virtual_soc_origin: str | None = None
         self._init_virtual_battery()
+
+        #: ``(plan_id, thermal block)`` of the last plans: the shadow prediction next to each plan.
+        self._thermal_blocks: deque[tuple[str, dict[str, Any]]] = deque(maxlen=_PLAN_MEMORY)
+        self._thermal_saved_at: datetime | None = None
+        self._thermal_refit_running = False
+        self._thermal_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bo-thermal")
+        self._init_thermal()
 
         # Periodic full charge (off by default).  ``_fc_directive`` is ``None`` (hands off) until
         # first step after a sync, and while the feature is suspended.
@@ -480,6 +509,8 @@ class ShadowService:
             self._tasks.append(asyncio.create_task(self._climate_loop(), name="climate-shadow"))
         if self.health is not None:
             self._tasks.append(asyncio.create_task(self._health_loop(), name="battery-health"))
+        if self.thermal is not None:
+            self._tasks.append(asyncio.create_task(self._thermal_loop(), name="thermal-shadow"))
         if self.full_charge is not None:
             self._tasks.append(
                 asyncio.create_task(self._full_charge_loop(), name="full-charge-scheduler")
@@ -507,6 +538,10 @@ class ShadowService:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         self._tasks.clear()
+        if self.thermal is not None:
+            with contextlib.suppress(Exception):
+                await self._save_thermal(self.clock.now(), samples=True)
+        self._thermal_pool.shutdown(wait=False, cancel_futures=True)
         if self.rest is not None:
             with contextlib.suppress(Exception):
                 await self.rest.aclose()
@@ -549,6 +584,9 @@ class ShadowService:
         health_role = self._health_roles.get(state.entity_id)
         if self.health is not None and health_role is not None:
             self.health.observe(health_role, state.state, self.clock.now())
+        thermal_role = self._thermal_roles.get(state.entity_id)
+        if self.thermal is not None and thermal_role is not None:
+            self.thermal.observe(thermal_role, state.state, self.clock.now())
         role = self.config.entities.role_of(state.entity_id)
         if self.actuator is not None:
             self._actuation_wake_on(state, role)
@@ -1195,6 +1233,7 @@ class ShadowService:
         self._wake_actuator()
         self._logged_skip = None
         _log_plan(result, trigger, elapsed)
+        thermal_block = self._predict_thermal(result, completed)
         self.adopt_late(completed)
         self.last_solve = {
             "at": now.isoformat(),
@@ -1204,7 +1243,10 @@ class ShadowService:
             "duration_s": round(elapsed, 4),
             "solver_status": result.solver.get("status"),
         }
-        await self._write(self.sink.write_plan, result.to_record())
+        record = result.to_record()
+        if thermal_block is not None:
+            record["thermal"] = thermal_block  # additive: absent unless planning.thermal is on
+        await self._write(self.sink.write_plan, record)
         await self._after_solve_full_charge(snapshot, result)
         return "ok"
 
@@ -1333,6 +1375,10 @@ class ShadowService:
         if price is None:
             price = self._recorded_price(slot_start)
         record = self._slot_record(slot_start, slot_end, measured, opened, price)
+        if self.thermal is not None:
+            scored = self._score_thermal(slot_start, opened)
+            if scored is not None:
+                record["thermal"] = scored
         self._closed_slot = slot_start
         log.info(
             "slot closed start=%s decision=%s grid_kwh=%s battery_charge_kwh=%s "
@@ -1717,6 +1763,182 @@ class ShadowService:
                 log.exception("scheduler tick failed")
                 delay = 5.0
             await self.clock.sleep(delay)
+
+    # ------------------------------------------------------------------ thermal shadow
+
+    def _thermal_observing(self) -> bool:
+        """The buffer records real minutes only while the Home Assistant session is synced."""
+        return self.ha is None or self.ha.stats.synced
+
+    def _init_thermal(self) -> None:
+        """Load the saved model and buffer (anything unusable is ignored, the prior stays)."""
+        tracker = self.thermal
+        if tracker is None:
+            return
+        now = self.clock.now()
+        for name, load in (
+            ("thermal", tracker.restore_state),
+            ("thermal_samples", lambda state: tracker.restore_samples(state, now)),
+        ):
+            state, problem = self.sink.load_state(name)
+            if problem is not None:
+                tracker.restore_problem = problem
+                log.warning("thermal state not usable problem=%s", problem)
+            load(state)
+        tracker.advance(now, observing=False)
+
+    def _predict_thermal(self, result: PlanResult, now: datetime) -> dict[str, Any] | None:
+        """The shadow prediction of a published plan, or ``None`` (off, or it failed: never
+        blocks planning)."""
+        tracker = self.thermal
+        if tracker is None:
+            return None
+        try:
+            snap = result.snapshot
+            hours = snap.interval_seconds / 3600.0
+            by_slot = {p.slot_start: p for p in slot_plans_from_result(result)}
+            charge, discharge = [], []
+            for start in snap.slot_starts:
+                plan = by_slot.get(start)
+                c, d = plan.energy_kwh() if plan is not None else (0.0, 0.0)
+                charge.append(c / hours)
+                discharge.append(d / hours)
+            tracker.advance(now, observing=self._thermal_observing())
+            block = tracker.predict(
+                plan_id=result.plan_id,
+                generated_at=result.plan.generated_at,
+                slot_starts=snap.slot_starts,
+                interval_s=snap.interval_seconds,
+                charge_kw=charge,
+                discharge_kw=discharge,
+                now=now,
+            )
+        except Exception:  # noqa: BLE001 - observability must never reach planning
+            self.metrics.thermal_predictions.labels(result="error").inc()
+            log.exception("thermal prediction failed plan_id=%s", result.plan_id)
+            return None
+        self.metrics.thermal_predictions.labels(result="ok").inc()
+        self._thermal_blocks.append((result.plan_id, block))
+        return block
+
+    def _score_thermal(
+        self, slot_start: datetime, opened: _SlotOpen | None
+    ) -> dict[str, Any] | None:
+        """Score the closed slot's predictions (counters and the slot record's block)."""
+        tracker = self.thermal
+        assert tracker is not None
+        try:
+            tracker.advance(self.clock.now(), observing=self._thermal_observing())
+            final = opened.final if opened else None
+            scored = tracker.score_slot(
+                slot_start, self._interval, final.plan_id if final is not None else None
+            )
+        except Exception:  # noqa: BLE001 - scoring is observability only
+            log.exception("thermal scoring failed slot=%s", slot_start.isoformat())
+            return None
+        m = self.metrics
+        for lead, entry in scored["leads"].items():
+            error = entry["error_c"]
+            if error is None:
+                continue
+            m.thermal_scored_slots.labels(lead=lead).inc()
+            m.thermal_abs_error.labels(lead=lead).inc(abs(error))
+            m.thermal_squared_error.labels(lead=lead).inc(error * error)
+            m.thermal_error_sum.labels(lead=lead).inc(error)
+        charge = scored["charge"]
+        if charge is not None and "error_kw" in charge:
+            m.thermal_power_scored_slots.inc()
+            m.thermal_power_abs_error.inc(abs(charge["error_kw"]))
+            m.thermal_power_error_sum.inc(charge["error_kw"])
+        return scored
+
+    async def _save_thermal(self, now: datetime, *, samples: bool) -> None:
+        tracker = self.thermal
+        assert tracker is not None
+        await self._write(self.sink.save_thermal, tracker.to_state())
+        if samples:
+            state = tracker.samples_state()
+            if state is not None:
+                await self._write(self.sink.save_thermal_samples, state)
+            self._thermal_saved_at = now
+
+    async def thermal_refit(self) -> str | None:
+        """Run the guarded refit on a copy of the buffer (own thread) and apply the verdict.
+
+        Returns the outcome (``accepted``, ``rejected``, ``insufficient_data``, ``error``), or
+        ``None`` when the thermal shadow is off or a refit is already running.  Only an accepted
+        refit changes the parameters; the result is persisted either way.
+        """
+        tracker = self.thermal
+        if tracker is None or self._thermal_refit_running:
+            return None
+        self._thermal_refit_running = True
+        try:
+            now = self.clock.now()
+            tracker.advance(now, observing=self._thermal_observing())
+            temp, power = tracker.arrays()
+            current, prior = tracker.params, tracker.prior
+            result, error = None, None
+            try:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    self._thermal_pool,
+                    lambda: refit_thermal_model(temp, power, current=current, prior=prior),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a failed refit keeps the parameters
+                error = f"{type(exc).__name__}: {exc}"[:300]
+                log.exception("thermal refit failed")
+            outcome = tracker.apply_refit(result, error, now)
+        finally:
+            self._thermal_refit_running = False
+        self.metrics.thermal_refits.labels(result=outcome).inc()
+        log.info(
+            "thermal refit outcome=%s status=%s tau_min=%.1f t_amb_c=%.2f k_c=%.2f k_d=%.2f",
+            outcome,
+            tracker.status,
+            tracker.params.tau_min,
+            tracker.params.t_amb_c,
+            tracker.params.k_c,
+            tracker.params.k_d,
+        )
+        await self._save_thermal(now, samples=True)
+        return outcome
+
+    async def thermal_tick(self) -> None:
+        """One pass of the thermal loop: record the minute, save the buffer, refit when due."""
+        tracker = self.thermal
+        assert tracker is not None
+        now = self.clock.now()
+        tracker.advance(now, observing=self._thermal_observing())
+        saved = self._thermal_saved_at
+        if saved is None or (now - saved).total_seconds() >= _THERMAL_SAVE_S:
+            await self._save_thermal(now, samples=True)
+        if tracker.refit_due(now, self._tz):
+            await self.thermal_refit()
+
+    async def _thermal_loop(self) -> None:
+        while True:
+            try:
+                await self.thermal_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the loop must survive one bad tick
+                log.exception("thermal tick failed")
+            await self.clock.sleep(_THERMAL_TICK_S)
+
+    def _thermal_view(self, now: datetime) -> dict[str, Any]:
+        assert self.thermal is not None
+        return {
+            **self.thermal.snapshot(now),
+            "current_slot": self.thermal.current_slot(floor_slot(now, self._interval)),
+        }
+
+    def _thermal_block_for(self, plan_id: str) -> dict[str, Any] | None:
+        for known, block in reversed(self._thermal_blocks):
+            if known == plan_id:
+                return block
+        return None
 
     # ------------------------------------------------------------------ periodic full charge
 
@@ -2335,6 +2557,7 @@ class ShadowService:
             "late_samples": self.observer.late_samples,
             "climate_shadow": self._climate_view(),
             **({"battery_health": self.health.snapshot(now)} if self.health is not None else {}),
+            **({"thermal": self._thermal_view(now)} if self.thermal is not None else {}),
             **({"actuator": self.actuator.snapshot()} if self.actuator is not None else {}),
             **(
                 {"full_charge": self._full_charge_metric(now)}
@@ -2402,6 +2625,7 @@ class ShadowService:
             },
             "climate_shadow": self._climate_status(),
             **({"battery_health": self._health_status(now)} if self.health is not None else {}),
+            **({"thermal": self._thermal_view(now)} if self.thermal is not None else {}),
             "config_hash": self.config.config_hash(),
             **({"actuator": self.actuator.view()} if self.actuator is not None else {}),
             **(
@@ -2475,6 +2699,7 @@ class ShadowService:
                 "decision": opened.decision if opened else None,
                 "day_ahead": day_ahead.to_dict() if day_ahead else None,
                 "final": final.to_dict() if final else None,
+                **({"thermal": self.thermal.current_slot(slot)} if self.thermal else {}),
             },
             "day_ahead": {
                 "slots": [
@@ -2499,6 +2724,8 @@ class ShadowService:
             }
         record = plan.to_record()
         record.pop("inputs", None)
+        if self.thermal is not None and (block := self._thermal_block_for(plan.plan_id)):
+            record["thermal"] = block
         return {
             "shadow": True,
             "now": now.isoformat(),
