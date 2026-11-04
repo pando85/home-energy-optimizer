@@ -88,6 +88,10 @@ achievable-power gap, hours per week above 35, 40 and 45 degC.
 of `k_c` are usable, `k_c` above 1.9 kW and `k_d` are not accepted (the acceptance check above fails), and the derate curve is
 confirmed only over 13.5 minutes at 48.3 to 50.2 degC. Not used by the planner.
 
+**Parked** (2026-11-04, owner): fans are to be added to the battery, so the thermal analysis is not prioritised and may be
+deprecated; the shadow keeps running as the before/after measurement. See the
+[parked note](../planning/thermal-derate-aware-planning.md#7-rollout-and-pr-breakdown).
+
 **Implementation** (PR 2, shadow; `planning.thermal.mode`, default `off`): the service reads the Omnibattery switch and
 numbers, the temperature and the AC power, keeps a one-minute buffer, refits daily within bounds with the acceptance checks of
 [service.md](../service.md#thermal-shadow-derate-prediction) (the parameters only change on an accepted refit; the status is
