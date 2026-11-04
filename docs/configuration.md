@@ -144,6 +144,14 @@ voltages, Omnibattery's balance monitor) is documented in
 [service.md](service.md#battery-health-telemetry). All its entities are optional and null in code; it adds no
 write path, no environment variable and no credential, and is excluded from the plan's config hash.
 
+The `planning.thermal:` section (read-only thermal state and derate prediction, **off by default**: `mode: "off"`,
+quoted) is documented in [service.md](service.md#thermal-shadow-derate-prediction). With `mode: shadow` it reads
+Omnibattery's Temperature Charge Limit switch and numbers (never written, never in the `ha_guard` allowlist), the
+battery temperature (shared with `battery_health.entities.temperature`, they must agree) and the AC power of
+`actuation.entities.battery_ac_power` with its sign; it keeps a thermal model with a daily guarded refit under
+`<data_dir>/service/v1/state/` and records a prediction beside every plan. It adds no environment variable and no
+credential, changes no plan, and is excluded from the plan's config hash.
+
 ## HA authentication
 
 HA history extraction requires a bearer token. The token is **never written to

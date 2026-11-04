@@ -1,8 +1,11 @@
 # Derate-aware planning: Omnibattery's Temperature Charge Limit in the planner
 
-- **Status:** study and design; **nothing here is implemented in the service**. The only code is the offline study
-  `hack/battery_thermal_derate.py` (with `tests/test_battery_thermal_derate.py`). Merging this document authorises
-  nothing on the installation and widens no allowlist. Each step of the [PR breakdown](#7-pr-breakdown) is its own PR.
+- **Status:** study and design. **PR 2 is implemented** as a read-only shadow (`planning.thermal.mode: shadow`,
+  default `off`; see [service.md](../service.md#thermal-shadow-derate-prediction)): inputs, thermal state with a
+  guarded refit, per-plan prediction, metrics. Nothing else is: the planner, the solver and the actuator do not use
+  it, and no allowlist is widened. The study is `hack/battery_thermal_derate.py` (with
+  `tests/test_battery_thermal_derate.py`; its model and fit now live in `service/thermal.py`). Each step of the
+  [PR breakdown](#7-pr-breakdown) is its own PR.
 - **Date:** 2026-11-04
 - **Related:** [battery longevity](battery-longevity.md) (step 6, the thermal policy), the [thermal charge soft
   cap](thermal-charge-soft-cap.md) (implemented, off by default; its thermal fit is superseded by section 2), the
@@ -31,6 +34,20 @@ already discourages (section 5). The replay of section 8 decides whether the cha
 
 ## 2. Evidence (2026-11-04, `hack/battery_thermal_derate.py`)
 
+> **Correction (PR 2).** PR #91 printed the two gains the wrong way round. The study script negates
+> `sensor.venus_ac_power` (negative while charging) so that its power is positive while charging, but its regressors
+> took the *negative* part of that power as the charge: the coefficient it called `k_c` multiplies the **discharge**
+> power and the one it called `k_d` the **charge** power. A synthetic check with known gains reproduces the swap
+> (`tests/test_battery_thermal_derate.py`), and the fitted 11.0 degC/kW reproduces the 2.5 kW session
+> (32.6 + 11.0 x 2.2 kW x (1 - exp(-75/44)) = 52.4 degC) which 6.9 cannot (46.7). The shared model in
+> `service/thermal.py` is now explicit (positive while charging, `k_c` on the charge power) and this page, the
+> [component page](../components/battery-thermal.md) and the service prior use the physical labels: **charge gain
+> `k_c` = 11.0 degC/kW** (bootstrap 8.7 to 11.7, leave-one-episode-out 9.7 to 11.6) and **discharge gain `k_d` = 6.9
+> degC/kW** (3.6 to 9.5; 3.1 to 8.2). The coefficients, `tau`, `T_amb` and the held-out scores do not change;
+> everything *derived from the labelled `k_c`* did and is recomputed below with the corrected charge gain from the
+> reported coefficients (the recorder is not re-read in this PR). Statements below about which gain "collapses" or
+> is "identifiable" were read with the old labels and are to be re-read after the next run of the script.
+
 **Data.** Home Assistant recorder, read only (events, not 5-minute windows), from the first AC energy (2026-11-03 19:14:30
 UTC) to 14:24 UTC: 19.2 hours, five episodes (the timeline split at the midpoints of idle gaps over 60 min): commissioning
 test at 0.8 kW, a 0.3 kW discharge, **one charge at 1.4 kW mean (peak 1.9 kW, 31.9 to 42.0 degC)**, a day of 0.2 to 0.8 kW
@@ -41,14 +58,14 @@ energised is excluded (a cold start: 25 degC rising at zero power).
 prediction error (horizons 10 to 90 min, origins every 2 min, 2729 rows), linear in `(T_amb, k_c, k_d)` for a given `tau`,
 so `tau` is profiled on a grid. Uncertainty: leave-one-episode-out (jackknife) ranges and a moving-block bootstrap
 (2 h blocks, 400 draws) at the best `tau`. The fit moves with every refresh (five more minutes of data took `tau`
-from 48 to 44 min and `k_c` from 7.4 to 6.9): the profile of `tau` is flat between 40 and 52 min.
+from 48 to 44 min and `k_d` from 7.4 to 6.9): the profile of `tau` is flat between 40 and 52 min.
 
 | parameter | fit | bootstrap 5 to 95% | leave-one-episode-out range |
 |---|---|---|---|
 | `tau` | 44 min | 40 to 52 (rmse within 5% of best) | 44 to 52 |
 | `T_amb` (idle level) | 32.6 degC | 32.2 to 33.0 | 32.3 to 32.9 |
-| `k_c` | 6.9 degC/kW | 3.6 to 9.5 | **3.1 to 8.2** |
-| `k_d` | 11.0 degC/kW | 8.7 to 11.7 | 9.7 to 11.6 |
+| `k_c` (charge) | 11.0 degC/kW | 8.7 to 11.7 | 9.7 to 11.6 |
+| `k_d` (discharge) | 6.9 degC/kW | 3.6 to 9.5 | **3.1 to 8.2** |
 
 **Validation (honest).** Prediction `h` minutes ahead from the measured temperature at the origin and the measured power
 in between, held-out episode never in the fit, against persistence (hold the origin temperature):
@@ -66,8 +83,8 @@ never exceeded 1.9 kW) the free simulation of the session peaks at 46.6 degC aga
 in-sample**. Further findings:
 
 - A single gain for both directions fits as well out of sample (leave-one-out 1.05, walk-forward 1.41): separate charge and
-  discharge gains are not resolved; `k_d` rests on discharges of at most 0.82 kW and **must not be extrapolated to 2.5 kW**
-  (it would predict 60 degC, which nothing supports).
+  discharge gains are not resolved; `k_d` (the discharge gain) rests on discharges of at most 0.82 kW and **must not be
+  extrapolated to 2.5 kW** (it would predict 49.9 degC at steady state, which nothing supports).
 - A quadratic charge term has a negative coefficient (heating sub-linear at the top, unphysical for resistive losses) and
   no out-of-sample gain: dropped.
 - Ambient: the idle plateau sits between 31.7 and 33.0 degC over the 19 hours. A daily harmonic on the ambient (amplitude
@@ -101,14 +118,17 @@ at 40 degC and the 40 to 48 degC part of the ramp, hysteresis (the curve is docu
 minimum, the discharge side (switch off), other limit values. The check covers 13.5 minutes of one regime; it will be
 re-run as the battery cools through the band (the script prints it on every run).
 
-**What follows physically** (model above, `k_c` 6.9, `tau` 44; sensitivity in brackets for `k_c` 3.6 and 9.5): from an idle start
-a charge at 2.5 kW reaches the 40 degC knee after 25 min and the steady state `T_amb + k_c P` of 50 degC; at 2.0 kW the knee
-comes after 34 min (steady 46), at 1.5 kW after 55 min (steady 43). The derate is itself a feedback: the thermal steady state
-meets the curve at **about 1.8 kW and 45 degC** (bootstrap 1.5 to 2.4 kW; leave-one-out 1.6 to 2.5 kW). A charge held at the
-maximum request for three hours from idle delivers 78% of the unlimited energy at 2.5 kW (97% at `k_c` 3.6, 66% at 9.5), 94% at
-2.0 kW (100%, 81%), and **100% at 1.5 kW** (100%, 100%): a request of 1.5 kW or less needs a temperature above 46 degC (cap 1.5
-kW) to be limited, so **the soft cap at 1.5 kW and the derate barely overlap**. One hour at 2.5 kW delivers 2.22 kWh instead
-of 2.5 (1.95 at `k_c` 9.5).
+**What follows physically** (model above with the corrected charge gain `k_c` 11.0, `tau` 44; in brackets the bootstrap ends
+8.7 and 11.7; recomputed with `service/thermal.py`, replacing the figures PR #91 derived from the discharge gain): from an
+idle start a charge at 2.5 kW reaches the 40 degC knee after 14 min (18 at 8.7, 13 at 11.7) and the steady state `T_amb +
+k_c P` of 60 degC, far into the band; at 2.0 kW the knee comes after 18 min (steady 55), at 1.5 kW after 26 min (steady 49).
+The derate is itself a feedback: the thermal steady state meets the curve at **about 1.4 kW and 48 degC** (1.6 kW and 46
+degC at 8.7; 1.3 kW and 48 degC at 11.7). A charge held at the maximum request for three hours from idle delivers 62% of the
+unlimited energy at 2.5 kW (70% at 8.7, 60% at 11.7), 76% at 2.0 kW (86%, 74%), and **96% at 1.5 kW** (100%, 93%): a
+request of 1.5 kW is limited only after about 26 minutes, so **the soft cap at 1.5 kW and the derate overlap more than PR
+#91 concluded** (it found them barely overlapping), and the derate is worth more than it assumed. One hour at 2.5 kW
+delivers 1.92 kWh instead of 2.5 (1.87 at 11.7). The discharge gain 6.9 must not be extrapolated either: 2.5 kW of
+discharge would settle at 49.9 degC, which nothing supports.
 
 **What data is needed, and how long to wait.** The verdict today is *usable for `tau`, `T_amb` and the order of magnitude of
 `k_c`; too thin for `k_c` at 2 to 2.5 kW and for `k_d`*. Needed: at least 10 episodes, with at least 4 charges above 1.8 kW
@@ -294,12 +314,26 @@ criteria of section 6. Rollback is the flag; the switch and numbers are never to
 | # | PR | Content | Depends on |
 |---|---|---|---|
 | 1 | `docs(planning): Derate-aware planning study` | **this PR**: study script and tests, this design, the [battery-thermal](../components/battery-thermal.md) page, regime-log entry | none |
-| 2 | `feat(service): Read-only thermal inputs, thermal state and refit` | `planning.thermal` config, entity subscriptions, `service/thermal.py` (curve, recursion, refit with guards), metrics, status API, per-slot `thermal` block for the **blind** plan; mode `off` or `shadow` records only | 1 |
+| 2 | `feat(service): Read-only thermal inputs, thermal state and refit` | **implemented** (see below): `planning.thermal` config, entity subscriptions, `service/thermal.py` (curve, recursion, refit with guards), metrics, status API, per-slot `thermal` block for the **blind** plan; mode `off` or `shadow` records only | 1 |
 | 3 | `feat(oracle): Per-slot charge and discharge power bounds` | `charge_limit_kw[t]`, `discharge_limit_kw[t]` in `build_model` / `solve_oracle`, byte-identical when absent, golden digests, composition with taper, soft cap, dwell | none |
 | 4 | `feat(planner): Derate-aware fixed-point solve, shadow comparison` | the loop of section 4 with its guards, `mode: shadow` solves both and records the comparison, full-charge hot-start test | 2, 3 |
 | 5 | `feat(benchmark): Thermal plant and derate in the replay, with its study` | thermal plant in `rolling_horizon`, `hack/thermal_derate_sweep.py`, the arms of section 6, the result and the soft-cap knee decision in this document | 3 |
 | 6 | `feat(planner): Aware plan drives the intents` | `mode: active`; deploy-config change recorded in the regime log; component pages recalibrated | 4, 5, the shadow gate |
 | 7 | `feat(oracle): Linear derate rows (experiment)` | the joint formulation of section 4 as a replay arm only | 3, 5 |
+
+**PR 2 as implemented**, against sections 3 and 5: `planning.thermal` is `mode: off | shadow` (no `active` yet) with the
+entities of section 3 (the two cap numbers and the discharge switch optional, a missing required role refused at
+start-up with the mode on). The refit is the algorithm of section 3 with these specifics: a ridge towards the prior of
+500 pseudo-rows fading as the rows grow; a gain refitted only with at least 10 minutes above 1 kW from at least three
+episodes; acceptance by **leave-one-episode-out** 60 minute error (skill against persistence at least 0.5, and better than
+the current parameters on the held-out rows of the last 7 days) in place of a walk-forward fit, because a walk-forward
+fit needs a long history before it can judge anything and the held-out comparison is the same question on the data
+that exists; data without thermal excitation (60 minute persistence error under 1 degC) is not judged. The shadow
+prediction simulates the node through each plan with the derate as a feedback at one-minute substeps and records
+the per-slot columns as a `thermal` key of the plan file (no sibling record; the key is absent when off). Scoring at
+slot close covers the end temperature at three leads and the achievable charge power in derate slots. The online
+ambient estimate, the plan temperature error stratified by power, the derate-conformance KPI (it needs the written
+set power, not read yet) and the exposure threshold at 45 degC are not part of PR 2.
 
 PRs 2 and 3 are independent and can proceed in parallel. PR 1 changes no service code and PRs 2 to 4 change no plan while
 `mode` is `off`. The first deployment decision is the owner's, as for the soft cap and the dwell cost.

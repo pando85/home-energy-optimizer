@@ -21,6 +21,9 @@ Layout (partitioned by **UTC** day, so a DST day is never split or doubled)::
                                                        outcome and pause
     service/v1/state/virtual_battery.json              the virtual battery's SOC (mutable)
     service/v1/state/full_charge.json                  the full-charge scheduler's state (mutable)
+    service/v1/state/thermal.json                      the thermal model's parameters and refit
+                                                       record (only with planning.thermal on)
+    service/v1/state/thermal_samples.json              its one-minute temperature / power buffer
 
 Plans are written with :func:`battery_optimizer.paths.write_part_atomic` (temp
 file, fsync, no-clobber hard link) — the store convention of the offline pipeline.
@@ -149,6 +152,25 @@ class ShadowSink:
             path.rename(aside)
         except OSError:
             pass
+
+    def save_thermal(self, state: dict[str, Any]) -> None:
+        self._save_state(self._state_path("thermal"), state)
+
+    def save_thermal_samples(self, state: dict[str, Any]) -> None:
+        self._save_state(self._state_path("thermal_samples"), state)
+
+    def load_state(self, name: str) -> tuple[dict[str, Any] | None, str | None]:
+        """``(state, problem)`` of a mutable state file: missing is ``(None, None)``, unreadable or
+        not a JSON object is ``(None, problem)`` (the next save replaces it)."""
+        try:
+            state = json.loads(self._state_path(name).read_text())
+        except FileNotFoundError:
+            return None, None
+        except (OSError, ValueError) as exc:
+            return None, f"{name}.json unreadable: {exc}"
+        if not isinstance(state, dict):
+            return None, f"{name}.json is not a JSON object"
+        return state, None
 
     def _save_state(self, path: Path, state: dict[str, Any]) -> None:
         _ensure_private_dir(path.parent)

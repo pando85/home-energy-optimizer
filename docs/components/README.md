@@ -95,7 +95,7 @@ flowchart LR
 | [battery-load-forecast](battery-load-forecast.md) | battery-optimizer |
 | [battery-model](battery-model.md) | battery-optimizer, boost-mode, system-replay-benchmark |
 | [battery-optimizer](battery-optimizer.md) | system-replay-benchmark, the future battery actuator |
-| [battery-thermal](battery-thermal.md) | battery-optimizer (derate-aware planning, planned), system-replay-benchmark (thermal plant, planned) |
+| [battery-thermal](battery-thermal.md) | battery-optimizer (derate-aware planning, planned), system-replay-benchmark (thermal plant, planned); the service shadow records its predictions |
 | [tariff-prices](tariff-prices.md) | battery-optimizer, boost-mode, every `dataset_id` |
 | [boost-mode](boost-mode.md) | heat-pump-controller, battery-load-forecast |
 | [system-replay-benchmark](system-replay-benchmark.md) | the decisions in the ADRs |
@@ -114,7 +114,7 @@ flowchart LR
 | [battery-load-forecast](battery-load-forecast.md) | stale | 2026-11-03 | Learns from reconstructed gross load since commissioning, with real charge and discharge since go-live (2026-11-03 23:45); recheck after the data-pipeline acceptance (and again at the comfort schedule) |
 | [battery-model](battery-model.md) | stale | 2026-11-03 | Live since 2026-11-03 23:45 with system caps 2500/2500 W and Premium mode (limits changed again); RTE, SOC window, idle draw still assumptions, now measurable; 2026-11-04: the owner enabled Omnibattery's Temperature Charge Limit (14:10:56 UTC), so charge power above 40 degC is derated and the 2.5 kW power assumption no longer holds in a hot battery ([regime log](regime-log.md), [battery-thermal](battery-thermal.md)) |
 | [battery-optimizer](battery-optimizer.md) | stale | 2026-11-03 | Live since 2026-11-03 23:45 (go-live trigger: measured SOC, import-cap adapter, the battery now moves); objective unchanged; recalibrate on measured load after settling; 2026-11-04: plans are derate-blind while the owner's Temperature Charge Limit is on (realised charge can be below the plan above 40 degC; the replan corrects each slot); derate-aware planning is [designed](../planning/thermal-derate-aware-planning.md), not built |
-| [battery-thermal](battery-thermal.md) | provisional | 2026-11-04 | Fitted on one day (two charges above 1 kW): `tau` 48 min and `T_amb` usable, `k_c` above 1.9 kW and `k_d` not accepted; derate curve confirmed only at 48.3 to 50.2 degC; offline only, not used by the planner |
+| [battery-thermal](battery-thermal.md) | provisional | 2026-11-04 | Fitted on one day (two charges above 1 kW): `tau` 44 min and `T_amb` usable, `k_c` above 1.9 kW and `k_d` not accepted; PR 2 corrected the gain labels (charge 11.0, discharge 6.9 degC/kW); derate curve confirmed only at 48.3 to 50.2 degC; runs in shadow in the service (`planning.thermal`, off by default), not used by the planner |
 | [tariff-prices](tariff-prices.md) | provisional | 2026-10-30 | Taxes unconfirmed, holidays missing |
 | [boost-mode](boost-mode.md) | planned | 2026-10-30 | Rule, thresholds and interlock not built; phase 2 after the comfort controller works |
 | [system-replay-benchmark](system-replay-benchmark.md) | valid as recorded (legacy and transferred regimes) | 2026-10-30 | Replay B load shape was never the real comfort schedule |

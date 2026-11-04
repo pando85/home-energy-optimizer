@@ -13,7 +13,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -23,12 +23,16 @@ import yaml
 
 from battery_optimizer._env import get_env
 
+from .thermal import DEFAULT_PARAMS
+
 __all__ = [
     "BATTERY_HEALTH_DOMAINS",
     "BATTERY_ROLES",
     "ENTITY_ROLES",
     "SERVICE_MODES",
     "SOC_SOURCES",
+    "THERMAL_DOMAINS",
+    "THERMAL_MODES",
     "ActuationEntities",
     "ActuationSettings",
     "ArchiveSettings",
@@ -49,6 +53,9 @@ __all__ = [
     "PvpcSnapshotSettings",
     "Secret",
     "ServiceConfig",
+    "ThermalEntities",
+    "ThermalPrior",
+    "ThermalSettings",
     "WeatherForecastSettings",
     "load_service_config",
     "resolve_service_config_path",
@@ -162,6 +169,96 @@ class PrometheusSettings:
     history_days: int = 28
 
 
+#: ``planning.thermal.mode``: ``off`` reads nothing and changes nothing; ``shadow`` reads the
+#: Omnibattery temperature-limit entities, keeps the thermal state and records a prediction beside
+#: every plan (observability only: no plan, hash or actuation changes).
+THERMAL_MODES: tuple[str, ...] = ("off", "shadow")
+
+#: Thermal entity -> required HA domain.  Every one is only read (never written, never in the
+#: ``ha_guard`` allowlist).
+THERMAL_DOMAINS: dict[str, str] = {
+    "temperature": "sensor",
+    "limit_switch": "switch",
+    "discharge_switch": "switch",
+    "limit_c": "number",
+    "band_c": "number",
+    "floor_pct": "number",
+    "system_max_charge_power": "number",
+    "venus_max_charge_power": "number",
+}
+#: The entities an active feature cannot work without; the rest only refine it.
+THERMAL_REQUIRED: tuple[str, ...] = (
+    "temperature",
+    "limit_switch",
+    "limit_c",
+    "band_c",
+    "floor_pct",
+)
+
+
+@dataclass(frozen=True)
+class ThermalEntities:
+    """Read-only inputs of the thermal state (Omnibattery's Temperature Charge Limit).
+
+    ``temperature`` is the sensor ``battery_health.entities.temperature`` already reads (one entity
+    store entry); if both name one they must agree, and either may be left to the other.  The
+    discharge switch and the two cap numbers are optional: without the switch the discharge side
+    is never derated in the prediction, without the caps ``planning.thermal.charge_limit_kw``
+    stands in for ``min(system cap, Venus cap)``.
+    """
+
+    temperature: str | None = None
+    limit_switch: str | None = None
+    discharge_switch: str | None = None
+    limit_c: str | None = None
+    band_c: str | None = None
+    floor_pct: str | None = None
+    system_max_charge_power: str | None = None
+    venus_max_charge_power: str | None = None
+
+    def all(self) -> tuple[str, ...]:
+        return tuple(e for k in THERMAL_DOMAINS if (e := getattr(self, k)))
+
+    def by_entity(self) -> dict[str, str]:
+        """Entity ID -> role, for the configured roles."""
+        return {e: k for k in THERMAL_DOMAINS if (e := getattr(self, k))}
+
+
+@dataclass(frozen=True)
+class ThermalPrior:
+    """Thermal parameters before any refit (the calibration record of ``battery-thermal``)."""
+
+    tau_min: float = DEFAULT_PARAMS.tau_min
+    t_amb_c: float = DEFAULT_PARAMS.t_amb_c
+    k_c: float = DEFAULT_PARAMS.k_c
+    k_d: float = DEFAULT_PARAMS.k_d
+
+
+@dataclass(frozen=True)
+class ThermalSettings:
+    """Read-only thermal state and derate prediction (``service/thermal.py``, design in
+    ``docs/planning/thermal-derate-aware-planning.md``).
+
+    ``mode: off`` (default) is today's service, byte for byte.  ``shadow`` needs the required
+    entities and ``actuation.entities.battery_ac_power`` with its sign (the measured AC power the
+    refit and the scoring use); it never changes a plan or an actuation.
+    """
+
+    mode: str = "off"
+    entities: ThermalEntities = field(default_factory=ThermalEntities)
+    #: ``min(system cap, Venus cap)`` in kW when the cap entities are not configured or unknown.
+    charge_limit_kw: float = 2.5  # the Venus E V3's rated power
+    #: Omnibattery's driver minimum power (kW): the derate never takes the cap below it.
+    driver_min_kw: float = 0.8
+    prior: ThermalPrior = field(default_factory=ThermalPrior)
+    #: Local hour at (and after) which the daily refit runs; it also runs at start-up when due.
+    refit_hour_local: int = 4
+
+    @property
+    def active(self) -> bool:
+        return self.mode != "off"
+
+
 @dataclass(frozen=True)
 class PlanningSettings:
     soc_source: str = "simulated"
@@ -188,6 +285,9 @@ class PlanningSettings:
     replan_soc_change_frac: float = 0.05
     replan_debounce_s: float = 30.0
     replan_min_interval_s: float = 120.0
+    #: Read-only thermal state and derate prediction; ``mode: off`` by default.  Observability only
+    #: in every mode, so it never joins :meth:`ServiceConfig.config_hash`.
+    thermal: ThermalSettings = field(default_factory=ThermalSettings)
 
 
 @dataclass(frozen=True)
@@ -632,6 +732,7 @@ class ServiceConfig:
         public.pop("actuation", None)  # nor does the way a plan is sent
         public.pop("full_charge", None)  # a committed plan carries its spec in its own inputs
         public.pop("battery_health", None)  # read-only telemetry never changes a plan
+        public["planning"].pop("thermal", None)  # nor does the thermal shadow (observability only)
         if not self.planning.high_soc_cost_eur_per_kwh_h:
             # An inactive dwell cost leaves every plan alone: keep the hash from before it existed.
             public["planning"].pop("high_soc_threshold_frac", None)
@@ -1262,6 +1363,122 @@ def _parse_battery_health(raw: Mapping[str, Any]) -> BatteryHealthSettings:
     )
 
 
+_THERMAL_KEYS = (
+    "mode",
+    "entities",
+    "charge_limit_kw",
+    "driver_min_kw",
+    "prior",
+    "refit_hour_local",
+)
+
+
+def _parse_thermal(
+    raw: Mapping[str, Any],
+    *,
+    entities: EntityMap,
+    actuation: ActuationSettings,
+    battery_health: BatteryHealthSettings,
+    full_charge: FullChargeSettings,
+) -> ThermalSettings:
+    """Validate ``planning.thermal:`` (read only; ``mode: off`` accepts and ignores the rest)."""
+    from .thermal import BOUNDS
+
+    name = "planning.thermal"
+    _keys(raw, name, _THERMAL_KEYS)
+    defaults = ThermalSettings()
+    mode = raw.get("mode", defaults.mode)
+    if mode is False:  # YAML 1.1 reads an unquoted ``off`` as a boolean
+        mode = "off"
+    if mode not in THERMAL_MODES:
+        raise ValueError(f"service config: {name}.mode must be one of {THERMAL_MODES}")
+
+    ents_raw = _section(raw, "entities")
+    _keys(ents_raw, f"{name}.entities", tuple(THERMAL_DOMAINS))
+    ents: dict[str, str | None] = {}
+    for key, domain in THERMAL_DOMAINS.items():
+        value = ents_raw.get(key)
+        if value is not None and (
+            not isinstance(value, str)
+            or not _ENTITY_ID.match(value)
+            or not value.startswith(f"{domain}.")
+        ):
+            raise ValueError(
+                f"service config: {name}.entities.{key} must be a {domain}.* entity ID or null"
+            )
+        ents[key] = value
+    # The temperature sensor is battery_health's (one entity store entry): the two sections agree.
+    health_temperature = battery_health.entities.temperature
+    if (
+        mode == "shadow"
+        and ents["temperature"]
+        and health_temperature
+        and ents["temperature"] != health_temperature
+    ):
+        raise ValueError(
+            f"service config: {name}.entities.temperature and battery_health.entities.temperature "
+            "must name the same entity"
+        )
+    ents["temperature"] = ents["temperature"] or health_temperature
+    named = [e for e in ents.values() if e]
+    if len(named) != len(set(named)):
+        raise ValueError(f"service config: {name}.entities must name distinct entities")
+    # Only the temperature may be shared (with battery_health); the rest is thermal's alone.
+    others = [e for k, e in ents.items() if e and k != "temperature"]
+    # ``entities.observed`` is read only context and may name the same (one store entry).
+    taken = {
+        *actuation.entities.all(),
+        *entities.configured().values(),
+        *full_charge.entities.all(),
+    }
+    if (taken & set(others)) or (ents["temperature"] in taken):
+        raise ValueError(
+            f"service config: {name}.entities must not reuse entities of entities (roles), "
+            "actuation.entities or full_charge.entities"
+        )
+
+    prior_raw = _section(raw, "prior")
+    _keys(prior_raw, f"{name}.prior", tuple(BOUNDS))
+    prior_values: dict[str, float] = {}
+    for key, (lo, hi) in BOUNDS.items():
+        value = _positive(prior_raw.get(key, getattr(defaults.prior, key)), f"{name}.prior.{key}")
+        if not lo <= value <= hi:
+            raise ValueError(f"service config: {name}.prior.{key} must be within {lo} and {hi}")
+        prior_values[key] = value
+    hour = raw.get("refit_hour_local", defaults.refit_hour_local)
+    if isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23:
+        raise ValueError(f"service config: {name}.refit_hour_local must be an hour 0 to 23")
+    settings = ThermalSettings(
+        mode=mode,
+        entities=ThermalEntities(**ents),
+        charge_limit_kw=_positive(
+            raw.get("charge_limit_kw", defaults.charge_limit_kw), f"{name}.charge_limit_kw"
+        ),
+        driver_min_kw=_positive(
+            raw.get("driver_min_kw", defaults.driver_min_kw), f"{name}.driver_min_kw"
+        ),
+        prior=ThermalPrior(**prior_values),
+        refit_hour_local=hour,
+    )
+    if settings.active:
+        missing = [k for k in THERMAL_REQUIRED if not ents[k]]
+        if missing:
+            raise ValueError(
+                f"service config: {name}.mode={mode} needs {name}.entities.{missing[0]} "
+                f"(missing: {', '.join(missing)})"
+            )
+        if not actuation.entities.battery_ac_power:
+            raise ValueError(
+                f"service config: {name}.mode={mode} needs actuation.entities.battery_ac_power"
+            )
+        if actuation.battery_ac_power_sign is None:
+            raise ValueError(
+                f"service config: {name}.mode={mode} needs actuation.battery_ac_power_sign "
+                "(+1 or -1, measured): the refit reads the signed battery power"
+            )
+    return settings
+
+
 def _read_token() -> Secret | None:
     token = get_env("BATTERY_OPTIMIZER_HA_TOKEN")
     if token:
@@ -1457,6 +1674,16 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
             "service config: mode=live needs planning.soc_source=entity: a plan made from a "
             "simulated SOC must never drive the real battery"
         )
+    planning = replace(
+        planning,
+        thermal=_parse_thermal(
+            _section(pl_raw, "thermal"),
+            entities=entities,
+            actuation=actuation,
+            battery_health=battery_health,
+            full_charge=full_charge,
+        ),
+    )
     fresh_raw = _section(raw, "freshness_s")
     freshness: dict[str, float | None] = {
         str(k): None

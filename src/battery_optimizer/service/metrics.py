@@ -192,6 +192,9 @@ class _RuntimeCollector(Collector):
         full_charge = snap.get("full_charge")
         if full_charge is not None:
             yield from _full_charge_families(full_charge)
+        thermal = snap.get("thermal")
+        if thermal is not None:
+            yield from _thermal_families(thermal)
 
 
 #: Values of the ``plan`` label: the first plan that covered a slot, and the plan of record.
@@ -542,6 +545,102 @@ def _climate_families(c: dict[str, Any]) -> Iterable[Metric]:
     yield from (rmse, skill, bias, n, mdape, weeks, top, gate)
 
 
+def _thermal_families(t: dict[str, Any]) -> Iterable[Metric]:
+    """The thermal shadow's scrape-time gauges (prefix ``battery_optimizer_thermal_``); read only.
+
+    An unknown reading is an absent sample, never a 0.
+    """
+    from .thermal import DERATE_STATES
+    from .thermal_tracker import MODEL_STATUSES
+
+    name = f"{PREFIX}_thermal"
+    derate = t.get("derate") or {}
+    model = t.get("model") or {}
+    current = t.get("current_slot") or {}
+
+    def gauge(suffix: str, doc: str, value: float | None) -> GaugeMetricFamily:
+        family = GaugeMetricFamily(f"{name}_{suffix}", doc, labels=[])
+        if value is not None:
+            family.add_metric([], float(value))
+        return family
+
+    yield gauge(
+        "temperature_celsius",
+        "Battery internal temperature (fresh reading)",
+        t.get("temperature_c"),
+    )
+    state = GaugeMetricFamily(
+        f"{name}_derate_state",
+        "1 for the state of Omnibattery's Temperature Charge Limit (off, on, unknown)",
+        labels=["state"],
+    )
+    for s in DERATE_STATES:
+        state.add_metric([s], 1.0 if s == derate.get("state") else 0.0)
+    yield state
+    yield gauge(
+        "derate_factor",
+        "Charge derate factor of the curve at the measured temperature (1 = none; absent unknown)",
+        derate.get("factor_now"),
+    )
+    derating = derate.get("derating_now")
+    yield gauge(
+        "derating",
+        "1 while the curve is in force and below 1 at the measured temperature",
+        None if derating is None else (1.0 if derating else 0.0),
+    )
+    setting = GaugeMetricFamily(
+        f"{name}_limit_setting",
+        "Omnibattery's temperature charge limit settings as read (limit_c, band_c, floor_pct, "
+        "limit_kw)",
+        labels=["name"],
+    )
+    for key in ("limit_c", "band_c", "floor_pct", "limit_kw"):
+        if derate.get(key) is not None:
+            setting.add_metric([key], float(derate[key]))
+    yield setting
+    yield gauge(
+        "predicted_temperature_celsius",
+        "Predicted temperature at the end of the slot in progress (newest plan's shadow)",
+        current.get("temp_end_c"),
+    )
+    yield gauge(
+        "predicted_derate_factor",
+        "Lowest predicted derate factor inside the slot in progress",
+        current.get("derate_factor"),
+    )
+    yield gauge(
+        "predicted_achievable_charge_kw",
+        "Predicted achievable mean charge power of the slot in progress",
+        current.get("charge_kw"),
+    )
+    status = GaugeMetricFamily(
+        f"{name}_model_status", "1 for the thermal model's status", labels=["status"]
+    )
+    for s in MODEL_STATUSES:
+        status.add_metric([s], 1.0 if s == model.get("status") else 0.0)
+    yield status
+    parameter = GaugeMetricFamily(
+        f"{name}_parameter",
+        "Thermal model parameter (tau_min, t_amb_c, k_c, k_d)",
+        labels=["name"],
+    )
+    for key in ("tau_min", "t_amb_c", "k_c", "k_d"):
+        if model.get(key) is not None:
+            parameter.add_metric([key], float(model[key]))
+    yield parameter
+    fitted_at = model.get("fitted_at")
+    yield gauge(
+        "last_fit_timestamp_seconds",
+        "Unix time of the accepted refit that produced the parameters (absent while prior)",
+        None if fitted_at is None else datetime.fromisoformat(fitted_at).timestamp(),
+    )
+    yield gauge(
+        "buffer_hours",
+        "Hours with a temperature reading in the one-minute observation buffer",
+        (t.get("buffer") or {}).get("hours_with_temperature"),
+    )
+
+
 class ServiceMetrics:
     def __init__(
         self,
@@ -549,6 +648,7 @@ class ServiceMetrics:
         *,
         actuation: bool = False,
         full_charge: bool = False,
+        thermal: bool = False,
     ) -> None:
         # ``*_created`` series double the exposition for no use here (process-wide switch).
         disable_created_metrics()
@@ -752,6 +852,8 @@ class ServiceMetrics:
             self._register_actuation()
         if full_charge:  # only with the feature enabled
             self._register_full_charge()
+        if thermal:  # only with planning.thermal on: mode off keeps the exposition as it was
+            self._register_thermal()
         if snapshot is not None:
             r.register(_RuntimeCollector(snapshot))
 
@@ -810,6 +912,72 @@ class ServiceMetrics:
         )
         for outcome in OUTCOMES:
             self.full_charge_runs.labels(outcome=outcome)
+
+    def _register_thermal(self) -> None:
+        from .thermal_tracker import LEADS
+
+        r = self.registry
+        self.thermal_refits = Counter(
+            f"{PREFIX}_thermal_refits",
+            "Daily thermal refits by result (accepted, rejected, insufficient_data, error)",
+            ["result"],
+            registry=r,
+        )
+        self.thermal_predictions = Counter(
+            f"{PREFIX}_thermal_predictions",
+            "Per-plan thermal predictions by result (ok, error)",
+            ["result"],
+            registry=r,
+        )
+        self.thermal_scored_slots = Counter(
+            f"{PREFIX}_thermal_scored_slots",
+            "Closed slots whose predicted end temperature was scored against the measurement",
+            ["lead"],
+            registry=r,
+        )
+        self.thermal_abs_error = Counter(
+            f"{PREFIX}_thermal_temperature_abs_error_celsius",
+            "Sum of |predicted - measured| temperature at the end of scored slots, by lead",
+            ["lead"],
+            registry=r,
+        )
+        self.thermal_squared_error = Counter(
+            f"{PREFIX}_thermal_temperature_squared_error_celsius_squared",
+            "Sum of (predicted - measured)^2 temperature at the end of scored slots, by lead",
+            ["lead"],
+            registry=r,
+        )
+        # A gauge: the signed sum falls when the model runs cold.
+        self.thermal_error_sum = Gauge(
+            f"{PREFIX}_thermal_temperature_error_sum_celsius",
+            "Sum of (predicted - measured) temperature at the end of scored slots, by lead",
+            ["lead"],
+            registry=r,
+        )
+        self.thermal_power_scored_slots = Counter(
+            f"{PREFIX}_thermal_derate_scored_slots",
+            "Closed slots with a predicted or measured derate whose achievable charge was scored",
+            registry=r,
+        )
+        self.thermal_power_abs_error = Counter(
+            f"{PREFIX}_thermal_achievable_charge_abs_error_kw",
+            "Sum of |predicted achievable - observed| mean charge power over derate-scored slots",
+            registry=r,
+        )
+        self.thermal_power_error_sum = Gauge(
+            f"{PREFIX}_thermal_achievable_charge_error_sum_kw",
+            "Sum of (predicted achievable - observed) mean charge power over derate-scored slots",
+            registry=r,
+        )
+        for result in ("accepted", "rejected", "insufficient_data", "error"):
+            self.thermal_refits.labels(result=result)
+        for result in ("ok", "error"):
+            self.thermal_predictions.labels(result=result)
+        for lead in LEADS:
+            self.thermal_scored_slots.labels(lead=lead)
+            self.thermal_abs_error.labels(lead=lead)
+            self.thermal_squared_error.labels(lead=lead)
+            self.thermal_error_sum.labels(lead=lead).set(0.0)
 
     def render(self) -> bytes:
         return generate_latest(self.registry)
