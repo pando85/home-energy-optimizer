@@ -1,15 +1,152 @@
 # Periodic full charge for cell balancing
 
-- **Status:** Plan, owner decisions recorded 2026-11-04; **not implemented**. The feature ships off by default.
-  Merging this plan authorises nothing on the installation: each implementation PR below is reviewed on its own, and
-  the first live run is supervised.
+- **Status:** Plan, owner decisions recorded 2026-11-04, **amended 2026-11-04** (see the
+  [amendment](#amendment-2026-11-04-success-criterion-settle-hold-and-adaptive-cadence), which supersedes the fixed 5/15
+  day cadence, the SOC-99 success criterion and the bootstrap of the original text; superseded passages stay in place,
+  marked). PRs 1 and 2 are merged (#81 solver and planner, #80 actuator, guard and config); PR 3 (scheduler) is not
+  written. The feature ships off by default. Merging this plan authorises nothing on the installation: each
+  implementation PR below is reviewed on its own, and the first live run is supervised.
 - **Date:** 2026-11-04
 - **Decisions:** [ADR-0007](../adr/0007-live-battery-control.md) (live control; this plan amends it, text in
   [section 8](#8-adr-0007-amendment-text-and-agentsmd-edit)) and [ADR-0004](../adr/0004-battery-optimizer-production-architecture.md).
 - **Code touched:** `src/battery_optimizer/oracle.py`, `service/planner.py`, `service/actuator.py`,
   `service/ha_guard.py`, `service/config.py`, `service/runtime.py`, `service/sink.py`, `service/metrics.py`, a new
   `service/full_charge.py`; `config/service.yaml`.
+- **Related:** [battery longevity policy](battery-longevity.md) (the operating policy these amendments come from:
+  balance telemetry, high-SOC dwell cost, thermal soft cap).
 - **Owner of the code:** this repository. The HA-side watchdog lives in `pando85/homelab` (follow-up, section 12).
+
+## Amendment 2026-11-04: success criterion, settle hold and adaptive cadence
+
+Approved by the owner on 2026-11-04 after an external investigation of the Omnibattery cell-balance monitor (summarised in
+[battery-longevity.md](battery-longevity.md)). It changes **what counts as a full charge**, **how the actuator ends a
+run** and **how often a run happens**. Everything else of this plan (decision rule shape, MILP, enabler, guard, state
+file) stands; where the original text disagrees, this section wins and the original passage carries a "Superseded" note.
+Implemented in PR 3 (scope in [A7](#a7-pr-3-scope)), which may edit `service/config.py` for the new keys; PRs 1 and 2 are
+merged and are not reopened.
+
+### A1. Success criterion: a new valid balance measurement
+
+A run counts as a full charge for the cadence **only when Omnibattery records a new valid balance measurement**:
+`sensor.venus_last_balance_read` advances past the value seen when the run was armed. The service records, as evidence
+next to it, `sensor.venus_cell_delta` (mV), `sensor.venus_balance_status`, `sensor.venus_delta_trend` and
+`sensor.venus_delta_avg_4w` (the average of the last four **readings**, not four weeks).
+
+| Outcome of a run | Counts for the cadence | State |
+|---|---|---|
+| `last_balance_read` advanced and `balance_status` is not `unknown` | **Yes**: `L` is the local date of the reading; the result classifies the next interval ([A3](#a3-adaptive-cadence)) | `done` |
+| SOC reached 99 or 100 (or Omnibattery completed) but **no new reading** within the settle window | **No**: "reached, unmeasured". A failed attempt for the cadence: `L` is not moved, `consecutive_failures + 1`, retried at the next eligible day. Never reported as balanced | `failed(reached_unmeasured)` |
+| SOC never reached 99, unacknowledged, never armed | No, as in [section 7](#7-state-persistence) | `failed(...)` |
+
+A stale, missing or `unknown` reading is **unknown, never zero imbalance**: it neither resets the clock nor selects a
+green cadence. SOC at 99% observed outside a run (a manual charge by the owner) no longer stamps `L` on its own; only a
+new valid reading does, whoever caused the charge.
+
+Superseded: the "SOC observed at 99% or more, or Omnibattery completes" definition of a full charge in
+[section 4](#4-decision-rule) and the `soc_99` / `omnibattery_complete` values of `last_full_source` in
+[section 7](#7-state-persistence). Those two events still drive the state machine (`reached`, `done`), but they stamp
+`L` only together with the new reading; the source is `balance_reading`.
+
+### A2. Settle hold in the actuator
+
+Omnibattery stops charging at about 3.60 V on the highest cell (or at a confirmed BMS cutoff) and measures the cell
+spread 60 s later; a reading taken under load is not comparable. After completion is observed (`integration_status`
+leaving `weekly_full_charge`, or SOC 100, or `top_hold_timeout_min`), the actuator **holds idle**, with no discharge and
+no charge (the existing idle intent), until **`last_balance_read` advances or `settle_timeout_s` (default 300, about five
+times Omnibattery's 60 s) elapses**, whichever is first. Then the normal intent resumes and the weekly switch is turned
+off (disarm moves behind the hold, so the run state Omnibattery holds is not cleared before it records the reading;
+to be verified on the supervised run). A timeout without a reading is outcome `reached_unmeasured` (A1). The hold is a
+field of the directive (`FullChargeDirective` gains a settle deadline, edited in PR 3 together with the actuator that
+reads it) and is subject to the same kill switch and guard as every other intent: the guard still wins, and a
+guard-failure safe idle simply ends the hold early.
+
+### A3. Adaptive cadence
+
+Replaces the fixed `min_interval_days` 5 / `max_interval_days` 15 of decisions 1 and 2 of
+[section 1](#1-goal-and-owner-decisions). The interval bounds come from the **latest valid** `balance_status` and the
+recent history, read from Omnibattery's sensors (never from a stale reading):
+
+| Condition (latest valid reading) | `min` days | `max` days | Extra |
+|---|---:|---:|---|
+| `unknown`, or fewer than 4 comparable readings so far (includes the bootstrap, [A4](#a4-first-run)) | 10 | 14 | |
+| 4 or more comparable readings, **all green**, and `delta_trend` not rising | 14 | 28 | |
+| `yellow` | 7 | 14 | |
+| `orange` or `red` on **two consecutive** readings | 5 | 7 | **Owner alert**; no automatic recovery or active-balance routine (the Omnibattery blueprint stays out of scope) |
+| a single `orange` or `red` after a better reading | 7 | 14 (as `yellow`) | **Repeat the measurement at the next eligible day**; one reading alone is never an alert |
+
+"Comparable" means a reading recorded after a settled completion of a run armed by this feature (or one the sensor itself
+marks valid at the top-of-charge condition); readings whose status is `unknown` are not comparable. The decision rule of
+[section 4](#4-decision-rule) is unchanged in shape, with `min`/`max` taken from the active row: `d < min` nothing,
+`min <= d < max` threshold test, `d >= max` forced. The threshold function becomes
+`threshold(d) = threshold_min_eur + threshold_scale_eur * (d - min) / (max - d)` (equal to the minimum at `d = min`,
+divergent at `d = max`, monotone), so the day-5 / day-15 numbers of section 4 no longer apply as printed. The warning in
+that section (the rule would normally fire at the minimum) still holds; the larger minimum of the common rows (10, 14)
+is what makes the cadence long in practice, and `fixed_cost_eur` remains the knob to discriminate days.
+
+**Configuration** (replaces `min_interval_days` and `max_interval_days` in the whole-schema block of
+[section 12](#12-configuration-tests-rollout-and-pr-split); PR 3 edits `service/config.py` and `config/service.yaml`):
+
+```yaml
+full_charge:
+  cadence:                    # days, keyed by the cadence class; the keys are fixed, the numbers owner-set
+    unknown: {min_days: 10, max_days: 14}   # also: fewer than min_comparable_readings
+    green:   {min_days: 14, max_days: 28}   # >= min_comparable_readings all green, trend not rising
+    yellow:  {min_days: 7,  max_days: 14}   # also a single orange or red after a better reading
+    alert:   {min_days: 5,  max_days: 7}    # orange or red on alert_consecutive readings in a row
+  min_comparable_readings: 4
+  alert_consecutive: 2
+  settle_timeout_s: 300
+```
+
+Validation: per row `0 < min_days < max_days <= 30`; `green.min_days >= unknown.min_days >= yellow.min_days >=
+alert.min_days` (a healthier battery is never measured more often than a worse one); `min_comparable_readings >= 1`;
+`alert_consecutive >= 2`; `0 < settle_timeout_s <= 900`.
+
+### A4. First run
+
+There is no baseline reading since commissioning, so the first run is eligible **as soon as the feature is enabled**:
+the bootstrap is "eligible now" (`L` is none, `d` is treated as `min` of the `unknown` row), the day is still chosen
+**opportunistically by price** (the threshold rule at `d = min`), and it is **forced at `max` days from enablement**
+(`enabled_at` is persisted in the state file; with `unknown` that is 14 days). The first live run is **supervised by the
+owner** (kill switch in hand, as in the acceptance section). Superseded: bootstrap precedence (a) to (c) and the
+2026-11-08 / 2026-11-18 dates of [section 7](#7-state-persistence); `bootstrap_last_full` remains as an explicit owner
+override, and a valid `last_balance_read` dated after `battery.commissioned_at` is honoured as `L` when present.
+
+### A5. Dwell on the day
+
+The checkpoint of [section 4](#forced-day-and-the-checkpoint) should land **close to the expected discharge** and avoid
+hours at 100%. The mechanism is the **high-SOC dwell cost** of the longevity plan (step 5 of
+[battery-longevity.md](battery-longevity.md#4-steps)): a linear cost per kWh and hour of SOC above a soft threshold. It
+applies **on the full-charge day as well**: the shortfall penalty still makes the checkpoint mandatory, and the dwell
+cost then pushes the optimizer to reach 100% as late as the prices allow, and to leave it early. Until that change is
+merged the checkpoint is placed at the end of the cheapest block as in the original text; the dwell is then a known cost
+of the run, recorded in the decision row.
+
+### A6. Answers to the open questions
+
+Recorded in [section 13](#13-open-questions-for-the-owner): cadence (adaptive, A3) and bootstrap (A4) are answered; the
+threshold scale, taper parameters and service-owned entities are unchanged and still open, and the homelab watchdog
+stands as a prerequisite.
+
+### A7. PR 3 scope
+
+PR 3 ([section 12](#pr-split-3-prs-each-independently-reviewable-feature-off-no-behaviour-change-when-merged)) is
+extended; the rest of its content is unchanged:
+
+- the **adaptive cadence** (A3): `cadence` table, comparable-reading count and alert logic in `service/full_charge.py`,
+  the owner alert, the `threshold(d)` form above, the `unknown` bootstrap and `enabled_at` (A4);
+- the **success criterion** (A1): `last_balance_read` advance detection against the value at arming, outcome
+  `reached_unmeasured` as a failed attempt, `last_full_source: balance_reading`, no `L` from SOC 99 alone;
+- the **settle hold** (A2) in the actuator and the directive, `settle_timeout_s`, disarm after the hold;
+- **balance telemetry consumed** from the read-only battery-health telemetry PR (step 3 of the longevity plan):
+  `balance_status`, `cell_delta`, `delta_trend`, `delta_avg_4w`, `last_balance_read` come from the entity store that PR
+  fills; PR 3 does not add a second reader;
+- `config.py`, `config/service.yaml`, `docs/service.md` and `docs/configuration.md` for the keys above; tests for every
+  row of the A1 and A3 tables, the settle hold (reading arrives, timeout, guard failure during the hold, restart during
+  the hold), and a 40-day synthetic replay that checks the cadence stays within the active row.
+
+Then, as before: at least 7 days of `dry_run`, a supervised first live run, and the homelab watchdog follow-up
+([section 12](#follow-up-for-the-homelab-repository-not-changed-here)).
 
 ## 1. Goal and owner decisions
 
@@ -18,7 +155,8 @@ the top of the charge. The planner works in a 20 to 95% window (`config/tariff.y
 gets there. Decisions of the owner (final, 2026-11-04):
 
 1. **No fixed weekday or hour.** The full charge happens **at least every 15 days and not more often than every 5
-   days**, on a day the optimizer picks from the prices.
+   days**, on a day the optimizer picks from the prices. *Superseded 2026-11-04: the bounds are adaptive,
+   [A3](#a3-adaptive-cadence).*
 2. **Rule (proposed by the owner, refined in [section 4](#4-decision-rule)):** count the days since the last 100%.
    Below 5: never. From 5 to 14: when the next day's prices are published, solve that day twice (normal, and "reach
    100% that day"); if the extra cost is under a threshold that grows from small at day 5 to unbounded at day 15, that
@@ -84,10 +222,14 @@ let a later offline study check whether waiting one more day would often have be
 
 - `L`: the local date of the last full charge (state, [section 7](#7-state-persistence)). **A full charge is recorded
   when the battery SOC is observed at 99% or more** (any time, including a manual one by the owner) **or** Omnibattery
-  completes a run, whichever is first. `reached_soc_pct` is 99.
+  completes a run, whichever is first. `reached_soc_pct` is 99. *Superseded 2026-11-04: only a new valid balance
+  measurement counts, [A1](#a1-success-criterion-a-new-valid-balance-measurement); 99% alone is "reached, unmeasured".*
 - `D`: the candidate day, normally tomorrow. `d = (D - L)` in calendar days.
 
 ### Evaluation (once per candidate day)
+
+*The 5 and 15 below are the original fixed bounds; since 2026-11-04 they are the `min` and `max` of the active cadence
+row, [A3](#a3-adaptive-cadence).*
 
 Run in the first solve in which `D` is fully published and no decision exists for `D`; retried at later solves of the
 evening if the inputs were not ready; sticky afterwards (a decision for `D` is never revisited, except cancellation, see
@@ -190,6 +332,8 @@ to today's, a test):
   to the target, which it closes with a trickle in the cheapest remaining slot: that trickle is the commanded charge
   Omnibattery's BMS-cutoff detector needs. At SOC 100 a V3 completes at once.
 - A slot's frozen intent can end up to one slot early relative to the taper; the replan at the next boundary continues.
+- After completion the actuator holds idle until the balance reading arrives or `settle_timeout_s`
+  ([A2](#a2-settle-hold-in-the-actuator)).
 - `top_hold_timeout_min` (120): if SOC has been 99% or more for this long and Omnibattery has not completed (a BMS that
   stalls at 99), the service records the run as reached, disarms, and stops commanding the extra charge.
 - **Guard.** `integration_status == "weekly_full_charge"` counts as healthy **only when** the actuator's directive says a
@@ -233,7 +377,8 @@ append-only JSONL under `service/v1/` partitioned by UTC day. This feature adds,
 process; the writes are idempotent (readback already matches, nothing is sent). A persisted `armed` state alone causes
 no write. Corrupt, missing or unreadable file: bootstrap below.
 
-**Bootstrap** (no state file): `L` is the first of (a) the latest time the SOC was at 99% or more in the Prometheus
+**Bootstrap** (no state file; *superseded 2026-11-04 by [A4](#a4-first-run): eligible as soon as the feature is
+enabled*): `L` is the first of (a) the latest time the SOC was at 99% or more in the Prometheus
 history the service already reads (`prometheus.history_days`, 28), (b) `battery.commissioned_at` (2026-11-03), (c)
 service start. With (b) the first eligible day is 2026-11-08 and the first forced one 2026-11-18. A configuration option
 `bootstrap_last_full` (ISO date) overrides it.
@@ -368,6 +513,8 @@ Privacy: relative figures and parameters only; no costs, savings or absolute ene
 ```yaml
 full_charge:
   enabled: false                      # master switch; false: no decision, no state, no new entity read or write
+  # min_interval_days / max_interval_days (5 / 15, as merged in PR 2) are replaced by the `cadence` table
+  # of the 2026-11-04 amendment (A3), edited in PR 3
   min_interval_days: 5                # never before
   max_interval_days: 15               # forced on the next priced day
   threshold_min_eur: 0.01             # day-5 threshold, EUR per run (pre-tax, objective unit)
@@ -434,7 +581,7 @@ would-be writes; live: sends). The two writable roles join the allowlist only wh
 |---|---|---|
 | **1. Solver and planner: soft full-charge target** | `oracle.build_model`/`solve_oracle` optional per-slot ceiling, checkpoint binaries, shortfall slack, taper rows; `planner.FullChargeSpec`, `FullChargeEvaluation`, `run_planner` evaluation and commit modes, `clamp_soc` ceiling argument; tests; `battery-model.md` and `battery-optimizer.md` | none |
 | **2. Guard and actuator: the Omnibattery weekly-charge enabler** | `ha_guard` allowlist (`select_option`, selects, the switch), `config.FullChargeSettings` (the **whole** schema above, so PR 1 and PR 3 never edit config parsing), `actuator` roles, ordering, guard status, directive handling, dry_run simulation; ADR-0007 amendment, `AGENTS.md`, `docs/service.md`, `docs/configuration.md`, `config/service.yaml` (feature off); tests | none (uses the interface below) |
-| **3. Scheduler: rule, state, observability** | `service/full_charge.py` (pure: rule, state machine, thresholds), `sink` state and records, `runtime` wiring (evaluation after the regular solve, committed plan, directive, observation, SOC at 99% detection), metrics, `/status`, regime-log rows, known issue, README/docs index; tests | PR 1 and PR 2 |
+| **3. Scheduler: rule, state, observability** (scope amended 2026-11-04, [A7](#a7-pr-3-scope): adaptive cadence, success criterion, settle hold, balance telemetry from the telemetry PR) | `service/full_charge.py` (pure: rule, state machine, thresholds), `sink` state and records, `runtime` wiring (evaluation after the regular solve, committed plan, directive, observation, SOC at 99% detection), metrics, `/status`, regime-log rows, known issue, README/docs index; tests | PR 1 and PR 2 |
 
 **PR 1 and PR 2 can be written and reviewed in parallel.** PR 3 starts when both interfaces are fixed (they are fixed
 here) and merges last. Merging 1 and 2 changes nothing observable; merging 3 with `enabled: false` changes nothing; the
@@ -496,6 +643,17 @@ and leave `switch.omnibattery_weekly_full_charge_enabled` off by default in HA. 
 Re-verify the integration contract when Omnibattery is upgraded beyond 1.5.1b1.
 
 ## 13. Open questions for the owner
+
+Answers recorded 2026-11-04; the original questions follow the table.
+
+| # | Question | Status |
+|---|---|---|
+| 1 | Cadence | **Answered: adaptive** (10/14, 14/28, 7/14, 5/7 days by balance status), [A3](#a3-adaptive-cadence) |
+| 2 | Threshold scale | Open: set from the `dry_run` distribution, now over the active row's `[min, max]` |
+| 3 | Taper parameters | Open: provisional until the first supervised run (the settle hold and the reading are recorded then too) |
+| 4 | Bootstrap | **Answered: eligible as soon as the feature is enabled**, forced at `max` days from enablement, first live run supervised, [A4](#a4-first-run) |
+| 5 | Service-owned entities | Open: not addressed by the amendment (the service still owns the weekly switch while enabled) |
+| 6 | Homelab watchdog | Standing prerequisite for unattended `live` use; listed as a step of [battery-longevity.md](battery-longevity.md#4-steps) |
 
 1. **Cadence.** With the shipped objective the forcing cost is usually about zero, so the rule fires at day 5 (every 5 to
    6 days). Keep that, raise `min_interval_days` (7?), or give `fixed_cost_eur` a value so days are discriminated?
