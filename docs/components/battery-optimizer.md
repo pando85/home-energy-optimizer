@@ -198,3 +198,9 @@ Slot records (`service/v1/slots/`) carry the battery counters, the gross load an
 for battery-mapped slots only from the deploy of the edge-value fix on (2026-11-04, code only, regime log):
 earlier live slots have them `null` ([known issues](../known-issues.md#idle-battery-counters-voided-a-live-slots-gross-load)).
 A recording fix, not a plant or model change: no recalibration.
+
+Derate (2026-11-04, regime log, plant change): the owner switched on Omnibattery's Temperature Charge Limit (14:10:56 UTC), so the
+realised charge power is capped by the battery temperature (1000 W at 50 degC or more) while the plan still assumes the spec's
+2.5 kW in every slot. The plans stay valid and the replan corrects each 15-minute slot; the stale status above is extended with this
+reason. [Derate-aware planning](../planning/thermal-derate-aware-planning.md) is designed, not built; the temperature model is
+[battery-thermal](battery-thermal.md).

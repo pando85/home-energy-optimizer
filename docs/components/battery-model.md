@@ -35,6 +35,7 @@ discharge on the temporary test socket, below the modelled 2.5 kW. Confirmed fro
 | Idle draw | 0, not modelled | `battery.py`; unmeasured |
 | High-SOC dwell cost | 0 (off); study value 0.01 EUR/kWh/h above 0.90 (`planning.high_soc_cost_eur_per_kwh_h`, `high_soc_threshold_frac`) | LFP calendar ageing is worse at high SOC; a planning convention, not a measured rate, same status as the wear cost; [study](../planning/high-soc-dwell-cost.md). The SOC window itself is unchanged |
 | Thermal charge-power soft cap | 0 (off); study value 1.5 kW at 0.005 EUR/kWh (`planning.charge_soft_cap_kw`, `charge_soft_cap_eur_per_kwh`) | The internal temperature rose about 10 degC in a 50 min charge at about 1.4 kW (2026-11-04) and LFP ageing is worse hot; a convex price on AC kWh charged above the knee, a planning convention like the wear cost, not a thermal model. The knee is a documented conservative choice because the thermal fit rests on 21 h and two charge sessions; [study](../planning/thermal-charge-soft-cap.md). The 2.5 kW limit itself is unchanged |
+| Omnibattery Temperature Charge Limit | On since 2026-11-04 14:10:56 UTC (40 degC, 10 degC band, floor 40%, discharge off); **not modelled**: charge power is capped at `limit x f(T)` by the Venus internal temperature (1000 W at 50 degC or more) | Owner setting, may change at will; curve checked over 48.3 to 50.2 degC, [battery-thermal](battery-thermal.md), [design](../planning/thermal-derate-aware-planning.md) |
 | Wear / throughput cost | 0.01 EUR/kWh per AC kWh and direction (`planning.throughput_cost_eur_per_kwh`, set 2026-10-31) | Knee of the rolling-horizon sweep, see [Wear cost decision](#wear-cost-decision-2026-10-31); a planning convention, not a measured aging rate |
 | Import limit | 5.0 kW; the model uses a 15-minute average with no margin, which is **insufficient** | Contract; enforced by the smart meter, which cuts supply on overload (owner-confirmed 2026-10-30, has happened); the trip is **instantaneous** (owner-confirmed 2026-10-31, no distributor document yet) |
 | Export | none, no credit | Invariant of the kernel; no PV |
@@ -128,7 +129,7 @@ Observability only; they show whether the battery does what the model assumes. M
 
 ## Status
 
-**stale** (2026-11-03): the battery is commissioned and, since go-live (2026-11-03 23:45, regime log), live
+**stale** (2026-11-04, reason added: the owner's Omnibattery Temperature Charge Limit now derates the charge power, see the assumptions table and the [regime log](regime-log.md)); first stale on 2026-11-03: the battery is commissioned and, since go-live (2026-11-03 23:45, regime log), live
 with Omnibattery's system caps at 2500 W charge / 2500 W discharge and Marstek Premium mode on (from the test
 socket's 1000/800 W: an "Omnibattery configuration changes limits" trigger, now matching the modelled 2.5 kW).
 RTE, SOC window and idle draw are still assumptions, and the wear cost (0.01) is a planning convention to be

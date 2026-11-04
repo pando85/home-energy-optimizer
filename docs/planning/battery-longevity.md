@@ -46,7 +46,7 @@ The distinction matters because the first column can change with an Omnibattery 
 | Hard ceiling | 95% (kept) | The existing planner window; the soft band above 90% is conditional on prompt discharge |
 | Periodic full charge | 100%, adaptive cadence | [Periodic full charge, amendment A3](periodic-full-charge.md#a3-adaptive-cadence) |
 | Thermal soft cap | about 1.5 kW | Step 6; parameters from telemetry |
-| Omnibattery Temperature Charge Limit | **default stays** (owner setting) | A backstop only; any more conservative threshold would be a site experiment |
+| Omnibattery Temperature Charge Limit | **default values stay** (owner setting); switched on at those values on 2026-11-04 | A backstop only; any more conservative threshold would be a site experiment; [derate-aware planning](thermal-derate-aware-planning.md) |
 
 Energy trade-off, as fractions of nominal capacity: a 20 to 90% window cycles 70%, a 20 to 95% window 75%, i.e. the last
 5 points of SOC add a twentieth of the capacity before conversion losses and any BMS reserve. Whether those points are
