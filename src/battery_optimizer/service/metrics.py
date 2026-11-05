@@ -183,6 +183,9 @@ class _RuntimeCollector(Collector):
         climate = snap.get("climate_shadow")
         if climate is not None:
             yield from _climate_families(climate)
+        climate_plan = snap.get("climate_plan")
+        if climate_plan is not None:
+            yield from _climate_plan_families(climate_plan)
         health = snap.get("battery_health")
         if health is not None:
             yield from _health_families(health)
@@ -469,6 +472,64 @@ def _actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
 GATE_STATUSES = ("PASS", "FAIL", "UNDETERMINED")
 CLIMATE_REGIMES = ("legacy", "comfort", "comfort_off", "unknown")
 CLIMATE_SOLVE_STATUSES = ("optimal", "gap", "time_limit", "infeasible", "error")
+
+
+CLIMATE_PLAN_STATES = (
+    "planned",
+    "skipped",
+    "error",
+    "mode_off",
+    "no_plan",
+    "expired",
+)
+CLIMATE_PLAN_MODES = ("off", "shadow", "live")
+
+
+def _climate_plan_families(c: dict[str, Any]) -> Iterable[Metric]:
+    """The advisory climate plan's scrape-time gauges (``battery_optimizer_climate_plan_*``).
+
+    The heating and water gauges are present only while a ``planned`` plan is current and the
+    effective mode is not ``off``: an absent series means "no plan to show", never "heating off"."""
+    name = f"{PREFIX}_climate_plan"
+
+    def family(suffix: str, doc: str, labels: list[str]) -> GaugeMetricFamily:
+        return GaugeMetricFamily(f"{name}_{suffix}", doc, labels=labels)
+
+    mode = c["mode"]
+    state = c["state"]
+    summary = c.get("summary") or {}
+    requested = family("mode_requested", "1 for the mode the owner requested", ["mode"])
+    effective = family("mode_effective", "1 for the mode in effect (never live)", ["mode"])
+    for m in CLIMATE_PLAN_MODES:
+        requested.add_metric([m], 1.0 if m == mode.requested else 0.0)
+        effective.add_metric([m], 1.0 if m == mode.effective else 0.0)
+    yield requested
+    yield effective
+    locked = family(
+        "live_locked", "1 when live is requested and refused (ADR-0008 not accepted)", []
+    )
+    locked.add_metric([], 1.0 if mode.live_locked else 0.0)
+    yield locked
+    st = family("state", "1 for what /climate/plan serves (a plan status or why none)", ["state"])
+    for k in CLIMATE_PLAN_STATES:
+        st.add_metric([k], 1.0 if k == state else 0.0)
+    yield st
+    age = family("age_seconds", "Seconds since the latest plan was generated", [])
+    if c.get("age_s") is not None:
+        age.add_metric([], float(c["age_s"]))
+    yield age
+    valid = family("valid", "1 while the latest plan is inside its validity", [])
+    valid.add_metric([], 1.0 if state in ("planned", "skipped", "error") else 0.0)
+    yield valid
+    shown = state == "planned" and summary.get("heating_now") is not None
+    heating = family("heating_planned_now", "1 when the plan heats in the current slot", [])
+    water = family("water_target_celsius", "Planned water target of the current slot", [])
+    if shown:
+        heating.add_metric([], 1.0 if summary["heating_now"] else 0.0)
+        if summary.get("water_c_now") is not None:
+            water.add_metric([], float(summary["water_c_now"]))
+    yield heating
+    yield water
 
 
 def _climate_families(c: dict[str, Any]) -> Iterable[Metric]:
@@ -802,6 +863,12 @@ class ServiceMetrics:
             buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60),
             registry=r,
         )
+        self.climate_plan_served = Counter(
+            f"{PREFIX}_climate_plan_served",
+            "Requests answered by the advisory climate plan endpoints",
+            ["endpoint", "result"],
+            registry=r,
+        )
         self.climate_scores = Counter(
             f"{PREFIX}_climate_shadow_scores",
             "Forecast origins leaving the scoring queue by outcome",
@@ -818,6 +885,9 @@ class ServiceMetrics:
             self.climate_runs.labels(result=result)
         for status in CLIMATE_SOLVE_STATUSES:
             self.climate_solves.labels(status=status)
+        for endpoint in ("plan", "summary"):
+            for result in ("ok", "unavailable"):
+                self.climate_plan_served.labels(endpoint=endpoint, result=result)
         for result in ("scored", "expired", "failed"):
             self.climate_scores.labels(result=result)
         for result in ("refitted", "prior_kept"):

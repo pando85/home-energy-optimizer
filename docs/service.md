@@ -272,8 +272,9 @@ The `actuation:` section is read only in `dry_run` and `live` (it is validated i
 
 The optional `archive:` section switches the two [passive archives](#passive-archives) on; without it
 both are off, so a deployed config must carry it. The `climate_shadow:` section (off by default) runs the
-[climate shadow](#climate-shadow-track-b2); its three Home Assistant helpers are those of the homelab
-comfort controller, and each may be absent until it is deployed.
+[climate shadow](#climate-shadow-track-b2); its Home Assistant helpers are those of the homelab
+comfort controller (and the owner's `entities.mode` select, see [Climate plan export](#climate-plan-export)),
+and each may be absent until it is deployed.
 
 The optional `battery_health:` section names the read-only battery health sensors (all optional, null in
 code; the committed file names the `sensor.venus_*` ones of the Omnibattery balance monitor and the cell data);
@@ -309,8 +310,10 @@ return 405). Bind address `0.0.0.0`, container port **8080**.
 |---|---|
 | `/health/live` | `{"status": "alive"}` — the process and its event loop are up |
 | `/health/ready` | `{ready, inputs_ready, reasons, details}`; 200 or 503 |
-| `/status` | Mode, adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), `battery_health` (only when a `battery_health.entities` role is configured), `thermal` (only with `planning.thermal.mode: shadow`), `full_charge` (only with `full_charge.enabled`), code version, config hash; in `dry_run`/`live` also `actuator` (kill switch, in control, guard reasons, desired and observed state, alert, last error, import-trip hold, last tick / confirmed write / heartbeat) |
+| `/status` | Mode, adapter state (connects, reconnects, resyncs, failures, last error), per-entity freshness, price curve summary, history summary, last solve (timing, outcome), virtual battery, the climate shadow (prior, model hash, last run, queue, error, go-live, verdicts), `climate_plan` (the plan export: state, requested and effective mode, live lock, plan id, age, heating and water target now; `null` while the climate shadow is disabled), `battery_health` (only when a `battery_health.entities` role is configured), `thermal` (only with `planning.thermal.mode: shadow`), `full_charge` (only with `full_charge.enabled`), code version, config hash; in `dry_run`/`live` also `actuator` (kill switch, in control, guard reasons, desired and observed state, alert, last error, import-trip hold, last tick / confirmed write / heartbeat) |
 | `/plan` | Latest plan with its snapshot summary, solver result and intents, plus the current intent (all flagged `shadow`), and the [day-ahead and final plan](#day-ahead-and-final-plan) of the current slot (`current_slot`) and of every upcoming slot (`day_ahead.slots`); with `planning.thermal.mode: shadow` the plan also carries its `thermal` block and `current_slot.thermal` the newest prediction of the slot |
+| `/climate/plan` | The advisory [ClimatePlan v1](climate-plan-contract.md) of the latest climate decision, `200` while one is current, else `404` with `state` and `reason` (`climate_shadow_disabled`, `mode_off`, `no_plan`, `expired`); see [Climate plan export](#climate-plan-export) |
+| `/climate/plan/summary` | The same for a dashboard: flat, always `200`, with `state`, the requested and effective mode, the live lock and, while a plan is current, the slot in progress, the next heating run and the predicted room temperatures |
 | `/metrics` | Prometheus exposition |
 
 Kubernetes probes: use `/health/live` for liveness **and readiness**. `/health/ready` answers 503
@@ -364,6 +367,13 @@ ID, price, timestamp or household reading is a label.
 | `climate_shadow_last_run_timestamp_seconds`, `climate_shadow_last_refit_timestamp_seconds` | gauge | — |
 | `climate_shadow_regime` | gauge 0/1 (the regime at the last run) | `regime` (`legacy`, `comfort`, `comfort_off`, `unknown`) |
 | `climate_shadow_last_plan_top_offset_share_ratio` | gauge | — |
+| `climate_plan_state` | gauge 0/1 (state set; what `/climate/plan` serves) | `state` (`planned`, `skipped`, `error`, `mode_off`, `no_plan`, `expired`) |
+| `climate_plan_mode_requested`, `climate_plan_mode_effective` | gauge 0/1 (state set; effective is never `live`) | `mode` (`off`, `shadow`, `live`) |
+| `climate_plan_live_locked` | gauge 0/1: live requested and refused (ADR-0008 not accepted) | — |
+| `climate_plan_age_seconds` | gauge (since the latest plan was generated; absent before the first) | — |
+| `climate_plan_valid` | gauge 0/1 (1 while the latest plan is inside `valid_until`) | — |
+| `climate_plan_heating_planned_now`, `climate_plan_water_target_celsius` | gauge: the current slot of a `planned` plan; **absent** when mode is off, no plan is current or the plan has no slots (absent is not 0); the water target only while heating is planned | — |
+| `climate_plan_served_total` | counter | `endpoint` (`plan`, `summary`), `result` (`ok`, `unavailable`) |
 | `climate_shadow_rmse_kelvin`, `climate_shadow_skill_ratio`, `climate_shadow_abs_bias_kelvin`, `climate_shadow_origins` | gauge | `window` (`legacy`, `new`), `horizon` (`1h`, `6h`, `12h`, `24h`) |
 | `climate_shadow_daily_heat_mdape_ratio`, `climate_shadow_valid_weeks`, `climate_shadow_top_offset_share_ratio` | gauge | `window` |
 | `climate_shadow_gate` | gauge 0/1 (state set) | `window`, `criterion` (the six of the preregistration and `verdict`), `status` (`PASS`, `FAIL`, `UNDETERMINED`) |
@@ -569,7 +579,8 @@ With `climate_shadow.enabled` the service also runs B0's thermal model and the p
 scores, and sends nothing anywhere. It is the data source of the preregistered section-A verdicts
 ([preregistration](planning/climate-preregistration-2026-27.md)) and of the descriptive MPC-versus-rule
 comparison after the winter (B3). Code: `climate/shadow.py` (live data, decision, scoring),
-`climate/shadow_gates.py` (the gates), `service/climate_shadow.py` (the job).
+`climate/shadow_gates.py` (the gates), `service/climate_shadow.py` (the job). Each decision is also shaped into an
+advisory plan that `GET /climate/plan` can serve, off by default ([Climate plan export](#climate-plan-export)).
 
 **Data flow.** Every `replan_every_minutes` of `config/climate-mpc.yaml` (hourly), `offset_minutes`
 after the boundary (default 10, after the weather fetch at :05), on its own worker thread:
@@ -683,6 +694,36 @@ themselves: the outdoor source or the heat measurement, the comfort rooms or the
 the schedule, the water curve or the machine limits is an edit of the MPC config (a new config hash in every
 decision), not a refit; both start a new lineage, which the gates evaluate apart. Changing the room set,
 a threshold or a window is a preregistration amendment, allowed only before go-live.
+
+### Climate plan export
+
+The climate shadow's hourly decision is also published as an **advisory ClimatePlan**, for the homelab comfort
+controller's shadow comparison and for dashboards. Contract, fields and consumer rules:
+[climate-plan-contract](climate-plan-contract.md); decision: [ADR-0008](adr/0008-climate-plan-handoff-to-the-comfort-controller.md)
+(Proposed). **The export is a read-only `GET` on this service: it adds no Home Assistant service call or write,
+`service/ha_guard.py` is unchanged, and turning it on does not let anything act on the heat pump.** The only
+thing that can ever act on it is the homelab consumer, behind its own hard lock
+(`optimizer_live_allowed: false` in git); in this code version the optimizer's effective mode is never `live`.
+
+**Toggle: off by default.** The owner's control is the Home Assistant select
+`input_select.climate_optimizer_mode` (options exactly `off`, `shadow`, `live`; `climate_shadow.entities.mode`),
+which the service reads through its existing read-only state subscription, like the battery kill switch. The
+`climate_shadow.optimizer_mode` key of `config/service.yaml` (`"off"`, committed default; quote it, a bare YAML
+`off` is a boolean) is the **fallback** while the helper is missing, unavailable or holds anything else.
+`climate_shadow.plan_ttl_minutes` (90) is the plan's validity after its decision time.
+
+| Mode (requested) | Effective | `/climate/plan` |
+|---|---|---|
+| `off` | `off` | `404`, `state: mode_off` |
+| `shadow` | `shadow` | the plan, advisory |
+| `live` | `shadow`, `live_locked: true` | the same plan, `requested_mode: live` and the lock reason |
+
+The mode only gates what is served: the shadow's hourly run, records and scoring continue in `off` (they are the
+measurement). The plan is rebuilt from the newest stored decision when the service starts, so a restart inside
+its validity keeps serving it; a plan past `valid_until` is `404` (`expired`), and consumers treat it as absent.
+Nothing is stored beyond the decision records that already exist. Operations: scrape
+`battery_optimizer_climate_plan_*` (see [Metrics](#metrics)); alert on `climate_plan_valid == 0` for 2 h while
+the effective mode is `shadow` if a consumer depends on it.
 
 ## Failure modes
 
@@ -1211,6 +1252,9 @@ Entities must be distinct from each other and from `entities` roles, `actuation.
 
 ## Safety
 
+* The climate plan export ([Climate plan export](#climate-plan-export)) is an HTTP `GET` on this service and a read of
+  the owner's mode select through the existing state subscription: no new service call, no write, the allowlist
+  below is untouched, and the effective export mode is never `live`.
 * WebSocket: every outgoing frame is checked against the allowlist `auth`, `ping`,
   `subscribe_events` (only `state_changed`), `subscribe_entities`, `subscribe_trigger` (only state
   triggers), `unsubscribe_events`, `get_states`, `get_config`. Anything else raises

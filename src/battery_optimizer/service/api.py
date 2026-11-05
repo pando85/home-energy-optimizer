@@ -1,4 +1,4 @@
-"""Internal HTTP surface (ClusterIP only): health, status, plan and metrics.
+"""Internal HTTP surface (ClusterIP only): health, status, plan, climate plan and metrics.
 
 Every route is ``GET`` and read-only.  There is deliberately no endpoint that
 changes state, triggers a solve or accepts a command.
@@ -27,6 +27,10 @@ class ServiceView(Protocol):
     def status(self) -> dict[str, Any]: ...
 
     def plan_view(self) -> dict[str, Any]: ...
+
+    def climate_plan_response(self) -> tuple[int, dict[str, Any]]: ...
+
+    def climate_plan_summary(self) -> dict[str, Any]: ...
 
     async def start(self) -> None: ...
 
@@ -76,6 +80,15 @@ def create_app(service: ServiceView, *, manage_lifecycle: bool = True) -> FastAP
     @app.get("/plan")
     async def plan() -> JSONResponse:
         return JSONResponse(service.plan_view())
+
+    @app.get("/climate/plan")
+    async def climate_plan() -> JSONResponse:
+        code, body = service.climate_plan_response()
+        return JSONResponse(body, status_code=code)
+
+    @app.get("/climate/plan/summary")
+    async def climate_plan_summary() -> JSONResponse:
+        return JSONResponse(service.climate_plan_summary())
 
     @app.get("/metrics")
     async def metrics() -> Response:

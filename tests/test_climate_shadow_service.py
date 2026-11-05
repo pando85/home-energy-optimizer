@@ -413,6 +413,7 @@ CLIMATE = REPO / "src" / "battery_optimizer" / "climate"
 CLIMATE_SHADOW_MODULES = [
     *sorted(CLIMATE.glob("mpc*.py")),
     CLIMATE / "b2d.py",
+    CLIMATE / "plan_export.py",
     CLIMATE / "shadow.py",
     CLIMATE / "shadow_gates.py",
     REPO / "src" / "battery_optimizer" / "service" / "climate_shadow.py",
