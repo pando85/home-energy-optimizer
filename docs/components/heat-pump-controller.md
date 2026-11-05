@@ -59,6 +59,11 @@ WH-ADC0309JE5C and WH-UD09JE5-1 are assumed equivalent). Page details in the hom
   `binary_sensor.aquarea_tank_heater_enabled`, `binary_sensor.aquarea_room_heater_enabled`,
   `binary_sensor.aquarea_internal_heater_state`, `binary_sensor.aquarea_external_heater_state`. Before
   them there was no heater history; it starts on those dates.
+- **Decision (owner, 2026-11-05): the backup heater stays under the unit's own control.** The controller
+  only writes setpoints and operating modes, never the heater. Evidence: under the legacy control the
+  heater ran only inside defrost (6 min on 2026-11-04, 8 min on 2026-11-05, all within
+  `binary_sensor.aquarea_defrost_active`). The one warning sign is heater minutes **outside** defrost (KPI
+  below); the lever against it is fewer cold starts, that is the unit's minimum on and off times.
 
 ## Calibrated on
 
@@ -96,7 +101,7 @@ Not fitted: the rules and `min_hours` were chosen by the owner. What exists is t
 - The pump runs a fixed direct water target; the stored heating curve is inactive
   ([C7-F](../planning/climate-flow-calibration-optimization.md)).
 - Setpoints are manual and high enough that comfort-room valves stay open.
-- The heater stays off in normal operation (hot water at or below about 50 degC, outdoor above 0 degC); the
+- The heater stays off in normal operation, apart from a few minutes a day inside defrost (hot water at or below about 50 degC, outdoor above 0 degC); the
   weekly sterilization, the one scheduled exception, is observed off on 2026-10-30 (the facts above).
 - The comfort schedule ([ADR-0006](../adr/0006-decouple-heat-pump-comfort-from-battery-price-optimisation.md): hall-kitchen at least 23.5 degC from 12:00 on weekdays and from 09:00
   at weekends, all rooms at least 21 degC) can be met by optimum start with the fewest kWh. Untested:
@@ -139,6 +144,7 @@ the matcher `entity=~"climate.thermostat_(bedroom|hall_kitchen|office_t)"`. Dash
 | Compressor starts per day (median at most 20) | `sum(increase(hass_sensor_state{entity="sensor.aquarea_compressor_start_stop_counter"}[1d]))` |
 | Rule activity: heating and hot-water hours against `min_hours` | `count_over_time((max(hass_sensor_power_w{entity="sensor.aquarea_heat_power_consumed"}) > 0)[1d:5m]) / 12` (and `dhw`) against `hass_input_number_state{entity="input_number.appdaemon_climate_min_hours_per_day"}`; `hass_input_boolean_state{entity="input_boolean.appdaemon_climate_enable"}`; `sum(increase(hass_automation_triggered_count_total{entity="automation.appdaemon_climate_watchdog"}[1d]))` |
 | Heater safety (booster stays off) | `hass_binary_sensor_state{entity=~"binary_sensor.aquarea_(internal_heater_state\|external_heater_state\|force_heater_state\|sterilization_state)"}`; `sum by (entity) (increase(hass_sensor_unit_h{entity=~"sensor.aquarea_(room\|dhw)_heater_operating_hours"}[7d]))` (hot-water heater hours unchanged) |
+| Backup heater minutes outside defrost (target 0 a day; early November 2026: 0 outside defrost, 6 to 8 min a day inside it) | `sum_over_time(((max(hass_binary_sensor_state{entity=~"binary_sensor.aquarea_(internal\|external)_heater_state"}) > bool 0) * on() (1 - max(hass_binary_sensor_state{entity="binary_sensor.aquarea_defrost_active"})))[24h:1m])`; dashboard panel `Heater minutes outside defrost`; the homelab alert `HeatPumpHeaterOutsideDefrost` fires on heater on and defrost off for 5 minutes (decision in the heater facts above) |
 | Tank never above 50 degC | `max_over_time(max(hass_sensor_unit_celsius{entity="sensor.aquarea_tank_temperature"})[1d:5m])` |
 
 Not yet measured: the share of hot-water energy inside the scheduled window (the window is not a metric), the
