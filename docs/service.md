@@ -845,7 +845,7 @@ most the house load minus this margin; `planning.discharge_margin_bound: true` (
 bound each slot's discharge the same way (`max(0, forecast load - discharge_margin_w)`), so the plan does not promise
 energy the actuator cannot deliver. It reads this one margin, joins `inputs_hash` and `config_hash` only when on,
 and applies to the day-ahead and the final plan alike (one solve); see
-[known issues](known-issues.md#planned-discharge-is-not-delivered-planner-bound-implemented-off-by-default-waiting-for-data-from-2026-11-04).
+[known issues](known-issues.md#planned-discharge-is-not-delivered-planner-bound-enabled-since-0140-monitoring).
 
 **Guard** (any failure → safe idle, recorded with the reason): `import_over_cap` (measured import above
 `import_cap_w + import_guard_margin_w` while charge is on: charge off at once, and charge refused for
