@@ -9,7 +9,7 @@
   discharge not delivered](../known-issues.md#planned-discharge-is-not-delivered-open-waiting-for-data-from-2026-11-04),
   [actuator](../service.md#live-control-dry_run-and-live).
 - **Code touched (Step 1):** `service/actuator.py` (or the runtime path that feeds it), `service/metrics.py`,
-  `docs/service.md` (metrics table). Homelab (`pando85/homelab`): the rule file, the Alertmanager route, the dashboard.
+  `docs/service.md` (metrics table). Homelab (`pando85/homelab`): the rule file and the dashboard (no Alertmanager change).
 - **Privacy:** aggregate figures only; no energy totals, costs or addresses.
 
 ## 1. Context
@@ -116,24 +116,20 @@ PromQL notes:
 **Why the margin-unchanged condition.** It restarts the 7-day clock after every change, so the rule judges only data
 collected at the current margin and stops firing once the margin is lowered.
 
-Annotation: "Lower `actuation.discharge_margin_w` by 25 W (to <current minus 25> W)". Labels: `severity: info`.
+Annotation: "Lower `actuation.discharge_margin_w` by 25 W (to <current minus 25> W)". Labels: `severity: warning`
+(see [2.3](#23-delivery)).
+
+The rule is the machine-readable form of the [shared definitions](#25-shared-definitions-step-1-and-step-2) below;
+Step 2 reuses them unchanged.
 
 ### 2.3 Delivery
 
-Alertmanager routes `severity: info` to the `null` receiver, so an info alert would never reach the owner. Add a
-dedicated route in `system/monitoring/resources/alertmanager-secret.yaml`, placed **before** the `severity: info` ->
-`"null"` route:
-
-```yaml
-- matchers:
-    - alertname = "BatteryMarginCanBeLowered"
-  receiver: telegram
-  repeat_interval: 168h
-```
-
-The alert keeps `severity: info` so the inhibition rules and the dashboards treat it as non-urgent. Result: one
-Telegram message when the conditions have held for an hour, a weekly reminder while they still hold, and it resolves
-by itself when the margin changes.
+Alertmanager routes `severity: info` to the `null` receiver, so an info alert would never reach the owner. That is why
+`BatteryMarginCanBeLowered` is `severity: warning`: it takes the **existing default route to the `telegram` receiver**
+with the default `repeat_interval` of 12 h. **No new Alertmanager route and no change to
+`system/monitoring/resources/alertmanager-secret.yaml`.** Result: one Telegram message when the conditions have held
+for an hour, a repeat every 12 h while they still hold, and it resolves by itself when the margin changes (the 7-day
+clock restarts).
 
 A Grafana panel on the battery-optimizer dashboard shows the margin, the export in Wh/day, the 0.1% quantile per
 power band and the rule state.
@@ -148,21 +144,39 @@ check the utility meter's hourly export by hand a week later.
 |---|---|
 | `BatteryMarginCanBeLowered` fires | lower by 25 W |
 | Export is 1 to 5 Wh/day, or the quantile is near 0 W | stay |
-| `BatteryGridExport` on 2 or more days (excluding days with an HA outage) | raise by 25 to 50 W |
+| `BatteryGridExport` on 2 or more days (real export events, section 2.5) | raise by 25 to 50 W |
 | `BatteryGridExportSustained` fires once | raise by 25 to 50 W |
+
+### 2.5 Shared definitions (Step 1 and Step 2)
+
+One definition each, used by the rule above, the decision table and the Step 2 controller. Step 2 must not redefine
+them: the manual rule is the automatic controller's input.
+
+- **Real export event:** export measured while discharging, on a day without a Home Assistant outage, beyond the
+  thresholds of the existing alerts of section 1 (read from the Shelly returned-energy counter, cross-checked with
+  `battery_optimizer_actuator_export_seconds_total`): more than 5 Wh in 24 h, or more than 10 Wh in 15 min. A day
+  with an HA outage is excluded both from export events and from clean days.
+- **Clean 7 days:** seven full days at the current margin (the margin series unchanged and present for the whole
+  window), with at most 7 Wh exported (about 1 Wh/day), the lowest 0.1% of discharge-time grid samples at or above
+  25 W import, and enough samples (more than 50000), i.e. exactly the conditions of `BatteryMarginCanBeLowered`.
+  The 7-day clock restarts at every margin change.
 
 ## 3. Step 2 (later, needs the owner's explicit OK): automatic margin
 
+**This is the documented future automation path.** The owner wants it recorded because it may be automated later. It is
+Step 1's manual rule with the owner removed from the loop: the same [shared definitions](#25-shared-definitions-step-1-and-step-2)
+of a *real export event* and of *clean 7 days* feed the controller, with no redefinition.
+
 The actuator adapts the margin itself inside fixed bounds of **75 to 200 W**:
 
-- **+50 W immediately** after a real export event, defined from the export counter and seconds and excluding HA
-  outages;
-- **-25 W after 7 clean days** by the same criteria as the rule of section 2.2.
+- **+50 W immediately** after a real export event (section 2.5);
+- **-25 W after clean 7 days** (section 2.5), the criteria of the rule of section 2.2.
 
 No new device permission: the margin is the value already written to the PD grid target, within the existing bounds of
 the ADR-0007 allowlist. Nothing is widened (same entities, same services, same value bounds). It does change live
 control behaviour, so it needs an ADR-0007 note or amendment and tests, and it is decided around **early December
-2026**, after Step 1 has shown that the metrics are reliable.
+2026**, after Step 1 has shown that the metrics are reliable. Until then the alert and the manual change of section 2.4
+are the only path.
 
 ## 4. Open points
 
