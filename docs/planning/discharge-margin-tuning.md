@@ -24,7 +24,7 @@ Margin history:
 | Date | Margin | Why |
 |---|---|---|
 | commissioning | 50 W | code default; brief exports of -10 to -94 W, PD swing of +-150 to 200 W |
-| 2026-11-04 | 200 W | first committed value |
+| 2026-11-03 | 200 W | first committed value (homelab, with the 0.5.0 `dry_run` deploy, about 23:26 local) |
 | 2026-11-05 | 100 W | owner decision, evidence below |
 
 **Evidence for 100 W.** 2-second Home Assistant grid samples over about 17 h of live discharge on 2026-11-04/05 at the
