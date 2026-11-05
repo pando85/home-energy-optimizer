@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.13.0](https://github.com/pando85/home-energy-optimizer/tree/v0.13.0) - 2026-11-05
+
+### Added
+
+- climate: Publish an advisory climate plan behind an owner mode select ([227bf9a](https://github.com/pando85/home-energy-optimizer/commit/227bf9a3933fb8c69e980bd82dba83dd990c36cd))
+
+### Documentation
+
+- planning: Draft the per-room comfort amendment of 2026-11-05 ([5131d33](https://github.com/pando85/home-energy-optimizer/commit/5131d33492cc243d8e95408cc45924830b0a3288))
+
 ## [v0.12.0](https://github.com/pando85/home-energy-optimizer/tree/v0.12.0) - 2026-11-05
 
 ### Added
