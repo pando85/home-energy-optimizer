@@ -280,7 +280,14 @@ class ClimateShadowJob:
             self._maybe_refit(d, today, now)
             assert self.model is not None
             rec = shadow.decide(
-                self.prior, self.model, d, self.cfg, t0, inputs, settings=self._plan_settings
+                self.prior,
+                self.model,
+                d,
+                self.cfg,
+                t0,
+                inputs,
+                settings=self._plan_settings,
+                comfort=shadow.comfort_helper_levels(series, t0),
             )
         except Exception as exc:  # noqa: BLE001 - recorded, counted, retried next hour
             log.exception("climate shadow decision at %s failed", key)

@@ -576,7 +576,8 @@ after the boundary (default 10, after the weather fetch at :05), on its own work
 
 1. **Read.** Raw Prometheus samples of the climate signals the job needs (rooms and setpoints, unit
    outdoor sensor, water target, compressor frequency, heat-pump power by mode, force-DHW, the legacy
-   rule's enable and hours, PVPC) for the trailing `model.reestimate.window_days + 2` days, cached in
+   rule's enable and hours, PVPC, and the controller's per-room `input_number.comfort_floor_<room>` /
+   `comfort_day_minimum_<room>` helpers, each absent-tolerant) for the trailing `model.reestimate.window_days + 2` days, cached in
    memory and fetched incrementally after the first run. They go through the feature builder's own slot
    rules and the climate loader, cut at the decision `t0`, so a live slot is computed like an offline
    feature-set slot (debiased outdoor sensor, DHW and cooling masks, comfort-room mean, replayed legacy
@@ -595,7 +596,9 @@ after the boundary (default 10, after the weather fetch at :05), on its own work
      [contract](planning/comfort-controller-design.md#b2-interface-to-the-controller-read-only)), and
      yesterday's measured DHW slots for the rest of the horizon or when the plan says nothing about
      today;
-   - the design setpoints with optimum start, or every room at 21.5 degC while `away` is on;
+   - the design setpoints with optimum start (per room: its floor, and its day minimum where that is above
+     the floor; helper values in effect at `t0` over the config's, held over the horizon, recorded in
+     `inputs.comfort`), or every room at its floor plus 0.5 K (21.5 degC by default) while `away` is on;
    - the run in progress from the measured slots.
 4. **Score** each origin once the local day of its last horizon slot is complete (so the replayed permission
    of that day is known): open-loop room predictions at 1, 6, 12 and 24 h, and, for midnight origins, the

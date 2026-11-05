@@ -241,6 +241,99 @@ def test_comfort_minimum_follows_the_schedule():
         mpc_replay.comfort_minimum(("bedroom",), hours, np.zeros(6, bool), CFG)
 
 
+def _with_comfort(**maps):
+    raw = CFG.to_dict()
+    raw["comfort"].update(maps)
+    return _section_cfg(raw, CFG)
+
+
+def _perfect(cfg):
+    raw = cfg.to_dict()
+    raw["replay"]["weather"] = "perfect"
+    return _section_cfg(raw, CFG)
+
+
+def _old_comfort_minimum(rooms, hour_frac, weekend, cfg):
+    """The single-schedule formula before the per-room maps (floor everywhere, the day minimum
+    in the day room's window), kept as the reference of the identity test."""
+    c = cfg.comfort
+    start = np.where(weekend, c.day_start_weekend_hour, c.day_start_weekday_hour)
+    in_day = (hour_frac >= start) & (hour_frac < c.day_end_hour)
+    out = np.full((len(rooms), hour_frac.size), float(c.floor_c))
+    out[list(rooms).index(c.day_room), in_day] = float(c.day_min_c)
+    return out
+
+
+def test_without_the_per_room_maps_the_schedule_is_exactly_the_single_one():
+    hours = np.tile(np.arange(0.25, 24.01, 0.25), 2)
+    weekend = np.repeat([False, True], hours.size // 2)
+    new = mpc_replay.comfort_minimum(ROOMS, hours, weekend, CFG)
+    assert np.array_equal(new, _old_comfort_minimum(ROOMS, hours, weekend, CFG))
+    # spelling the defaults out per room changes nothing, in the minimum or in the setpoints
+    spelled = _with_comfort(
+        floor_c_by_room={r: 21.0 for r in ROOMS},
+        day_min_c_by_room={"hall_kitchen": 23.5, "bedroom": 21.0, "office_t": 21.0},
+    )
+    assert np.array_equal(new, mpc_replay.comfort_minimum(ROOMS, hours, weekend, spelled))
+    d = _data(t_out_level=5.0)
+    a = mpc_replay.decision_inputs(_context(d, "perfect"), 2 * 96)
+    b = mpc_replay.decision_inputs(replace(_context(d, "perfect"), cfg=_perfect(spelled)), 2 * 96)
+    assert np.array_equal(a["minimum"], b["minimum"])
+    assert np.array_equal(a["ex"].setpoints, b["ex"].setpoints)
+
+
+def test_comfort_minimum_is_per_room():
+    hours = np.array([8.75, 9.0, 11.75, 12.0, 21.75, 22.0])
+    cfg = _with_comfort(
+        floor_c_by_room={"bedroom": 20.0, "office_t": 22.0},
+        day_min_c_by_room={"bedroom": 22.5, "office_t": 21.0},
+    )
+    out = mpc_replay.comfort_minimum(ROOMS, hours, np.ones(6, bool), cfg)
+    bed, hall, off = (ROOMS.index(r) for r in ("bedroom", "hall_kitchen", "office_t"))
+    assert out[bed].tolist() == [20.0, 22.5, 22.5, 22.5, 22.5, 20.0]
+    assert out[hall].tolist() == [21.0, 23.5, 23.5, 23.5, 23.5, 21.0]  # the old keys still apply
+    # a day minimum below the floor never lowers it: the effective day minimum is the maximum
+    assert out[off].tolist() == [22.0] * 6
+
+
+def test_a_day_minimum_below_the_floor_is_the_floor():
+    hours = np.array([10.0, 13.0])
+    cfg = _with_comfort(floor_c_by_room={"hall_kitchen": 24.0})  # above day_min_c 23.5
+    out = mpc_replay.comfort_minimum(ROOMS, hours, np.zeros(2, bool), cfg)
+    assert out[ROOMS.index("hall_kitchen")].tolist() == [24.0, 24.0]
+    lv = mpc_replay.comfort_levels(ROOMS, cfg)
+    assert lv.day.tolist() == [21.0, 24.0, 21.0]
+
+
+def test_live_override_replaces_the_config_per_room_and_helper():
+    cfg = _with_comfort(floor_c_by_room={"bedroom": 20.0})
+    lv = mpc_replay.comfort_levels(
+        ROOMS, cfg, {"floor": {"office_t": 22.0}, "day_min": {"bedroom": 22.5}}
+    )
+    assert lv.floor.tolist() == [20.0, 21.0, 22.0]
+    assert lv.day_min.tolist() == [22.5, 23.5, 21.0]
+    # an empty override is the config
+    empty = mpc_replay.comfort_levels(ROOMS, cfg, {"floor": {}, "day_min": {}})
+    assert np.array_equal(empty.floor, mpc_replay.comfort_levels(ROOMS, cfg).floor)
+
+
+def test_every_room_with_a_raised_day_minimum_gets_the_optimum_start():
+    cfg = _with_comfort(day_min_c_by_room={"bedroom": 22.5})
+    cfg = _perfect(cfg)
+    ctx = replace(_context(_data(t_out_level=5.0), "perfect"), cfg=cfg)
+    t0 = 2 * 96
+    sp = mpc_replay.decision_inputs(ctx, t0)["ex"].setpoints
+    hall, bed, off = (ROOMS.index(r) for r in ("hall_kitchen", "bedroom", "office_t"))
+    start = 48 - 45  # the same lead as the hall/kitchen at 5 degC
+    assert (sp[bed, :start] == 21.5).all() and (sp[bed, start:88] == 23.0).all()
+    assert (sp[bed, 88:] == 21.5).all()
+    assert (sp[hall, start:88] == 24.0).all() and (sp[off] == 21.5).all()
+    # a live override reaches the exogenous inputs the same way
+    live = replace(ctx, comfort_override={"floor": {"office_t": 22.0}})
+    sp2 = mpc_replay.decision_inputs(live, t0)["ex"].setpoints
+    assert (sp2[off] == 22.5).all() and np.array_equal(sp2[bed], sp[bed])
+
+
 def test_causal_outdoor_holds_the_last_valid_reading():
     d = _data()
     valid = d.t_out_valid.copy()
