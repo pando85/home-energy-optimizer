@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.12.0](https://github.com/pando85/home-energy-optimizer/tree/v0.12.0) - 2026-11-05
+
+### Added
+
+- climate: Make the comfort schedule per room ([e952ede](https://github.com/pando85/home-energy-optimizer/commit/e952ede42c86fe9db60cce6ea5eba1acea5f42d4))
+
+### Documentation
+
+- components: Record the backup heater decision and its outside-defrost KPI ([aad1bc0](https://github.com/pando85/home-energy-optimizer/commit/aad1bc07aac935c01c4a07207af89d76aa66ff2f))
+
 ## [v0.11.0](https://github.com/pando85/home-energy-optimizer/tree/v0.11.0) - 2026-11-04
 
 ### Fixed
