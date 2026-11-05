@@ -60,6 +60,12 @@ Setpoints carry a **+0.5 K margin** over the minimum:
 The **day window** starts at the weekday or weekend start above and ends at **22:00** (owner-confirmed
 2026-10-31; no longer an assumption). The end time stays editable as a helper.
 
+**Per room (2026-11-05).** The floor and the day minimum are helpers per room, `comfort_floor_<room>`
+(default 21.0 everywhere) and `comfort_day_minimum_<room>` (default 23.5 hall/kitchen, 21.0 elsewhere); the
+effective day minimum of a room is `max(day minimum, floor)` and the window stays shared. With the defaults the
+schedule above is unchanged. The evaluation criteria follow per room, against the values in effect at each slot
+([preregistration amendment of 2026-11-05](climate-preregistration-2026-27.md#4-amendments)).
+
 ## 4. Thermostat semantics
 
 - **The setpoint is the room's current target.** AppDaemon writes setpoints only **at schedule
@@ -222,7 +228,7 @@ stopping AppDaemon.
 
 ## 11. HA helpers (editable)
 
-Editable without a deployment: day minimums and times (weekday and weekend), night floor, margin, lead
+Editable without a deployment: per-room day minimums and floors (section 3) and the window times (weekday and weekend), margin, lead
 times, curve points, the optional optimum-start raise, away. **Machine limits stay in code** (minimum on/off,
 water clamp 20 to 35 degC, write rate, tank cap 50 degC).
 
