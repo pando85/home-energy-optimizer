@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.14.0](https://github.com/pando85/home-energy-optimizer/tree/v0.14.0) - 2026-11-05
+
+### Added
+
+- planner: Bound planned discharge by the actuator's import margin ([f73221b](https://github.com/pando85/home-energy-optimizer/commit/f73221bfdfe80983d6cd61344f127a185e84f75e))
+
+### Documentation
+
+- planning: Plan data-driven tuning of the discharge margin ([605e105](https://github.com/pando85/home-energy-optimizer/commit/605e1053f04f96196dcd63536a48dbdf2505035d))
+
 ## [v0.13.0](https://github.com/pando85/home-energy-optimizer/tree/v0.13.0) - 2026-11-05
 
 ### Added
