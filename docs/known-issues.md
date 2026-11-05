@@ -312,10 +312,11 @@ Side effects while the high threshold is in place:
 4. If it latches again, put 500 W back and reopen the upstream issue. Otherwise record the change in the
    [regime log](components/regime-log.md) and delete this workaround here and in ADR-0007.
 
-## Planned discharge is not delivered (planner bound implemented, off by default; waiting for data from 2026-11-04)
+## Planned discharge is not delivered (planner bound enabled since 0.14.0, monitoring)
 
-Status: **fix implemented in code, off by default** (2026-11-05); enabling it is the owner's decision after the
-live data below. Until then the problem stands in the deployed service.
+Status: **fix implemented 2026-11-05; code default off, enabled in the deployed config since 0.14.0 on 2026-11-05
+(margin 100 W). Open, monitoring**: the issue stays open until the evening-discharge data confirm the shortfall
+is gone.
 
 **Symptom.** The "Final plan energy not delivered" panel of the `battery-model-actuation` dashboard showed a
 large discharge shortfall over the first 24 hours of live control.
@@ -334,15 +335,15 @@ large discharge shortfall over the first 24 hours of live control.
 - Not involved: the per-slot discharge cap (`number.omnibattery_system_max_discharge_power`) was above the
   house load and not binding, and the device limits (2500 W) were never reached.
 
-**Fix (implemented 2026-11-05, off by default).** `planning.discharge_margin_bound: true` bounds each slot's
+**Fix (implemented 2026-11-05, code default off, enabled since 0.14.0).** `planning.discharge_margin_bound: true` bounds each slot's
 planned discharge in the solver at `max(0, forecast house load - actuation.discharge_margin_w)`: the no-export
 row of the LP becomes `discharge[t] - charge[t] <= max(0, load[t] - margin * h)` (`oracle.solve_oracle(...,
 discharge_margin_kw=...)`), so the plan stops promising energy the actuator cannot deliver. One knob: the margin
 is `actuation.discharge_margin_w` (100 W deployed since 2026-11-05), read by the planner when the switch is on, and the day-ahead
 and final plan share it (the same solve). Off, the model, the plans, `inputs_hash` and `config_hash` are
-byte-identical to before; on, the value joins both hashes. Enable it in the homelab `service.yaml`, shadow first
-(compare the "Final plan energy not delivered" panel and the share below before and after); the date and release
-go in the [regime log](components/regime-log.md). It does not touch the load-forecast bias: if the bias persists,
+byte-identical to before; on, the value joins both hashes. Enabled in the homelab `service.yaml` since 0.14.0 on
+2026-11-05 ([regime log](components/regime-log.md)); compare the "Final plan energy not delivered" panel and the
+share below before and after. It does not touch the load-forecast bias: if the bias persists,
 recalibrate the load forecast ([battery-load-forecast](components/battery-load-forecast.md)) as well.
 
 **Decision criteria, after about 7 days of live data** (live days only, excluding the pre-live artefact):
@@ -352,4 +353,4 @@ recalibrate the load forecast ([battery-load-forecast](components/battery-load-f
 - the share of the shortfall that falls in slots where the planned discharge exceeded
   `forecast house load - discharge_margin_w`.
 
-If that share is large, enable the planner bound; if the bias dominates, recalibrate the forecast first.
+If the shortfall remains after the bound, the bias dominates: recalibrate the forecast.

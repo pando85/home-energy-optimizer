@@ -103,13 +103,13 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
   charging from 2.13 to 1.49 kW and the energy charged above 1.5 kW from 35% to 7% for 0.10% of cost (0.52% of the
   saving, worst window 0.91%). The knee is a conservative documented choice: the temperature fit has 21 h of data and
   no session above 1.5 kW. Omnibattery's Temperature Charge Limit stays the backstop.
-- **Discharge margin bound (off, 2026-11-05).** `planning.discharge_margin_bound: true` replaces the no-export row
+- **Discharge margin bound (code default off; enabled in the deployed config since 0.14.0, 2026-11-05, margin 100 W).** `planning.discharge_margin_bound: true` replaces the no-export row
   `discharge <= load` by `discharge <= max(0, load - actuation.discharge_margin_w * h)` in every solve (the
   full-charge ones too), because the actuator discharges against a PD grid target of that margin and so can deliver
   at most the load minus it. It only tightens the feasible set (no new row or column), it does not change the
   objective, and the bounds the solver reports belong to the margin-bound problem. Planning only: the load forecast
   is unchanged, so a forecast that runs high still leaves a shortfall
-  ([known issue](../known-issues.md#planned-discharge-is-not-delivered-planner-bound-implemented-off-by-default-waiting-for-data-from-2026-11-04)).
+  ([known issue](../known-issues.md#planned-discharge-is-not-delivered-planner-bound-enabled-since-0140-monitoring)).
   Not benchmarked: the offline benchmark and replay leave the margin at 0.
 - Omnibattery's own price features will be off, so this is the only battery price reactor.
 
@@ -155,8 +155,8 @@ first plan that covered it, the *final plan* the plan of record at the slot open
 
 Offline: `uv run python hack/day_ahead_kpis.py --from <day> --to <day>`.
 
-Open: planned discharge is not fully delivered in live (bound implemented, off; waiting for data from 2026-11-04):
-[known issue](../known-issues.md#planned-discharge-is-not-delivered-planner-bound-implemented-off-by-default-waiting-for-data-from-2026-11-04).
+Open: planned discharge is not fully delivered in live (bound enabled since 0.14.0, 2026-11-05; monitoring the evening discharge):
+[known issue](../known-issues.md#planned-discharge-is-not-delivered-planner-bound-enabled-since-0140-monitoring).
 
 ## Status
 
@@ -198,11 +198,11 @@ benchmark, default 0, so plans, `inputs_hash` and `config_hash` are byte-identic
 regime log). Merging changes nothing observable and nothing goes stale; enabling it changes the plans (charge spread over
 more slots, same cost within 0.1%) and is recorded in the regime log when it happens, with the dependants checked then.
 
-Discharge margin bound (2026-11-05, code only): `discharge_margin_kw` in the solver, `planning.discharge_margin_bound` in
-the planner and the service config, default off, so plans, `inputs_hash` and `config_hash` are byte-identical until a
-deploy sets it (planned, regime log). Merging changes nothing observable and the status stays **stale** for the reasons
-above; enabling it changes the plans (discharge capped at load minus the actuation margin, so less planned and more
-delivered discharge) and is recorded in the regime log when it happens. The replay benchmark is unaffected (margin 0); a
+Discharge margin bound (2026-11-05): `discharge_margin_kw` in the solver, `planning.discharge_margin_bound` in
+the planner and the service config, code default off (plans, `inputs_hash` and `config_hash` are byte-identical while
+off), enabled in the deployed config since 0.14.0 on 2026-11-05 (margin 100 W, regime log). The status stays **stale**
+for the reasons above; enabled, it changes the plans (discharge capped at load minus the actuation margin, so less
+planned and more delivered discharge). The replay benchmark is unaffected (margin 0); a
 benchmark made with the bound would not be comparable with earlier ones.
 
 Slot decisions (2026-11-04, code only, regime log): a slot that opened without an intent adopts one later in
