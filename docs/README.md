@@ -73,6 +73,7 @@ change leads to a recalibration instead of a silent drift.
 | [Battery longevity policy](planning/battery-longevity.md) | Plan: documented Omnibattery behaviour versus proposed site settings, current and target state, the six steps (full-charge PRs, balance and thermal telemetry, scheduler, high-SOC dwell cost, thermal soft cap), risks and out-of-scope |
 | [Thermal soft cap on charge power](planning/thermal-charge-soft-cap.md) | Step 6 of the longevity plan (off by default): the thermal evidence study (21 h, two charge sessions, too thin for a fitted knee), the replay cost study and the recommended 1.5 kW at 0.005 EUR/kWh |
 | [Whole-system replay](planning/system-replay.md) | Offline heat-pump regime x battery replay (`hack/system_sim.py`): results as relative figures and how to reproduce them |
+| [Discharge margin tuning](planning/discharge-margin-tuning.md) | Proposed: measure the grid-power distribution while discharging, suggest 25 W margin reductions by alert on clean data, and a later bounded automatic margin (owner OK needed) |
 
 ## Provenance
 
