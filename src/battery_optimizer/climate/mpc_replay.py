@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -66,9 +66,11 @@ from battery_optimizer.climate.mpc_model import Exogenous, HeatLaw, RcComfortMod
 
 __all__ = [
     "ACTIONS",
+    "ComfortLevels",
     "Context",
     "Prior",
     "causal_outdoor",
+    "comfort_levels",
     "comfort_minimum",
     "decision_inputs",
     "fit_cop",
@@ -112,20 +114,56 @@ def check_configs(ccfg: ClimateConfig, cfg: MpcConfig) -> None:
         raise ValueError(f"comfort.day_room {cfg.comfort.day_room!r} is not a comfort room")
 
 
-def comfort_minimum(
-    rooms: Sequence[str], hour_frac: np.ndarray, weekend: np.ndarray, cfg: MpcConfig
-) -> np.ndarray:
-    """``(rooms, T)`` minimum of the comfort schedule at the local times *hour_frac*: the floor
-    everywhere, the day minimum in the day room's window (weekday or weekend start until the end
-    hour).  Callers pass the slot-**end** time (slot start + 0.25 h)."""
+@dataclass(frozen=True)
+class ComfortLevels:
+    """The per-room comfort levels in effect: ``floor`` (always) and ``day_min`` (in the shared
+    day window), one value per room.  The effective day minimum is ``max(day_min, floor)``."""
+
+    floor: np.ndarray  # (rooms,)
+    day_min: np.ndarray  # (rooms,)
+
+    @property
+    def day(self) -> np.ndarray:
+        return np.maximum(self.day_min, self.floor)
+
+
+def comfort_levels(
+    rooms: Sequence[str],
+    cfg: MpcConfig,
+    override: Mapping[str, Mapping[str, float]] | None = None,
+) -> ComfortLevels:
+    """The levels of *rooms*: the config's (``floor_c`` / ``day_min_c`` for the day room, the
+    floor for the others, each replaced by its ``*_by_room`` entry), then any *override* of the
+    form ``{"floor": {room: degC}, "day_min": {room: degC}}`` (the live helper values)."""
     c = cfg.comfort
-    start = np.where(weekend, c.day_start_weekend_hour, c.day_start_weekday_hour)
-    in_day = (hour_frac >= start) & (hour_frac < c.day_end_hour)
-    out = np.full((len(rooms), hour_frac.size), float(c.floor_c))
     if c.day_room not in rooms:
         raise ValueError(f"the day room {c.day_room!r} is not a modelled room {list(rooms)}")
-    out[list(rooms).index(c.day_room), in_day] = float(c.day_min_c)
-    return out
+    over = override or {}
+    floor, day_min = [], []
+    for r in rooms:
+        f = over.get("floor", {}).get(r, c.floor_c_by_room.get(r, c.floor_c))
+        base = c.day_min_c if r == c.day_room else c.floor_c
+        floor.append(float(f))
+        day_min.append(float(over.get("day_min", {}).get(r, c.day_min_c_by_room.get(r, base))))
+    return ComfortLevels(np.array(floor), np.array(day_min))
+
+
+def comfort_minimum(
+    rooms: Sequence[str],
+    hour_frac: np.ndarray,
+    weekend: np.ndarray,
+    cfg: MpcConfig,
+    levels: ComfortLevels | None = None,
+) -> np.ndarray:
+    """``(rooms, T)`` minimum of the comfort schedule at the local times *hour_frac*: each room's
+    floor everywhere, ``max(day minimum, floor)`` in the shared window (weekday or weekend start
+    until the end hour).  *levels* default to the config's.  Callers pass the slot-**end** time
+    (slot start + 0.25 h)."""
+    c = cfg.comfort
+    lv = levels or comfort_levels(rooms, cfg)
+    start = np.where(weekend, c.day_start_weekend_hour, c.day_start_weekday_hour)
+    in_day = (hour_frac >= start) & (hour_frac < c.day_end_hour)
+    return np.where(in_day[None, :], lv.day[:, None], lv.floor[:, None])
 
 
 @dataclass
@@ -143,6 +181,8 @@ class Context:
     t_out_model: np.ndarray  # the observer's outdoor history (weather-mode dependent)
     t_out_causal: np.ndarray
     space_heat: np.ndarray  # measured space heating per slot: 1 / 0, NaN unknown
+    #: live helper values (``{"floor": {room: degC}, "day_min": {room: degC}}``) over the config's
+    comfort_override: Mapping[str, Mapping[str, float]] | None = None
 
     @property
     def horizon(self) -> int:
@@ -186,9 +226,9 @@ def _first_at(hour_frac: np.ndarray, hour: float) -> int:
 
 def schedule_setpoints(ctx: Context, t0: int, hi: int, rooms: Sequence[str]) -> np.ndarray:
     """``(rooms, hi - t0)`` thermostat setpoints the controller writes (design sections 3 and 6):
-    the floor plus the margin everywhere; the day room's day minimum plus the margin from its
-    optimum start (window start minus the lead of the outdoor band, never before 22:00 the evening
-    before) until the window end.
+    each room's floor plus the margin everywhere; the day minimum plus the margin of every room
+    whose day minimum is above its floor, from its optimum start (window start minus the lead of
+    the outdoor band, never before 22:00 the evening before) until the window end.
 
     The band reads the mean outdoor temperature from 22:00 the evening before to the window start:
     ``t_out_model`` with perfect weather (declared foresight), otherwise the causal series before
@@ -196,8 +236,9 @@ def schedule_setpoints(ctx: Context, t0: int, hi: int, rooms: Sequence[str]) -> 
     d, cfg = ctx.d, ctx.cfg
     c, o = cfg.comfort, cfg.optimum_start
     margin = float(c.setpoint_margin_k)
-    out = np.full((len(rooms), hi - t0), float(c.floor_c) + margin)
-    room = list(rooms).index(c.day_room)
+    lv = comfort_levels(rooms, cfg, ctx.comfort_override)
+    out = np.tile((lv.floor + margin)[:, None], (1, hi - t0))
+    raised = np.flatnonzero(lv.day > lv.floor)  # rooms with a day minimum above their floor
     if cfg.replay.weather == "perfect":
         series = d.t_out_model
     else:
@@ -219,7 +260,7 @@ def schedule_setpoints(ctx: Context, t0: int, hi: int, rooms: Sequence[str]) -> 
         early = max(ws - int(round(leads[band] / 15.0)), lo - evening)
         a, b = max(early, t0), min(we, hi)
         if a < b:
-            out[room, a - t0 : b - t0] = float(c.day_min_c) + margin
+            out[raised, a - t0 : b - t0] = (lv.day[raised] + margin)[:, None]
     return out
 
 
@@ -244,7 +285,11 @@ def decision_inputs(ctx: Context, t0: int) -> dict[str, Any] | None:
     if not np.isfinite(t_out).all():
         return None
     minimum = comfort_minimum(
-        model.rooms, ctx.hour_frac[t0:hi] + STEP_H, ctx.weekend[t0:hi], cfg
+        model.rooms,
+        ctx.hour_frac[t0:hi] + STEP_H,
+        ctx.weekend[t0:hi],
+        cfg,
+        comfort_levels(model.rooms, cfg, ctx.comfort_override),
     )  # slot-end time: compared with the end-of-slot state
     ex = Exogenous(
         t_out=np.asarray(t_out, float),
@@ -477,13 +522,16 @@ def _kh_below(temps: np.ndarray, minimum: np.ndarray) -> tuple[float, float, flo
     return float(deficit.sum() * STEP_H), float(known.mean()), float(deficit.max(initial=0.0))
 
 
-def _split_kh(rooms, temps, minimum, cfg) -> dict[str, float]:
-    """Kh below the day minimum (day room, day window) and below the floor (each room)."""
-    i = list(rooms).index(cfg.comfort.day_room)
-    day_min = np.where(minimum[i] > cfg.comfort.floor_c, minimum[i], np.nan)
-    floor = np.full(minimum.shape, float(cfg.comfort.floor_c))
-    day_kh, day_cov, _ = _kh_below(temps[i], day_min)
-    floor_kh, floor_cov, _ = _kh_below(temps, floor)
+def _split_kh(rooms, temps, minimum, cfg, levels=None) -> dict[str, float]:
+    """Kh below the day minimum (rooms with one above their floor, day window) and below the floor
+    (each room); the day room is always counted."""
+    floor = (levels or comfort_levels(rooms, cfg)).floor[:, None]
+    day_min = np.where(minimum > floor, minimum, np.nan)
+    day_rows = [
+        i for i, r in enumerate(rooms) if r == cfg.comfort.day_room or np.isfinite(day_min[i]).any()
+    ]
+    day_kh, day_cov, _ = _kh_below(temps[day_rows], day_min[day_rows])
+    floor_kh, floor_cov, _ = _kh_below(temps, np.broadcast_to(floor, minimum.shape))
     return {"day_kh": day_kh, "floor_kh": floor_kh, "coverage": min(day_cov, floor_cov)}
 
 
@@ -564,7 +612,13 @@ def run_decision(
                 "plan_terminal_shortfall_kwh_th": p.result.extra.get("terminal_shortfall_kwh_th"),
                 **{
                     f"plan_{k}": v
-                    for k, v in _split_kh(model.rooms, temps, inp["minimum"], cfg).items()
+                    for k, v in _split_kh(
+                        model.rooms,
+                        temps,
+                        inp["minimum"],
+                        cfg,
+                        comfort_levels(model.rooms, cfg, ctx.comfort_override),
+                    ).items()
                 },
             }
         )

@@ -17,6 +17,17 @@ plans: nothing writes to Home Assistant or the plant. Owner: this repository (`c
   Minimum on 30 min; minimum off 20 min is 2 slots, so **effectively 30 min**. Starts and limits count
   space heating only (DHW transparent); stored heat is valued at the end. Heat per level comes from the
   heat table along a reference (free-running house, then three re-linearisations; best iterate kept).
+- **Comfort schedule** (`comfort:` of the MPC config; `mpc_replay.comfort_levels` / `comfort_minimum`): per room,
+  the floor everywhere and `max(day minimum, floor)` in the shared day window. The config holds the single
+  schedule (`floor_c`, `day_min_c` for `day_room`) and optional per-room maps `floor_c_by_room` and
+  `day_min_c_by_room` that override it; without the maps the arrays are exactly the single schedule's (tested).
+  Every room with a day minimum above its floor gets the optimum start and the raised setpoint, not only the
+  day room. The live shadow additionally reads the controller's per-room helpers from Prometheus
+  (`input_number.comfort_floor_<room>` and `comfort_day_minimum_<room>`, metric `hass_input_number_state`):
+  the value in effect at the decision, held over its horizon, replaces the config's per room and helper; absent
+  (not yet deployed), stale (older than 2 h), or outside 18 to 23 degC (floor) / 18 to 26 degC (day minimum)
+  means the config's value. Each decision records the levels used and which came from helpers
+  (`inputs.comfort`), so a mid-evaluation change is logged. Read-only; no new write path.
 - **Model interface** (`climate/mpc_model.py`, `MpcModel`): `dynamics()`, `drive()`, `room_outputs()`, `heat_table()`, `valves()`, `simulate()`, `capacities`. Implementations: `b2d` (default) and `c2`.
 - **In:** climate feature set, [outdoor-temperature](outdoor-temperature.md), [cop-model](cop-model.md),
   comfort rooms and offsets as in [thermal-model](thermal-model.md); setpoints from design sections 3
@@ -48,7 +59,8 @@ plans: nothing writes to Home Assistant or the plant. Owner: this repository (`c
 
 ## Invalidated when
 
-- The schedule, lead table, setpoint margin, water curve or machine limits change (edit the MPC config).
+- The schedule, lead table, setpoint margin, water curve or machine limits change (edit the MPC config: a new
+  hash starts a new lineage; the live helper values do not change the hash, they are recorded per decision).
 - The comfort controller goes live (legacy heat law, offsets and COP no longer hold), a successor to B0's model is accepted, or the outdoor source or heat measurement changes.
 
 ## Recalibrate by

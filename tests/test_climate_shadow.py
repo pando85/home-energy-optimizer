@@ -291,6 +291,107 @@ def test_without_away_the_day_room_gets_its_optimum_start_setpoint():
 
 
 # ---------------------------------------------------------------------------
+# The per-room comfort helpers (read-only, from Prometheus)
+# ---------------------------------------------------------------------------
+
+AT = MIDNIGHT + timedelta(hours=10)
+
+
+def _helper(entity: str, samples: list[tuple[timedelta, float]]) -> RawSeries:
+    t = np.array([int((AT + dt).timestamp() * 1e6) for dt, _v in samples], dtype=np.int64)
+    return RawSeries(
+        entity, shadow.COMFORT_METRIC, "", t, np.array([v for _dt, v in samples], float)
+    )
+
+
+def _levels(**series):
+    return shadow.comfort_helper_levels(series, AT)
+
+
+def test_the_helpers_are_read_from_prometheus_by_entity():
+    sources = shadow.live_sources(None)
+    assert sources["comfort_floor_bedroom"] == (
+        "input_number.comfort_floor_bedroom",
+        "hass_input_number_state",
+    )
+    assert sources["comfort_day_min_hall_kitchen"] == (
+        "input_number.comfort_day_minimum_hall_kitchen",
+        "hass_input_number_state",
+    )
+    assert sum(k.startswith("comfort_") for k in sources) == 8  # two helpers, four rooms
+
+
+def test_absent_helper_series_fall_back_to_the_config():
+    assert _levels() == {"floor": {}, "day_min": {}}
+    empty = RawSeries("e", shadow.COMFORT_METRIC, "", np.zeros(0, np.int64), np.zeros(0))
+    assert _levels(comfort_floor_bedroom=empty) == {"floor": {}, "day_min": {}}
+
+
+def test_the_helper_value_in_effect_at_the_decision_is_used():
+    minute = timedelta(minutes=1)
+    got = _levels(
+        comfort_floor_bedroom=_helper("f", [(-60 * minute, 21.0), (-5 * minute, 20.0)]),
+        # a sample after the decision is never read
+        comfort_floor_office_t=_helper("f", [(-5 * minute, 22.0), (+2 * minute, 19.0)]),
+        comfort_day_min_hall_kitchen=_helper("d", [(-1 * minute, 24.5)]),
+    )
+    assert got["floor"] == {"bedroom": 20.0, "office_t": 22.0}
+    assert got["day_min"] == {"hall_kitchen": 24.5}
+
+
+@pytest.mark.parametrize(
+    ("kind", "value", "kept"),
+    [
+        ("floor", 17.9, False),
+        ("floor", 18.0, True),
+        ("floor", 23.0, True),
+        ("floor", 23.1, False),
+        ("day_min", 17.9, False),
+        ("day_min", 26.0, True),
+        ("day_min", 26.1, False),
+        ("floor", float("nan"), False),
+    ],
+)
+def test_out_of_range_helper_values_are_ignored(kind, value, kept):
+    series = {f"comfort_{kind}_bedroom": _helper("x", [(-timedelta(minutes=1), value)])}
+    got = shadow.comfort_helper_levels(series, AT)
+    assert (got[kind] == {"bedroom": value}) if kept else (got[kind] == {})
+
+
+def test_a_stale_helper_sample_is_ignored():
+    stale = _helper("x", [(-timedelta(hours=3), 22.0)])
+    assert _levels(comfort_floor_bedroom=stale)["floor"] == {}
+
+
+def test_helper_values_reach_the_plan_inputs_and_are_recorded():
+    sp = prior()
+    t0 = AT
+    d = live_data(t0)
+    legacy = shadow.LiveInputs(regime="legacy")
+    base = shadow.decide(sp, model_rec(sp), d, MPC, t0, legacy, settings=SETTINGS)
+    rooms = list(sp.prior.rooms)
+    off = rooms.index("office_t")
+    assert base["inputs"]["comfort"]["from_helpers"] == {}
+    assert base["inputs"]["comfort"]["floor_c"] == [21.0, 21.0, 21.0]
+    # no helper at all, or an empty read, is exactly the config
+    nothing = shadow.decide(sp, model_rec(sp), d, MPC, t0, legacy, settings=SETTINGS, comfort={})
+    assert nothing["inputs"] == base["inputs"]
+    live = {"floor": {"office_t": 22.0}, "day_min": {"bedroom": 22.5}}
+    rec = shadow.decide(sp, model_rec(sp), d, MPC, t0, legacy, settings=SETTINGS, comfort=live)
+    c = rec["inputs"]["comfort"]
+    assert c["rooms"] == rooms and c["floor_c"][off] == 22.0
+    assert c["day_min_c"][rooms.index("bedroom")] == 22.5
+    assert c["from_helpers"] == {"floor": ["office_t"], "day_min": ["bedroom"]}
+    # the floor setpoint of office_t is 22.0 + margin at every slot; away uses the helper floors
+    assert set(rec["inputs"]["setpoints"][off]) == {22.5}
+    away = shadow.decide(
+        sp, model_rec(sp), d, MPC, t0, replace(legacy, away=True), settings=SETTINGS, comfort=live
+    )
+    for i, row in enumerate(away["inputs"]["setpoints"]):
+        assert set(row) == ({22.5} if i == off else {21.5})
+
+
+# ---------------------------------------------------------------------------
 # Scoring: hand-computed values
 # ---------------------------------------------------------------------------
 
@@ -476,6 +577,34 @@ def test_the_job_decides_refits_scores_and_resumes(tmp_path):
     snap = again.snapshot()
     assert snap["model_hash"] == models[0]["model_hash"] and snap["queue"] == 1
     assert snap["report"]["windows"]["legacy"]["verdict"] == "UNDETERMINED"
+
+
+def test_the_job_reads_the_helpers_and_falls_back_without_them(tmp_path):
+    samples = FakeSamples(MIDNIGHT - timedelta(days=12), MIDNIGHT + timedelta(days=3))
+    legacy = shadow.LiveInputs(regime="legacy")
+    at = MIDNIGHT + timedelta(hours=10)
+    bare = make_job(tmp_path / "bare", samples)
+    assert bare.run_once(at + timedelta(minutes=10), legacy)["status"] == "planned"
+
+    def with_helpers(now):
+        out = dict(samples(now))
+        t = np.arange(int((MIDNIGHT - timedelta(days=1)).timestamp()), int(now.timestamp()), 60)
+        out["comfort_floor_office_t"] = RawSeries(
+            "input_number.comfort_floor_office_t",
+            shadow.COMFORT_METRIC,
+            "",
+            t * 1_000_000,
+            np.where(t < int(at.timestamp()) - 1800, 21.0, 22.0),
+        )
+        return out
+
+    live = make_job(tmp_path / "live", with_helpers)
+    assert live.run_once(at + timedelta(minutes=10), legacy)["status"] == "planned"
+    (b,) = read(tmp_path / "bare", "climate_decisions")
+    (a,) = read(tmp_path / "live", "climate_decisions")
+    assert b["inputs"]["comfort"]["from_helpers"] == {}
+    assert a["inputs"]["comfort"]["from_helpers"] == {"floor": ["office_t"]}
+    assert a["inputs"]["comfort"]["floor_c"] == [21.0, 21.0, 22.0]  # the value in effect at t0
 
 
 def test_a_data_failure_is_recorded_not_raised(tmp_path):

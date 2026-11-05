@@ -90,3 +90,37 @@ def test_a_duplicated_key_is_refused(tmp_path):
 def test_a_missing_file_is_a_config_error(tmp_path):
     with pytest.raises(MpcConfigError, match="cannot read"):
         load_mpc_config(tmp_path / "absent.yaml")
+
+
+def test_the_per_room_comfort_maps_are_optional_and_default_to_empty():
+    c = load_mpc_config(SHIPPED).comfort
+    assert "floor_c_by_room" not in SHIPPED.read_text()  # the shipped file (and hash) is unchanged
+    assert dict(c.floor_c_by_room) == {} and dict(c.day_min_c_by_room) == {}
+
+
+def test_the_per_room_comfort_maps_load(tmp_path):
+    raw = _raw()
+    raw["comfort"]["floor_c_by_room"] = {"bedroom": 20.0, "office_t": 22.0}
+    raw["comfort"]["day_min_c_by_room"] = {"hall_kitchen": 24.0, "office_t": 21.5}
+    c = load_mpc_config(_write(tmp_path, raw)).comfort
+    assert dict(c.floor_c_by_room) == {"bedroom": 20.0, "office_t": 22.0}
+    assert dict(c.day_min_c_by_room) == {"hall_kitchen": 24.0, "office_t": 21.5}
+    assert (c.day_min_c, c.floor_c) == (23.5, 21.0)  # the old keys keep working
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("floor_c_by_room", {"attic": 21.0}, "is not one of"),
+        ("floor_c_by_room", {"bedroom": 5.0}, "below the minimum"),
+        ("day_min_c_by_room", {"bedroom": "21"}, "expected a number"),
+        ("day_min_c_by_room", {"bedroom": 30.0}, "above the maximum"),
+        ("day_min_c_by_room", [21.0], "expected a mapping"),
+    ],
+)
+def test_malformed_per_room_comfort_maps_are_refused(tmp_path, key, value, message):
+    raw = _raw()
+    raw["comfort"][key] = value
+    with pytest.raises(MpcConfigError, match="climate-mpc config") as err:
+        load_mpc_config(_write(tmp_path, raw))
+    assert f"comfort.{key}" in str(err.value) and message in str(err.value)

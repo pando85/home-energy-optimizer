@@ -85,6 +85,7 @@ __all__ = [
     "ShadowPrior",
     "bridge_outages",
     "build_live_data",
+    "comfort_helper_levels",
     "day_record",
     "decide",
     "detect_regime",
@@ -142,12 +143,51 @@ LIVE_SIGNALS: tuple[Signal, ...] = tuple(s for s in CLIMATE_SIGNALS if s.alias i
 PRICE_KEY = "price"
 PRICE_METRIC = "hass_sensor_unit_u0x20ac_per_kwh"
 
+#: The comfort controller's per-room helpers (``input_number``), read from Prometheus like every
+#: other input: ``floor`` is the always-minimum, ``day_min`` the minimum in the shared day window.
+#: ``(helper kind, entity prefix, accepted range in degC, both ends inclusive)``; a value outside
+#: its range is ignored (the controller's own ranges).
+COMFORT_HELPERS = {
+    "floor": ("input_number.comfort_floor_", (18.0, 23.0)),
+    "day_min": ("input_number.comfort_day_minimum_", (18.0, 26.0)),
+}
+COMFORT_METRIC = "hass_input_number_state"
+#: A helper sample older than this at the decision is not trusted (the exporter emits one every
+#: scrape, so an older last sample means an outage or a removed helper).
+COMFORT_MAX_AGE_S = 2 * 3600
+
 
 def live_sources(price_entity: str | None) -> dict[str, tuple[str, str]]:
     """``source key -> (entity id, Prometheus metric)`` of every series the job fetches."""
     out = {s.source: (s.entity, ENTITY_SPECS[s.extract_key].metric) for s in LIVE_SIGNALS}
     if price_entity:
         out[PRICE_KEY] = (price_entity, PRICE_METRIC)
+    for kind, (prefix, _range) in COMFORT_HELPERS.items():
+        for room in DESIGN_ROOMS:
+            out[f"comfort_{kind}_{room}"] = (f"{prefix}{room}", COMFORT_METRIC)
+    return out
+
+
+def comfort_helper_levels(
+    series: Mapping[str, RawSeries], at: datetime
+) -> dict[str, dict[str, float]]:
+    """``{"floor": {room: degC}, "day_min": {room: degC}}`` in effect at *at*: the last helper
+    sample at or before it, when it is at most :data:`COMFORT_MAX_AGE_S` old and inside the
+    controller's range.  A missing, stale, non-finite or out-of-range value is simply absent, so
+    the config's value stands for that room and helper."""
+    at_us = int(at.timestamp() * 1e6)
+    out: dict[str, dict[str, float]] = {kind: {} for kind in COMFORT_HELPERS}
+    for kind, (_prefix, (lo, hi)) in COMFORT_HELPERS.items():
+        for room in DESIGN_ROOMS:
+            raw = series.get(f"comfort_{kind}_{room}")
+            if raw is None or raw.t_us.size == 0:
+                continue
+            i = int(np.searchsorted(raw.t_us, at_us, side="right")) - 1
+            if i < 0 or at_us - int(raw.t_us[i]) > COMFORT_MAX_AGE_S * 1_000_000:
+                continue
+            value = float(raw.values[i])
+            if math.isfinite(value) and lo <= value <= hi:
+                out[kind][room] = value
     return out
 
 
@@ -565,7 +605,13 @@ def _season_model(d: ClimateData, model, t0: int, w: np.ndarray) -> b2d.SeasonMo
 
 
 def _context(
-    sp: ShadowPrior, d: ClimateData, cfg: MpcConfig, model, t0: int, settings: PlanSettings
+    sp: ShadowPrior,
+    d: ClimateData,
+    cfg: MpcConfig,
+    model,
+    t0: int,
+    settings: PlanSettings,
+    comfort: Mapping[str, Mapping[str, float]] | None = None,
 ) -> mpc_replay.Context:
     hour_frac, weekend = b2d.slot_calendar(d)
     diurnal = b2d.diurnal_matrix(hour_frac, weekend, cfg.model.diurnal_harmonics)
@@ -585,6 +631,7 @@ def _context(
         t_out_model=w[:, 1],
         t_out_causal=causal,
         space_heat=mpc_replay.space_heat_state(d),
+        comfort_override=comfort,
     )
 
 
@@ -601,8 +648,13 @@ def decide(
     inputs: LiveInputs,
     *,
     settings: PlanSettings | None = None,
+    comfort: Mapping[str, Mapping[str, float]] | None = None,
 ) -> dict[str, Any]:
     """The decision record at *t0_at* (a slot start of *d*; *d* extends one horizon past it).
+
+    *comfort* is :func:`comfort_helper_levels` at *t0_at*: the per-room helper values in effect at
+    the decision, held over the horizon (the controller's schedule at the decision is the best
+    knowledge of the schedule after it); absent values fall back to the config.
 
     ``origin`` (the observer state the predictions start from) is kept whenever it exists, so the
     prediction is scored even if the plan fails; ``plan`` is the MPC's (never executed)."""
@@ -634,7 +686,7 @@ def decide(
     dhw = d.dhw.copy()
     dhw[t0:hi] = horizon_dhw
     live = replace(d, t_out_debiased=history_t_out, t_out_filled=None, dhw=dhw)
-    ctx = _context(sp, live, cfg, model, t0, settings)
+    ctx = _context(sp, live, cfg, model, t0, settings, comfort)
     local = t0_at.astimezone(d.tz)
     rec: dict[str, Any] = {
         "kind": "climate_decision",
@@ -660,6 +712,13 @@ def decide(
             "away": inputs.away,
         },
     }
+    levels = mpc_replay.comfort_levels(model.rooms, cfg, comfort)
+    rec["inputs"]["comfort"] = {
+        "rooms": list(model.rooms),
+        "floor_c": levels.floor.tolist(),
+        "day_min_c": levels.day_min.tolist(),
+        "from_helpers": {k: sorted(v) for k, v in (comfort or {}).items() if v},
+    }
     x0 = ctx.season.states[t0]
     age = int(ctx.season.age[t0])
     if np.isfinite(x0).all() and age >= WARMUP_SLOTS:
@@ -669,10 +728,12 @@ def decide(
         rec["status"] = "no_inputs" if "origin" in rec else "no_state"
         return rec
     if inputs.away:
-        floor = float(cfg.comfort.floor_c)
+        floor = levels.floor[:, None]
         away_sp = floor + float(cfg.comfort.setpoint_margin_k)
-        inp["ex"] = replace(inp["ex"], setpoints=np.full_like(inp["ex"].setpoints, away_sp))
-        inp["minimum"] = np.full_like(inp["minimum"], floor)
+        inp["ex"] = replace(
+            inp["ex"], setpoints=np.broadcast_to(away_sp, inp["ex"].setpoints.shape).copy()
+        )
+        inp["minimum"] = np.broadcast_to(floor, inp["minimum"].shape).copy()
     rec["inputs"].update(
         {
             "prev_on": bool(inp["prev_on"]),

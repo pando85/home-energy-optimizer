@@ -64,24 +64,57 @@ def _hex_prefix(value: Any, path: str) -> str:
     return v
 
 
+def _room_map(value: Spec) -> Spec:
+    """A possibly empty ``room -> value`` mapping (an unknown room is an error)."""
+    room = text(*KNOWN_ROOMS)
+
+    def check(raw: Any, path: str) -> Section:
+        if not isinstance(raw, dict):
+            raise _fail(path, "expected a mapping of room to degC")
+        return Section({room(k, f"{path}.{k}"): value(v, f"{path}.{k}") for k, v in raw.items()})
+
+    return check
+
+
+_COMFORT_REQUIRED: Spec = section(
+    {
+        "day_room": text(*KNOWN_ROOMS),
+        "day_min_c": num(15.0, 28.0),
+        "day_start_weekday_hour": integer(0, 23),
+        "day_start_weekend_hour": integer(0, 23),
+        "day_end_hour": integer(1, 24),
+        "floor_c": num(10.0, 25.0),
+        "penalty_kwh_per_kh": num(1e-6),
+        "setpoint_margin_k": num(0.0, 3.0),
+    }
+)
+#: Optional per-room schedule (the controller's ``comfort_floor_<room>`` and
+#: ``comfort_day_minimum_<room>`` helpers).  Absent, a room has ``floor_c``, and ``day_min_c`` for
+#: the day room (``floor_c`` for the others), exactly the single schedule of config version 1.
+_COMFORT_OPTIONAL: dict[str, Spec] = {
+    "floor_c_by_room": _room_map(num(10.0, 25.0)),
+    "day_min_c_by_room": _room_map(num(15.0, 28.0)),
+}
+
+
+def _comfort(raw: Any, path: str) -> Section:
+    if not isinstance(raw, dict):
+        raise _fail(path, "expected a mapping")
+    base = _COMFORT_REQUIRED({k: v for k, v in raw.items() if k not in _COMFORT_OPTIONAL}, path)
+    optional = {
+        k: spec(raw[k], f"{path}.{k}") if k in raw else Section({})
+        for k, spec in _COMFORT_OPTIONAL.items()
+    }
+    return Section({**base, **optional})
+
+
 SCHEMA: Spec = section(
     {
         "config_version": integer(MPC_CONFIG_VERSION, MPC_CONFIG_VERSION),
         "timezone": timezone,
         "horizon_hours": integer(1, 72),
         "replan_every_minutes": integer(15, 1440),
-        "comfort": section(
-            {
-                "day_room": text(*KNOWN_ROOMS),
-                "day_min_c": num(15.0, 28.0),
-                "day_start_weekday_hour": integer(0, 23),
-                "day_start_weekend_hour": integer(0, 23),
-                "day_end_hour": integer(1, 24),
-                "floor_c": num(10.0, 25.0),
-                "penalty_kwh_per_kh": num(1e-6),
-                "setpoint_margin_k": num(0.0, 3.0),
-            }
-        ),
+        "comfort": _comfort,
         "optimum_start": section(
             {
                 "band_edges_c": seq(num(-30.0, 30.0), min_len=0, unique=True),
