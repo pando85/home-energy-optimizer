@@ -362,6 +362,15 @@ climate_shadow:
   # amendment 2026-10-31).  The new window starts 7 days later.  The gate room-mean is fixed by
   # the preregistration: comfort.rooms of climate.yaml (bedroom, hall_kitchen, office_t).
   go_live: null
+  # Advisory ClimatePlan export (docs/climate-plan-contract.md, ADR-0008 proposed): GET /climate/plan.
+  # The owner's control is the HA select entities.mode below ("off" / "shadow" / "live"); this is the
+  # FALLBACK used while that helper is missing, unavailable or holds anything else.  QUOTE it: a bare
+  # YAML off is a boolean.  "off" (default): /climate/plan answers 404, nothing is published.
+  # "shadow": the plan is published (advisory; nothing in the optimizer acts on it, it stays
+  # read-only toward Home Assistant).  "live" is only a request: the effective mode is never live in
+  # this code version (live_locked).  The shadow's own hourly run and scoring are unaffected.
+  optimizer_mode: "off"
+  plan_ttl_minutes: 90                # a plan is absent for consumers this long after its decision t0
   # Read-only Home Assistant helpers of the homelab comfort controller
   # (config/integrations/appdaemon_comfort.yaml); each may be absent until it is deployed.
   entities:
@@ -373,3 +382,6 @@ climate_shadow:
     dhw_plan: input_text.comfort_dhw_plan
     # Away (design section 5): every room at 21.5 degC.
     away: input_boolean.comfort_away
+    # The owner's mode select, options exactly off / shadow / live (input_select, created by the
+    # homelab).  Read only, like the battery kill switch; absent or unreadable: optimizer_mode.
+    mode: input_select.climate_optimizer_mode

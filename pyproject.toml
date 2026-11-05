@@ -33,6 +33,7 @@ Changelog = "https://github.com/pando85/home-energy-optimizer/blob/main/CHANGELO
 dev = [
     "pytest",
     "pytest-cov",
+    "jsonschema",
     "ruff",
 ]
 

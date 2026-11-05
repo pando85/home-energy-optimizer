@@ -14,6 +14,7 @@ the [top-level README](../README.md).
 | [Benchmark reference](benchmark.md) | `benchmark` flags, the five-rung policy ladder, battery assumptions, methodology notes |
 | [Architecture](architecture.md) | Module notes: dispatch intent contract, artifact integrity, economic sensitivity, replay runtime, shadow service |
 | [Container image](container.md) | Published tags, running the batch commands and `serve` from the image, provenance verification |
+| [ClimatePlan contract v1](climate-plan-contract.md) | The advisory climate plan the service can serve (`GET /climate/plan`, off by default): fields, slots, modes, validity and the consumer's rules; JSON Schema in `schemas/` |
 | [Known issues](known-issues.md) | HA retention, per-chunk emptiness, row-level re-extraction dedup, `carry_in` flags |
 
 ## Component calibration records
@@ -35,6 +36,7 @@ change leads to a recalibration instead of a silent drift.
 | [0003](adr/0003-phase1-measurement-and-baseline.md) | Phase 1 measurement and baseline | Accepted (2026-10-23) |
 | [0004](adr/0004-battery-optimizer-production-architecture.md) | Production runtime and independent source repository | Accepted (2026-10-25; software architecture, shadow only) |
 | [0005](adr/0005-shared-energy-planning-climate.md) | Shared runtime and climate optimization | Proposed (2026-10-30; architecture only) |
+| [0008](adr/0008-climate-plan-handoff-to-the-comfort-controller.md) | Climate plan handoff to the comfort controller | Proposed (2026-11-05; no actuation authorized) |
 
 ## Delivery snapshot (2026-10-25)
 

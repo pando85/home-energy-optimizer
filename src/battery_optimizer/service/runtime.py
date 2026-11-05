@@ -46,7 +46,11 @@ Climate shadow
 With ``climate_shadow.enabled`` the track-B2 job (:mod:`.climate_shadow`) runs hourly on its own
 worker thread: B0's thermal model and the comfort MPC on live data, recorded and scored, never
 sent.  It reads three optional HA helpers through the entity store and the weather archive; a
-failure is counted and reported and never touches readiness or the battery planner.
+failure is counted and reported and never touches readiness or the battery planner.  Each decision
+is also shaped into an advisory ClimatePlan (:mod:`battery_optimizer.climate.plan_export`) that
+``GET /climate/plan`` serves while the owner's mode select (read-only, like the battery kill switch;
+else ``climate_shadow.optimizer_mode``, default ``off``) says ``shadow`` or ``live``: ``live`` is a
+request only, the effective mode is never ``live``, and nothing is written anywhere.
 
 Safety
 ------
@@ -92,6 +96,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from battery_optimizer.climate import plan_export
 from battery_optimizer.climate.shadow import LiveInputs, detect_regime
 from battery_optimizer.config import TariffConfig
 
@@ -847,6 +852,83 @@ class ShadowService:
                 "climate shadow catch-up: Home Assistant not synced after %.0f s, running anyway",
                 self._climate_sync_timeout_s,
             )
+
+    def climate_mode(self) -> plan_export.ModeState:
+        """The owner's mode: the HA select's state (read only, from the entity store), else the
+        configured fallback.  Never ``live`` in effect (see :mod:`.plan_export`)."""
+        s = self.config.climate_shadow
+        entity = self.store.get(s.mode_entity) if s.mode_entity else None
+        state = entity.state if entity is not None and entity.available else None
+        return plan_export.resolve_mode(state, s.optimizer_mode)
+
+    def _climate_plan_now(self) -> tuple[dict[str, Any] | None, plan_export.ModeState, datetime]:
+        plan = self.climate.plan if self.climate is not None else None
+        return plan, self.climate_mode(), self.clock.now()
+
+    def climate_plan_response(self) -> tuple[int, dict[str, Any]]:
+        """``GET /climate/plan``: ``(status code, body)``; counts what was served."""
+        plan, mode, now = self._climate_plan_now()
+        code, body = plan_export.plan_response(
+            plan, enabled=self.config.climate_shadow.enabled, mode=mode, now=now
+        )
+        self.metrics.climate_plan_served.labels(
+            endpoint="plan", result="ok" if code == 200 else "unavailable"
+        ).inc()
+        return code, body
+
+    def climate_plan_summary(self) -> dict[str, Any]:
+        """``GET /climate/plan/summary``: the flat dashboard document (always served)."""
+        plan, mode, now = self._climate_plan_now()
+        body = plan_export.summary_response(
+            plan, enabled=self.config.climate_shadow.enabled, mode=mode, now=now
+        )
+        self.metrics.climate_plan_served.labels(
+            endpoint="summary",
+            result="ok" if body["state"] in plan_export.PLAN_STATES else "unavailable",
+        ).inc()
+        return body
+
+    def _climate_plan_view(self, now: datetime) -> dict[str, Any] | None:
+        """The export's state for ``/metrics`` and ``/status`` (no counters touched)."""
+        s = self.config.climate_shadow
+        if not s.enabled:
+            return None
+        plan = self.climate.plan if self.climate is not None else None
+        mode = self.climate_mode()
+        state = plan_export.plan_state(plan, enabled=True, mode=mode, now=now)
+        summary = None
+        if plan is not None and state in plan_export.PLAN_STATES:
+            summary = plan_export.summarise(plan, now)
+        return {
+            "mode": mode,
+            "state": state,
+            "plan": plan,
+            "summary": summary,
+            "age_s": None
+            if plan is None
+            else max(0.0, (now - datetime.fromisoformat(plan["generated_at"])).total_seconds()),
+        }
+
+    def _climate_plan_status(self, now: datetime) -> dict[str, Any] | None:
+        view = self._climate_plan_view(now)
+        if view is None:
+            return None
+        plan, summary, mode = view["plan"], view["summary"], view["mode"]
+        return {
+            "advisory": True,
+            "actuation": "none (the optimizer only publishes an advisory plan; ADR-0008 proposed)",
+            "state": view["state"],
+            **mode.fields(),
+            "live_allowed": plan_export.LIVE_ALLOWED,
+            "plan_id": plan["plan_id"] if plan else None,
+            "status": plan["status"] if plan else None,
+            "generated_at": plan["generated_at"] if plan else None,
+            "valid_until": plan["valid_until"] if plan else None,
+            "age_s": None if view["age_s"] is None else round(view["age_s"]),
+            "heating_now": summary["heating_now"] if summary else None,
+            "water_c_now": summary["water_c_now"] if summary else None,
+            "ttl_minutes": self.config.climate_shadow.plan_ttl_minutes,
+        }
 
     def _climate_view(self) -> dict[str, Any] | None:
         if not self.config.climate_shadow.enabled:
@@ -2556,6 +2638,7 @@ class ShadowService:
             "virtual_soc": self.virtual_soc,
             "late_samples": self.observer.late_samples,
             "climate_shadow": self._climate_view(),
+            "climate_plan": self._climate_plan_view(now),
             **({"battery_health": self.health.snapshot(now)} if self.health is not None else {}),
             **({"thermal": self._thermal_view(now)} if self.thermal is not None else {}),
             **({"actuator": self.actuator.snapshot()} if self.actuator is not None else {}),
@@ -2624,6 +2707,7 @@ class ShadowService:
                 },
             },
             "climate_shadow": self._climate_status(),
+            "climate_plan": self._climate_plan_status(now),
             **({"battery_health": self._health_status(now)} if self.health is not None else {}),
             **({"thermal": self._thermal_view(now)} if self.thermal is not None else {}),
             "config_hash": self.config.config_hash(),

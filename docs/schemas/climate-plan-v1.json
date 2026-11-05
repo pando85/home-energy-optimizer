@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/pando85/home-energy-optimizer/docs/schemas/climate-plan-v1.json",
+  "title": "ClimatePlan v1",
+  "description": "The body of a 200 answer of GET /climate/plan: the advisory plan of the climate optimizer (docs/climate-plan-contract.md, ADR-0008 proposed). Consumers must treat a plan past valid_until, a status other than planned, or a document that fails this schema as ABSENT. The optimizer never acts on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version", "advisory", "plan_id", "generated_at", "valid_until", "t0", "code_version",
+    "regime", "status", "reason", "model", "inputs", "slots",
+    "requested_mode", "effective_mode", "live_locked", "live_lock_reason", "mode_source", "summary"
+  ],
+  "properties": {
+    "version": {"const": 1, "description": "Contract version. A consumer must refuse any other value."},
+    "advisory": {"const": true, "description": "Always true in v1: the plan is a recommendation, never a command."},
+    "plan_id": {"type": "string", "pattern": "^[0-9a-f]{16}$", "description": "Hash of the plan's content (everything but the mode fields and summary). The same decision always gives the same id: apply a plan once per plan_id."},
+    "generated_at": {"$ref": "#/$defs/instant", "description": "When the decision run finished."},
+    "valid_until": {"$ref": "#/$defs/instant", "description": "t0 + plan_ttl_minutes (90). At or after this instant the plan is absent."},
+    "t0": {"$ref": "#/$defs/instant", "description": "The decision boundary: the start of slot 0."},
+    "code_version": {"type": "string", "minLength": 1},
+    "regime": {"enum": ["legacy", "comfort", "comfort_off", "unknown"], "description": "Control regime the optimizer saw at the decision."},
+    "status": {"enum": ["planned", "skipped", "error"]},
+    "reason": {"type": ["string", "null"], "description": "Why there is no plan (skipped, error); null when planned."},
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prior_id", "model_hash", "mpc_config_sha256", "solver_status"],
+      "properties": {
+        "prior_id": {"type": ["string", "null"]},
+        "model_hash": {"type": ["string", "null"]},
+        "mpc_config_sha256": {"type": ["string", "null"]},
+        "solver_status": {"type": ["string", "null"], "description": "optimal, gap or time_limit for a plan."}
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["comfort", "away", "weather"],
+      "properties": {
+        "comfort": {
+          "type": "object",
+          "description": "Per room, the comfort levels the plan was computed with (the controller's helpers when present, else the optimizer's config). Rooms: bedroom, hall_kitchen, office_t. Empty when the decision failed before the levels were known.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["floor_c", "day_min_c", "floor_from_helper", "day_min_from_helper"],
+            "properties": {
+              "floor_c": {"type": "number", "minimum": 5, "maximum": 30},
+              "day_min_c": {"type": "number", "minimum": 5, "maximum": 30},
+              "floor_from_helper": {"type": "boolean"},
+              "day_min_from_helper": {"type": "boolean"}
+            }
+          }
+        },
+        "away": {"type": ["boolean", "null"], "description": "Away mode at the decision (every room planned at its floor + 0.5 K); null when unknown."},
+        "weather": {"enum": ["forecast", "persistence", null], "description": "Outdoor temperature over the horizon: the issued forecast, or the last reading held."}
+      }
+    },
+    "slots": {
+      "description": "Columnar per-slot plan over the horizon; null unless status is planned. Slot i covers [start + i * step_minutes, start + (i + 1) * step_minutes). All arrays have length n.",
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["start", "step_minutes", "n", "heating", "water_c", "dhw", "predicted_room_c"],
+          "properties": {
+            "start": {"$ref": "#/$defs/instant", "description": "Equals t0."},
+            "step_minutes": {"const": 15},
+            "n": {"type": "integer", "minimum": 1, "maximum": 192},
+            "heating": {"type": "array", "items": {"enum": [0, 1]}, "description": "1: space heating planned on (it permits heating; the heat pump still follows its thermostats); 0: planned off."},
+            "water_c": {"type": "array", "items": {"oneOf": [{"type": "integer", "minimum": 20, "maximum": 35}, {"type": "null"}]}, "description": "Absolute water target in degC, already clamped to 20..35, in heating slots; null where heating is 0."},
+            "dhw": {"type": "array", "items": {"enum": [0, 1]}, "description": "1: the plan assumed hot-water production in the slot (the controller owns it); heating is 0 there."},
+            "predicted_room_c": {
+              "type": "object",
+              "description": "Per room, the model's air temperature at the END of each slot under this plan. Monitoring only.",
+              "additionalProperties": {"type": "array", "items": {"type": ["number", "null"]}}
+            }
+          }
+        }
+      ]
+    },
+    "requested_mode": {"enum": ["off", "shadow", "live"], "description": "What the owner asked for (HA select, else the config fallback)."},
+    "effective_mode": {"enum": ["off", "shadow"], "description": "What the optimizer does. Never live in this code version."},
+    "live_locked": {"type": "boolean", "description": "True while live is requested and refused."},
+    "live_lock_reason": {"type": ["string", "null"]},
+    "mode_source": {"enum": ["helper", "config"]},
+    "summary": {
+      "type": "object",
+      "description": "Derived at the instant of the request, for dashboards. A consumer never needs it: the slots are the contract.",
+      "additionalProperties": false,
+      "required": [
+        "as_of", "age_s", "expires_in_s", "slot_index", "slot_start", "heating_now", "water_c_now",
+        "dhw_now", "next_heating_start", "next_heating_stop", "heating_slots", "predicted_room_c"
+      ],
+      "properties": {
+        "as_of": {"$ref": "#/$defs/instant"},
+        "age_s": {"type": "integer", "minimum": 0},
+        "expires_in_s": {"type": "integer"},
+        "slot_index": {"type": ["integer", "null"]},
+        "slot_start": {"oneOf": [{"$ref": "#/$defs/instant"}, {"type": "null"}]},
+        "heating_now": {"type": ["boolean", "null"]},
+        "water_c_now": {"type": ["integer", "null"], "minimum": 20, "maximum": 35},
+        "dhw_now": {"type": ["boolean", "null"]},
+        "next_heating_start": {"oneOf": [{"$ref": "#/$defs/instant"}, {"type": "null"}], "description": "Start of the next heating run after the current slot."},
+        "next_heating_stop": {"oneOf": [{"$ref": "#/$defs/instant"}, {"type": "null"}], "description": "End of the current heating run, else of the next one."},
+        "heating_slots": {"type": ["integer", "null"], "minimum": 0},
+        "predicted_room_c": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["hours_ahead", "rooms"],
+              "properties": {
+                "hours_ahead": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+                "rooms": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": ["number", "null"]}}}
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "planned"}}},
+      "then": {"properties": {"slots": {"type": "object"}, "reason": {"type": "null"}}},
+      "else": {"properties": {"slots": {"type": "null"}, "reason": {"type": "string"}}}
+    },
+    {
+      "if": {"properties": {"live_locked": {"const": true}}},
+      "then": {"properties": {"requested_mode": {"const": "live"}, "effective_mode": {"const": "shadow"}, "live_lock_reason": {"type": "string"}}},
+      "else": {"properties": {"live_lock_reason": {"type": "null"}}}
+    }
+  ],
+  "$defs": {
+    "instant": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?\\+00:00$", "description": "ISO 8601, always UTC with a +00:00 offset."}
+  }
+}

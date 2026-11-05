@@ -347,9 +347,26 @@ class ClimateShadowSettings:
     regime_entity: str | None = "input_boolean.comfort_control_enable"
     dhw_plan_entity: str | None = "input_text.comfort_dhw_plan"
     away_entity: str | None = "input_boolean.comfort_away"
+    #: The owner's mode select (read only): ``off`` / ``shadow`` / ``live`` (ADR-0008, proposed).
+    mode_entity: str | None = "input_select.climate_optimizer_mode"
+    #: The advisory ClimatePlan export's mode when the helper is missing, unavailable or garbage.
+    #: ``off`` (the default): ``/climate/plan`` answers 404.  ``live`` is a request only: the
+    #: effective mode is never ``live`` in this code version (``climate/plan_export.py``).
+    optimizer_mode: str = "off"
+    #: A plan is valid this long after its decision time; consumers treat an older one as absent.
+    plan_ttl_minutes: int = 90
 
     def entities(self) -> tuple[str, ...]:
-        return tuple(e for e in (self.regime_entity, self.dhw_plan_entity, self.away_entity) if e)
+        return tuple(
+            e
+            for e in (
+                self.regime_entity,
+                self.dhw_plan_entity,
+                self.away_entity,
+                self.mode_entity,
+            )
+            if e
+        )
 
 
 #: Actuation entity -> required HA domain.  ``kill_switch`` and the sensors are only read.
@@ -895,6 +912,8 @@ _CLIMATE_SHADOW_KEYS = (
     "score_lookback_days",
     "go_live",
     "entities",
+    "optimizer_mode",
+    "plan_ttl_minutes",
 )
 
 
@@ -902,13 +921,14 @@ def _parse_climate_shadow(raw: Mapping[str, Any]) -> ClimateShadowSettings:
     _keys(raw, "climate_shadow", _CLIMATE_SHADOW_KEYS)
     name = "climate_shadow"
     ents = _section(raw, "entities")
-    _keys(ents, f"{name}.entities", ("regime", "dhw_plan", "away"))
+    _keys(ents, f"{name}.entities", ("regime", "dhw_plan", "away", "mode"))
     entities: dict[str, str | None] = {}
     defaults = ClimateShadowSettings()
     for key, default in (
         ("regime", defaults.regime_entity),
         ("dhw_plan", defaults.dhw_plan_entity),
         ("away", defaults.away_entity),
+        ("mode", defaults.mode_entity),
     ):
         value = ents.get(key, default)
         if value is not None and (not isinstance(value, str) or not _ENTITY_ID.match(value)):
@@ -940,6 +960,19 @@ def _parse_climate_shadow(raw: Mapping[str, Any]) -> ClimateShadowSettings:
     offset = _int(raw.get("offset_minutes", 10), f"{name}.offset_minutes", 0)
     if offset >= 60:
         raise ValueError(f"service config: {name}.offset_minutes must be below 60")
+    mode = raw.get("optimizer_mode", defaults.optimizer_mode)
+    if mode is False:  # an unquoted YAML `off`
+        mode = "off"
+    if mode not in ("off", "shadow", "live"):
+        raise ValueError(
+            f'service config: {name}.optimizer_mode must be "off", "shadow" or "live" '
+            "(quote it: a bare YAML off is a boolean)"
+        )
+    ttl = _int(
+        raw.get("plan_ttl_minutes", defaults.plan_ttl_minutes), f"{name}.plan_ttl_minutes", 1
+    )
+    if ttl > 360:
+        raise ValueError(f"service config: {name}.plan_ttl_minutes must be at most 360")
     return ClimateShadowSettings(
         enabled=enabled,
         climate_config=paths["climate_config"],
@@ -954,6 +987,9 @@ def _parse_climate_shadow(raw: Mapping[str, Any]) -> ClimateShadowSettings:
         regime_entity=entities["regime"],
         dhw_plan_entity=entities["dhw_plan"],
         away_entity=entities["away"],
+        mode_entity=entities["mode"],
+        optimizer_mode=mode,
+        plan_ttl_minutes=ttl,
     )
 
 

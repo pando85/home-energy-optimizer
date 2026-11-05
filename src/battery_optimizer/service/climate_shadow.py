@@ -34,7 +34,7 @@ import httpx
 import numpy as np
 
 from battery_optimizer import extract_prom
-from battery_optimizer.climate import shadow, shadow_gates
+from battery_optimizer.climate import plan_export, shadow, shadow_gates
 from battery_optimizer.climate.config import ClimateConfig, load_climate_config
 from battery_optimizer.climate.data import SITE_FILE, Site, load_site
 from battery_optimizer.climate.mpc import PlanSettings
@@ -208,6 +208,9 @@ class ClimateShadowJob:
         self.days: dict[str, dict[str, Any]] = {}
         self.report: dict[str, Any] | None = None
         self.last: dict[str, Any] = {}
+        #: The latest advisory ClimatePlan (contract v1), rebuilt from the newest decision record
+        #: at load and replaced by every run.  Always built; whether it is served is the mode's.
+        self.plan: dict[str, Any] | None = None
         self.refit_at: datetime | None = None
         self._loaded = False
 
@@ -242,12 +245,44 @@ class ClimateShadowJob:
         for rec in iter_records(self.data_dir, "climate_days", since, until):
             self.days[rec["day"]] = rec
         lookback = now - timedelta(days=self.settings.score_lookback_days + 2)
+        newest: dict[str, Any] | None = None
         for rec in iter_records(self.data_dir, "climate_decisions", lookback, until):
+            if self._own(rec) and (newest is None or rec["t0"] > newest["t0"]):
+                newest = rec
             self.decided.add(rec["t0"])
             self.day_regimes.setdefault(rec["local_day"], set()).add(rec.get("regime") or "")
             if "origin" in rec and rec["t0"] not in scored and self._own(rec):
                 self.queue[rec["t0"]] = rec
+        if newest is not None:  # a restart inside a plan's validity keeps serving it
+            self._publish(newest)
         self._loaded = True
+
+    def _publish(self, rec: Mapping[str, Any]) -> None:
+        """Shape the decision into the advisory plan.  A failure here is reported as an ``error``
+        plan and never reaches the shadow."""
+        machine = self.cfg.machine
+        try:
+            self.plan = plan_export.build_plan(
+                rec,
+                code_version=self.code_version,
+                ttl_minutes=self.settings.plan_ttl_minutes,
+                water_range_c=(int(machine.water_min_c), int(machine.water_max_c)),
+            )
+        except Exception as exc:  # noqa: BLE001 - the plan is advisory, the shadow carries on
+            log.exception("climate plan export of %s failed", rec.get("t0"))
+            self.plan = plan_export.build_plan(
+                {
+                    "t0": rec["t0"],
+                    "run_at": rec.get("run_at"),
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: plan export",
+                    "regime": rec.get("regime"),
+                    "prior_id": rec.get("prior_id"),
+                    "mpc_config_sha256": rec.get("mpc_config_sha256"),
+                },
+                code_version=self.code_version,
+                ttl_minutes=self.settings.plan_ttl_minutes,
+            )
 
     def _own(self, rec: Mapping[str, Any]) -> bool:
         """A record of this job's lineage: its prior and its MPC config."""
@@ -305,6 +340,7 @@ class ClimateShadowJob:
         rec["run_at"] = _iso(now)
         rec["elapsed_s"] = round(time.monotonic() - started, 3)
         self._write("climate_decisions", t0, rec)
+        self._publish(rec)
         self.decided.add(key)
         self.day_regimes.setdefault(rec["local_day"], set()).add(rec.get("regime") or "")
         if "origin" in rec:

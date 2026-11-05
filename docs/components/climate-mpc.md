@@ -36,6 +36,16 @@ plans: nothing writes to Home Assistant or the plant. Owner: this repository (`c
   live data (prior from `hack/climate_shadow_prior.py`, forecast weather, today's DHW plan); out:
   `service/v1/climate_*`, `climate_shadow_*` metrics, `climate-shadow-report` (preregistration section A).
 
+- **Plan export (advisory, off by default,** [contract](../climate-plan-contract.md)**,**
+  [ADR-0008](../adr/0008-climate-plan-handoff-to-the-comfort-controller.md) **proposed):** each live decision is shaped
+  into a ClimatePlan v1 (`climate/plan_export.py`) and served read-only by `GET /climate/plan` when the owner's
+  mode (`input_select.climate_optimizer_mode`, else `climate_shadow.optimizer_mode`, default `"off"`) is `shadow`
+  or `live`. It exports exactly the two levers the MPC plans: space heating on/off per 15-minute slot and the
+  absolute water target (curve plus offset, clamped to 20 to 35 degC), plus predicted room temperatures for
+  monitoring. It changes neither the MPC nor its model, config or scoring (no recalibration trigger), and turning it
+  on lets nothing act on the heat pump: the effective mode is never `live` in this code version and the only
+  possible writer, the homelab comfort controller, has its own hard lock.
+
 ## Calibrated on
 
 - `b2d`: B0's 2-state model with weekday/weekend diurnal gain; prior, heat law and COP table from the

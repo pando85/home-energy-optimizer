@@ -98,7 +98,14 @@ def test_no_writable_routes(tmp_path):
     app = create_app(service, manage_lifecycle=False)
 
     async def go():
-        for path in ("/plan", "/status", "/health/ready", "/metrics"):
+        for path in (
+            "/plan",
+            "/status",
+            "/health/ready",
+            "/metrics",
+            "/climate/plan",
+            "/climate/plan/summary",
+        ):
             for method in ("POST", "PUT", "DELETE", "PATCH"):
                 response = await _get(app, path, method)
                 assert response.status_code == 405, (method, path)
