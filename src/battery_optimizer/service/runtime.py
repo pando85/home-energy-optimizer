@@ -1184,6 +1184,11 @@ class ShadowService:
             high_soc_cost_eur_per_kwh_h=self.config.planning.high_soc_cost_eur_per_kwh_h,
             charge_soft_cap_kw=self.config.planning.charge_soft_cap_kw,
             charge_soft_cap_eur_per_kwh=self.config.planning.charge_soft_cap_eur_per_kwh,
+            discharge_margin_kw=(
+                self.config.actuation.discharge_margin_w / 1000.0
+                if self.config.planning.discharge_margin_bound
+                else 0.0
+            ),
             solver_time_limit_s=self.config.planning.solver_time_limit_s,
             plan_sequence=self._plan_sequence,
             expires_at=first + self.config.planning.plan_ttl_slots * step,
