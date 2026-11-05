@@ -70,7 +70,7 @@ Two separate limits apply and both stay in force:
    |---|---|---|---|
    | `idle` | charge **off**, discharge **off** | `neutral_pd_target_w` (0) | untouched |
    | `charge` at P W | discharge **off**, charge **on** | `min(house load + P, import_cap_w, entity max)`, floored, never negative | untouched |
-   | `discharge` at P W | charge **off**, discharge **on** | `discharge_margin_w` (a small import, never export; 200 W committed since 2026-11-03, code default 50) | limits **on**, discharge cap `max(P, min_discharge_cap_w)` |
+   | `discharge` at P W | charge **off**, discharge **on** | `discharge_margin_w` (a small import, never export; 200 W from 2026-11-03, 100 W deployed since 2026-11-05, code default 50) | limits **on**, discharge cap `max(P, min_discharge_cap_w)` |
    | *safe idle* | charge **off**, discharge **off** | untouched | untouched |
 
    House load = grid power − battery AC power (charge positive; the sensor's sign is
@@ -338,7 +338,8 @@ configuration or the [live preconditions](#live-preconditions-2026-11-03).
   Changing the charge mapping instead (power limits off while charging, or a written charge cap, which needs
   the allowlist of decision 3) stays an owner decision.
 - **Discharge margin.** The PD loop swings ±150 to 200 W on a ~2 s period; the 50 W margin gave brief exports
-  (-10..-94 W). The committed config sets `discharge_margin_w: 200`.
+  (-10..-94 W). The config set `discharge_margin_w: 200`, and 100 since 2026-11-05 (evidence in
+  [known issues](../known-issues.md#the-pd-loop-oscillates-the-discharge-margin-was-too-small)).
 - **HA outage.** On an HA restart (40 s), a forced kill (23 s) and a 10.5-minute stop the battery held its last
   command and kept discharging (about 620 W through the long one); Omnibattery does not set standby on shutdown
   and the firmware has no timeout of at least 10 minutes. The watchdog (decision 8) and safe idle act only while
@@ -368,10 +369,10 @@ Found in the commissioning test; each must hold before the kill switch is turned
   (decision 8) can stop it during an HA outage. Required before `live`: a failsafe that does not depend on
   HA. Planned (homelab ESPHome config, not this repository): the battery's ESPHome smart plug turns its relay
   off after N minutes without a connected HA API client, which removes the battery's AC input.
-- **(b) Import margin 200 W.** Omnibattery's PD loop oscillates by about ±150 to 200 W on a ~2 s period; with a
-  50 W grid-import target while discharging the grid briefly exported (-10..-94 W). The committed
-  `discharge_margin_w` is 200 W (the code default stays 50 W); a smaller margin needs a smoother Omnibattery
-  PD tuning profile first.
+- **(b) Import margin 200 W (100 W since 2026-11-05).** Omnibattery's PD loop oscillates by about ±150 to 200 W on a ~2 s period; with a
+  50 W grid-import target while discharging the grid briefly exported (-10..-94 W). `discharge_margin_w` was
+  set to 200 W (the code default stays 50 W) and, from measured data, lowered to 100 W on 2026-11-05 (see
+  [known issues](../known-issues.md#the-pd-loop-oscillates-the-discharge-margin-was-too-small)).
 - **(c) System caps at the battery's rating.** *Pre-go-live state:* on the temporary test socket the system
   caps are 1000 W charge / 800 W discharge with the power limits on, so the PD target, and with it the charge,
   is bounded by `system max charge − house load` (the charge-ceiling finding above), and

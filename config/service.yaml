@@ -145,6 +145,11 @@ planning:
   # docs/planning/thermal-charge-soft-cap.md.
   charge_soft_cap_kw: 1.5
   charge_soft_cap_eur_per_kwh: 0.0
+  # Bound each slot's planned discharge by forecast load - actuation.discharge_margin_w (floored
+  # at 0), the most the live actuator can deliver because it keeps that much grid import.  false =
+  # off, today's plan (discharge bounded by the load alone).  See docs/known-issues.md, "Planned
+  # discharge is not delivered".
+  discharge_margin_bound: false
   # Read-only thermal state and derate prediction (docs/planning/thermal-derate-aware-planning.md,
   # docs/service.md "Thermal shadow").  off (default): nothing is read, recorded or exposed, today's
   # service byte for byte.  shadow: reads Omnibattery's Temperature Charge Limit entities and the
@@ -241,8 +246,9 @@ actuation:
   import_trip_hold_s: 300
   neutral_pd_target_w: 0          # PD grid target in a planned idle
   # > 0: small import while discharging, never export.  Omnibattery's PD loop swings about
-  # +-150..200 W on a ~2 s period; 50 W gave brief exports (-10..-94 W) on 2026-11-03.
-  discharge_margin_w: 200
+  # +-150..200 W on a ~2 s period; 50 W gave brief exports (-10..-94 W) on 2026-11-03.  200 W until
+  # 2026-11-05 (median import 192-195 W, rarely below 0 W); 100 W since, see docs/known-issues.md.
+  discharge_margin_w: 100
   min_discharge_cap_w: 100        # the discharge cap is never written below this (0 = unlimited)
   # Venus E V3 limit: its own max charge/discharge is 2500 W (number.venus_max_charge_power /
   # number.venus_max_discharge_power, min 800, never written here).  Separate from import_cap_w.

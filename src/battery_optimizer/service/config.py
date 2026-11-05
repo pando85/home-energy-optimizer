@@ -282,6 +282,10 @@ class PlanningSettings:
     #: before.
     charge_soft_cap_kw: float = 1.5
     charge_soft_cap_eur_per_kwh: float = 0.0
+    #: Bound each slot's planned discharge by ``forecast load - actuation.discharge_margin_w``, the
+    #: most the live actuator can deliver (it keeps that much grid import).  False (the default) is
+    #: off and leaves the plan, and :meth:`ServiceConfig.config_hash`, as before.
+    discharge_margin_bound: bool = False
     replan_soc_change_frac: float = 0.05
     replan_debounce_s: float = 30.0
     replan_min_interval_s: float = 120.0
@@ -758,6 +762,12 @@ class ServiceConfig:
             # Likewise an inactive thermal soft cap.
             public["planning"].pop("charge_soft_cap_kw", None)
             public["planning"].pop("charge_soft_cap_eur_per_kwh", None)
+        if self.planning.discharge_margin_bound:
+            # The bound makes the actuator's margin a planning input (``actuation`` is otherwise
+            # dropped above), so the value joins the hash.
+            public["planning"]["discharge_margin_w"] = self.actuation.discharge_margin_w
+        else:
+            public["planning"].pop("discharge_margin_bound", None)
         text = json.dumps(public, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(text.encode()).hexdigest()
 
@@ -1643,6 +1653,9 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
             pl_raw.get("charge_soft_cap_eur_per_kwh", 0.0),
             "charge_soft_cap_eur_per_kwh",
             allow_zero=True,
+        ),
+        discharge_margin_bound=_bool(
+            pl_raw.get("discharge_margin_bound", False), "planning.discharge_margin_bound"
         ),
         replan_soc_change_frac=_positive(
             replan.get("soc_change_frac", 0.05), "replan.soc_change_frac"

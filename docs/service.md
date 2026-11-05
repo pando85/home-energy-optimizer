@@ -67,7 +67,7 @@ mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 
 ### What is reused from the offline code
 
-* **Optimizer:** `oracle.solve_oracle(terminal_mode="free", terminal_value, floor_kwh, throughput_cost, high_soc_cost, charge_soft_cap)`
+* **Optimizer:** `oracle.solve_oracle(terminal_mode="free", terminal_value, floor_kwh, throughput_cost, high_soc_cost, charge_soft_cap, discharge_margin_kw)`
   — the call `rolling_horizon.run_rolling_horizon` makes per event — then
   `dispatch.intents_from_schedule`, which re-checks the plan against the battery kernel.
 * **Battery parameters:** `benchmark.resolve_battery_assumptions` on `tariff.yaml` (`sqrt(RTE)` per
@@ -814,7 +814,7 @@ the actuator takes the intent frozen for the current slot and maps it to Omnibat
 |---|---|---|---|
 | `idle` | charge off, discharge off | `neutral_pd_target_w` (0) | untouched |
 | `charge` at P W | discharge off, charge on | `min(house load + P, import_cap_w, entity max)` (never negative) | untouched |
-| `discharge` at P W | charge off, discharge on | `discharge_margin_w` (+200 committed) | on, discharge cap `max(P, min_discharge_cap_w)` (never 0 = unlimited) |
+| `discharge` at P W | charge off, discharge on | `discharge_margin_w` (+100 deployed since 2026-11-05) | on, discharge cap `max(P, min_discharge_cap_w)` (never 0 = unlimited) |
 | safe idle | charge off, discharge off | untouched | untouched |
 
 House load = grid power − battery AC power, charge positive (`battery_ac_power_sign` turns the sensor's sign
@@ -839,8 +839,13 @@ charge is cut hard; the go-live configuration sets both system caps to 2500 W an
 (discharge above 800 W), so the bound is then ±2500 W, as the planner's `power_kw: 2.5` assumes: see
 [known issues](known-issues.md#the-pd-target-is-bounded-by-the-system-caps-while-the-power-limits-are-on).
 
-`discharge_margin_w` is 200 W in the committed config (code default 50 W): Omnibattery's PD loop swings by
-±150 to 200 W on a ~2 s period, and 50 W gave brief exports in the commissioning test.
+`discharge_margin_w` is 100 W in the deployed config since 2026-11-05 (200 W before; code default 50 W): Omnibattery's
+PD loop swings by ±150 to 200 W on a ~2 s period, and 50 W gave brief exports in the commissioning test. 2-second HA grid samples over about 17 h of live discharge on 2026-11-04/05 at the 200 W target had a median of 192 to 195 W, a 1st percentile of 131 to 151 W and were below 0 W in 0 to 0.04% of samples; replaying 100 W on the same data gives about 0.2% of time below zero and about 1 Wh/day of export ([known issues](known-issues.md#the-pd-loop-oscillates-the-discharge-margin-was-too-small)); export is alerted from the Shelly's returned-energy counter (homelab `BatteryGridExport`, `BatteryGridExportSustained`). A discharge is therefore at
+most the house load minus this margin; `planning.discharge_margin_bound: true` (default `false`) makes the planner
+bound each slot's discharge the same way (`max(0, forecast load - discharge_margin_w)`), so the plan does not promise
+energy the actuator cannot deliver. It reads this one margin, joins `inputs_hash` and `config_hash` only when on,
+and applies to the day-ahead and the final plan alike (one solve); see
+[known issues](known-issues.md#planned-discharge-is-not-delivered-planner-bound-implemented-off-by-default-waiting-for-data-from-2026-11-04).
 
 **Guard** (any failure → safe idle, recorded with the reason): `import_over_cap` (measured import above
 `import_cap_w + import_guard_margin_w` while charge is on: charge off at once, and charge refused for
@@ -885,7 +890,7 @@ entity IDs, all required outside shadow, including `battery_liveness`, deployed 
 Modbus fails, so this is the check that catches a silent battery), `battery_ac_power_sign` (none: required
 outside shadow; -1 committed, measured 2026-11-03: `sensor.venus_ac_power` is negative while charging),
 `tick_interval_s` (30), `import_cap_w` (4500), `import_guard_margin_w` (200), `import_trip_hold_s` (300),
-`neutral_pd_target_w` (0), `discharge_margin_w` (50; 200 committed), `min_discharge_cap_w` (100), `max_discharge_cap_w`
+`neutral_pd_target_w` (0), `discharge_margin_w` (50; 100 deployed), `min_discharge_cap_w` (100), `max_discharge_cap_w`
 (2500), `healthy_states` (`balanced`, `charging`, `discharging`), `command_policy.max_attempts` (3),
 `command_policy.min_setpoint_change_w` (100), `command_policy.min_command_interval_s` (30),
 `readback_timeout_s` (10), `shutdown_timeout_s` (15), `freshness_s.grid_power` (30),

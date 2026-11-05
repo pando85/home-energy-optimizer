@@ -68,6 +68,17 @@ Constraints
    configured ceiling the charge variables are bounded by the power limit and SOC
    headroom alone (the same physics the causal policy uses).  There is no
    ``charge <= load`` cap, and constraint 6 never bounds the discharge side.
+
+   An optional ``discharge_margin_kw`` (default ``0``: the row above, byte for byte)
+   models an actuator that keeps a small grid import while discharging, so the battery
+   can deliver at most the load minus that margin::
+
+       discharge[t] - charge[t] <= max(0, load[t] - discharge_margin_kw * h)
+
+   The service planner enables it so the plan does not promise energy the live
+   actuator cannot deliver; the offline benchmark leaves it off.  It only tightens the
+   feasible set, so the kernel re-trace (which checks the margin-free rule) still
+   accepts every plan.
 6. **Site import ceiling** — only when ``horizon.import_limit_kw`` is
    configured; the row block is omitted entirely when it is ``None``, because an
    unknown ceiling must stay unknown rather than become an invented number.  The
@@ -492,6 +503,7 @@ def build_model(
     full_charge: FullChargeModel | None = None,
     high_soc_cost: tuple[float, float] | None = None,
     charge_soft_cap: tuple[float, float] | None = None,
+    discharge_margin_kw: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, Bounds, list[LinearConstraint]]:
     """Assemble the MILP: ``(objective, integrality, bounds, constraints)``.
 
@@ -552,9 +564,20 @@ def build_model(
     positive cost appends one continuous column ``x[t]`` per slot (after the dwell columns),
     the row ``x[t] - charge[t] >= -threshold_kw * h`` after every other row, and ``cost`` on each
     ``x[t]``.  See the module section "Optional thermal charge-power soft cap".
+
+    ``discharge_margin_kw`` (default ``0.0``: byte for byte) tightens the no-export row to
+    ``discharge[t] - charge[t] <= max(0, load[t] - discharge_margin_kw * h)``; no row or column is
+    added, only that right-hand side moves.  Must be finite and non-negative.
     """
     _check_terminal_mode(terminal_mode)
     free = terminal_mode == _TERMINAL_FREE
+    if isinstance(discharge_margin_kw, bool) or not math.isfinite(discharge_margin_kw):
+        raise ValueError(
+            f"discharge_margin_kw must be a finite number, got {discharge_margin_kw!r}"
+        )
+    if discharge_margin_kw < 0.0:
+        raise ValueError(f"discharge_margin_kw must be >= 0, got {discharge_margin_kw}")
+    margin_kwh = float(discharge_margin_kw) * horizon.interval_seconds / 3600.0
 
     if isinstance(throughput_cost_eur_per_kwh, bool):
         raise ValueError(
@@ -712,9 +735,10 @@ def build_model(
 
     for t in range(n):
         # 5. no intentional export
-        add_row(
-            [(_discharge_idx(t), 1.0), (_charge_idx(t), -1.0)], -np.inf, float(horizon.load_kwh[t])
-        )
+        export_rhs = float(horizon.load_kwh[t])
+        if margin_kwh > 0.0:
+            export_rhs = max(0.0, export_rhs - margin_kwh)
+        add_row([(_discharge_idx(t), 1.0), (_charge_idx(t), -1.0)], -np.inf, export_rhs)
 
     # 6. site import ceiling — omitted entirely when the ceiling is unknown, so
     # an unconfigured site keeps 4n rows and an unconstrained import side.  The
@@ -899,6 +923,7 @@ def solve_oracle(
     full_charge: FullChargeModel | None = None,
     high_soc_cost: tuple[float, float] | None = None,
     charge_soft_cap: tuple[float, float] | None = None,
+    discharge_margin_kw: float = 0.0,
 ) -> Schedule:
     """Cost-minimising dispatch over the whole horizon with perfect information.
 
@@ -969,6 +994,11 @@ def solve_oracle(
             ``cost_eur`` excludes it (``eur_per_kwh * charge_soft_cap_excess_kwh(...)``
             recovers it), the dual bound is discarded, and with a full-charge checkpoint the
             shortfall penalty must exceed the dwell cost plus ``eur_per_kwh`` per stored kWh.
+        discharge_margin_kw: Grid import (kW) the actuator keeps while discharging.  Tightens
+            the no-export row to ``max(0, load - discharge_margin_kw * h)`` per interval so the
+            plan only discharges what can be delivered.  ``0.0`` (the default) is the historical
+            model, byte for byte.  The bounds describe the margin-bound problem the solver
+            solved, not the margin-free one.  Must be finite and non-negative.
 
     Raises:
         ValueError: If *spec* is not physically meaningful, a tolerance or the
@@ -1015,6 +1045,7 @@ def solve_oracle(
         full_charge=full_charge,
         high_soc_cost=high_soc_cost,
         charge_soft_cap=charge_soft_cap,
+        discharge_margin_kw=discharge_margin_kw,
     )
     options = _solver_options(time_limit_s, mip_rel_gap, mip_abs_gap)
     with warnings.catch_warnings():

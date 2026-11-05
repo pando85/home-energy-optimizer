@@ -197,6 +197,9 @@ class PlanningSnapshot:
     #: above the threshold power in a slot.
     charge_soft_cap_kw: float = 1.5
     charge_soft_cap_eur_per_kwh: float = 0.0
+    #: Grid import (kW) the actuator keeps while discharging
+    #: (``planning.discharge_margin_bound``); 0 is off: discharge is bounded by the load alone.
+    discharge_margin_kw: float = 0.0
 
     def __post_init__(self) -> None:
         n = len(self.slot_starts)
@@ -250,6 +253,9 @@ class PlanningSnapshot:
                 "threshold_kw": self.charge_soft_cap_kw,
                 "eur_per_kwh": self.charge_soft_cap_eur_per_kwh,
             }
+        if self.discharge_margin_kw > 0.0:
+            # Likewise the discharge margin bound.
+            payload["discharge_margin_kw"] = self.discharge_margin_kw
         return payload
 
     def inputs_hash(self) -> str:
@@ -440,6 +446,7 @@ def _solve(
             if snapshot.charge_soft_cap_eur_per_kwh > 0.0
             else None
         ),
+        discharge_margin_kw=snapshot.discharge_margin_kw,
     )
 
 
