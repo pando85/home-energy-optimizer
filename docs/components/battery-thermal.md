@@ -60,6 +60,9 @@ for `k_c` 11.7 to 8.7; PR #91's 1.8 kW at 45 degC used the discharge gain).
 - `k_d` and a separate discharge gain are **not resolved** (a single gain validates as well); no discharge above 0.82 kW observed.
 - The idle level (31.7 to 33.0 degC over 19 hours) is a constant; a daily harmonic fails validation, a per-episode level would
   halve the error (oracle), so level drift is the largest unmodelled term.
+- Discharge heats the battery too: the Venus internal temperature reached 40 degC at about 900 W of discharge
+  (2026-11-05 evening). The 40 degC charge temperature limit (band 10, floor 40 %) can therefore already be active when a
+  charge starts after a discharge, which matters for the first full charge.
 - Omnibattery's curve is the documented one (1 up to the limit, linear to the floor over the band, continuous, no hysteresis,
   never below the driver minimum, no temperature means no derate), checked only between 48.3 and 50.2 degC.
 

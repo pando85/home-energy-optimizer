@@ -21,6 +21,18 @@ with the battery commissioning.
 
 Out of scope: any battery actuation, cooling, and any change to the unit's internal protections.
 
+**Parked (owner, 2026-11-05).** The controller (homelab draft PRs #4699 and #4746) is parked until the battery runs
+optimally, that is, until the discharge shortfall is solved
+([known issues](../known-issues.md#planned-discharge-is-not-delivered-planner-bound-enabled-since-0140-monitoring)).
+
+**Go-live gates:**
+
+- an owner-chosen date no earlier than 2026-11-10 and after the first live full charge;
+- the owner confirms a "valid heating day";
+- the legacy automation off and the 9 scheduler schedules off;
+- the Comfort view (`apps/home-assistant/lovelace/dashboard-comfort.json` in homelab) created in HA on go-live day
+  only, with a Lovelace backup first.
+
 ## 2. Run logic
 
 AppDaemon decides whether heat-pump heating is on or off. It has to, because the pump's zone sensor is the
@@ -65,6 +77,16 @@ The **day window** starts at the weekday or weekend start above and ends at **22
 effective day minimum of a room is `max(day minimum, floor)` and the window stays shared. With the defaults the
 schedule above is unchanged. The evaluation criteria follow per room, against the values in effect at each slot
 ([preregistration amendment of 2026-11-05](climate-preregistration-2026-27.md#4-amendments)).
+
+**Owner's starting values (go-live).** Set from the Comfort view at go-live, not code defaults (the code defaults
+stay 21 / 23.5). Based on 14-day measured temperatures, about 0.5 to 1 K below the current ones.
+
+| Room | floor degC | day minimum degC |
+|---|---|---|
+| hall_kitchen | 22 | 23.5 |
+| bedroom | 22 | 22 |
+| office_t | 22 | 23 |
+| office_a | 21 | 21 |
 
 ## 4. Thermostat semantics
 
@@ -209,10 +231,10 @@ The battery cap therefore cannot rely on 15-minute averages. OmniBattery must **
 measured load in real time with a margin below the limit**. This is a **requirement for the actuator
 ADR**.
 
-**Backup heater: no decision (2026-10-31).** Default: leave it as is. The unit starts the heater by itself
-below its heater-on outdoor temperature of 0 degC (see the heater facts in
-[heat-pump-controller](../components/heat-pump-controller.md)), and the controller never touches it. The
-item stays open.
+**Backup heater: decided 2026-11-05 (owner).** Leave the heater to the unit: the controller writes setpoints and
+operating modes only, and the warning sign is heater on outside defrost. The unit still starts the heater by itself
+below its heater-on outdoor temperature of 0 degC; decision, evidence and lever in
+[heat-pump-controller](../components/heat-pump-controller.md#heater-facts-import-limit-inputs).
 
 ## 10. Rollback and failure mode
 
@@ -445,4 +467,4 @@ Answered by the owner on 2026-10-31.
 | Legionella policy | 7.2, 13 | Resolved | 2026-10-31 | Off for now; the final MPC (track B) should schedule it eventually (future extension) |
 | Import-limit basis | 9 | Resolved (owner-confirmed; no distributor document yet) | 2026-10-31 | Instantaneous trip; battery cap must regulate in real time against measured load with a margin (actuator ADR requirement) |
 | Thermostat device programs | 4 | Resolved | 2026-10-31 | Disabled, owner-confirmed |
-| Backup heater enabled for space heating | 9 | **Open** (no decision) | 2026-10-31 | Default: leave as is (the unit starts it below 0 degC outdoor); the controller never touches it |
+| Backup heater enabled for space heating | 9 | Resolved | 2026-11-05 | Leave the heater to the unit; the controller writes setpoints and modes only; the warning sign is heater on outside defrost ([decision](../components/heat-pump-controller.md#heater-facts-import-limit-inputs)) |

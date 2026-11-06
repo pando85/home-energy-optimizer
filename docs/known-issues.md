@@ -233,13 +233,22 @@ Shelly's device-integrated returned-energy counter (homelab alerts `BatteryGridE
 `BatteryGridExportSustained`), not from the 2 s samples. A smoother Omnibattery PD tuning profile (owner
 setting) would allow a smaller margin still.
 
+**Analysis 2026-11-06: no PD defect.** 66 h of 2-second data at the baseline settings showed a steady discharge
+error std of about 24 W and no limit cycle. Export comes almost only from load-down steps while the battery is
+pinned at its per-slot cap, because of 1 to 4 s of dead time (the feedforward's 2-sample confirm plus
+Modbus and inverter); gains cannot remove it. On 2026-11-06 09:30 UTC the owner changed
+`pd_min_cycle_interval` 1.0 -> 0.5 s and kp 0.35 -> 0.40 ([regime log](components/regime-log.md)). The full
+settings log and the evaluation criteria are in the homelab deployment doc, section "Omnibattery PD controller
+settings log".
+
 ### The battery holds its last command when Home Assistant is down
 
 On a clean HA restart (40 s down) and a forced pod kill (23 s down) while discharging, the battery kept
 discharging at about 700 W and the grid stayed steady: it does **not** go to standby, and Omnibattery does not
 set it to standby on shutdown. On start Omnibattery re-took control with the switches persisted (a brief dip
 to about 190 W). A longer outage (about 10.5 minutes, HA stopped while discharging) gave the same result: the
-battery held about 620 W of discharge for the whole outage (read directly over Modbus), with no firmware
+battery held about 620 W of discharge for the whole outage (read directly over Modbus, a probe that only works while Omnibattery is the battery's single Modbus TCP client: the
+battery accepts one client and refuses others, so such a read competes with Omnibattery), with no firmware
 timeout and no standby; Omnibattery resumed control at once when HA came back. So there is **no device
 timeout of at least 10 minutes**, and the HA watchdog and the service's safe idle cannot stop the battery while
 HA is down: during an outage it neither follows the house load (a discharge can export when the load drops)
@@ -354,3 +363,18 @@ recalibrate the load forecast ([battery-load-forecast](components/battery-load-f
   `forecast house load - discharge_margin_w`.
 
 If the shortfall remains after the bound, the bias dominates: recalibrate the forecast.
+
+**Finding 2026-11-05 evening (margin 100 W, bound on).** Grid below 0 W for 8 s and about 0.3 Wh exported;
+2.45 of 3.28 kWh of planned discharge delivered. 30 s samples show `number.venus_set_discharge_power` equal to the
+per-slot cap whenever the load allowed, with no temperature or actuator derating. The gap is load below forecast:
+the evening peak was forecast about 1 h late and overestimated. Lesson: 15-minute means mix load-limited and
+cap-limited minutes, so do not infer an actuator shortfall from them. Next review about 2026-11-11 (7 live days).
+
+## Charge pauses: allow_charge off 25 to 30 s while charging
+
+Status: **open, to investigate.**
+
+**Symptom.** While charging, `switch.venus_battery_allow_charge` went off for about 25 to 30 s several times, with
+grid import dropping by 1.4 to 2 kW: 2026-11-04 13:25, 2026-11-05 13:20 and 14:15 UTC.
+
+**Diagnosis.** Not yet explained. Candidates: the import guard or a slot transition.
