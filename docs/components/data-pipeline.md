@@ -44,6 +44,8 @@ and the data volume are deployed from the homelab repository.
   (measured 2026-11-03 22:44 to 23:01 UTC, first live discharge: `sensor.venus_ac_power`, which includes the
   backup-port supply, integrates to 0.074 kWh, 0.072 kWh of it to the backup port; the discharge counter rose
   0.08 kWh). So `grid - charge + discharge` keeps the servers in `gross_kwh` (no undercount).
+  `sensor.venus_ac_power` likewise includes the supply to the backup (EPS) port, so it is not the load of the
+  main circuit: measured, the plug net was about 14 W while `ac_power` read 259 W with the servers at 246 W.
 - `washer_plug` ends at `features.WASHER_PLUG_REFLASHED_AT` (2026-11-03 22:46 UTC, plug reflashed for
   another load) and is unknown from then on; it has had no data since 2024-07-08 anyway.
 - Extraction retires an entity that no longer exists (`EntitySpec.retired_at`, after its last sample):

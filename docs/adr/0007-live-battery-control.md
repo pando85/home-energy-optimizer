@@ -359,6 +359,14 @@ configuration or the [live preconditions](#live-preconditions-2026-11-03).
   Resolved: the planner now checks the SOC as the actuator does, availability only by default
   (`freshness_s.battery_soc: null`; a number restores an age test) plus `actuation.entities.battery_liveness`
   exactly `None` (tracked in every mode with `soc_source: entity`), and the committed config uses `entity`.
+- **Premium and the 2500 W cap.** The decision to run Premium mode with the 2500 W discharge cap was backed by the
+  perfect-foresight LP: an 800 W discharge cap would lose about 11 % of the savings.
+- **One Modbus client.** The battery accepts a single Modbus TCP client, Omnibattery; others are refused. A
+  "read directly over Modbus" probe therefore competes with Omnibattery.
+- **PD settings are the owner's** (owner decision 2026-11-06). Omnibattery's PD settings (kp, kd, deadband,
+  max_power_change, direction hysteresis, min cycle interval, tuning profile) are set by the owner; the optimizer only
+  analyses them and recommends ([known issues](../known-issues.md#the-pd-loop-oscillates-the-discharge-margin-was-too-small)).
+  A future optimizer write path would need an amendment of this ADR with bounded allowlist entries and tests.
 
 ### Live preconditions (2026-11-03)
 

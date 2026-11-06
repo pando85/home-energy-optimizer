@@ -64,6 +64,10 @@ WH-ADC0309JE5C and WH-UD09JE5-1 are assumed equivalent). Page details in the hom
   heater ran only inside defrost (6 min on 2026-11-04, 8 min on 2026-11-05, all within
   `binary_sensor.aquarea_defrost_active`). The one warning sign is heater minutes **outside** defrost (KPI
   below); the lever against it is fewer cold starts, that is the unit's minimum on and off times.
+  Size: about 0.4 kWh per defrost event, about EUR 0.05 to 0.10 a day. The 02:10 local grid peak of 4.9 kW (5 kW
+  contract) was defrost plus heater; the battery's 4.5 kW import guard covers an overlap with charging. Lever: fewer cold
+  starts, `MIN_ON` 30 / `MIN_OFF` 20 min in the comfort controller. Follow-up: only about 6 days of heater data exist;
+  recheck after a cold week.
 
 ## Calibrated on
 
