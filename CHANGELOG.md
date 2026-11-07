@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.15.0](https://github.com/pando85/home-energy-optimizer/tree/v0.15.0) - 2026-11-07
+
+### Added
+
+- actuator: Follow the real load in planned discharge slots ([60ff30e](https://github.com/pando85/home-energy-optimizer/commit/60ff30e674eb518fefdce87d328a63baa13b15ef))
+
+### Documentation
+
+- components: Log the margin change and the enabled discharge margin bound ([abab65a](https://github.com/pando85/home-energy-optimizer/commit/abab65a5ae47c70537a7e6960b112ed05c964896))
+- components: Drop the cost figure from the heat pump controller page ([18b4d99](https://github.com/pando85/home-energy-optimizer/commit/18b4d998e7311771d724535eefac29079ab13413))
+- State the discharge margin bound as enabled since 0.14.0 ([ac571aa](https://github.com/pando85/home-energy-optimizer/commit/ac571aa2a35a87faf60a370607da1fe4993356a5))
+- Record battery findings, PD analysis and comfort controller gates ([60028de](https://github.com/pando85/home-energy-optimizer/commit/60028de31a422f23145aae0c08bd22daa9a3649e))
+
 ## [v0.14.0](https://github.com/pando85/home-energy-optimizer/tree/v0.14.0) - 2026-11-05
 
 ### Added
