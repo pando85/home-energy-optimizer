@@ -47,6 +47,7 @@ __all__ = [
     "FullChargeSettings",
     "FullChargeTaper",
     "HomeAssistantSettings",
+    "LoadFollowingSettings",
     "ObservationSettings",
     "PlanningSettings",
     "PrometheusSettings",
@@ -428,6 +429,22 @@ class ActuationEntities:
 
 
 @dataclass(frozen=True)
+class LoadFollowingSettings:
+    """Load-following discharge (ADR-0007 amendment 2026-11-07); **off** by default.
+
+    In a planned discharge slot, while the measured SOC is at or above the plan's end-of-slot SOC,
+    the system discharge cap is raised from the planned power to ``max_w`` (``None``: the
+    actuation's ``max_discharge_cap_w``), so the battery covers the real load and not only the
+    forecast one; the PD grid target (the discharge margin) still prevents export.  It engages at
+    ``plan SOC + soc_hysteresis_pct`` and releases below the plan SOC.
+    """
+
+    enabled: bool = False
+    max_w: float | None = None
+    soc_hysteresis_pct: float = 1.0
+
+
+@dataclass(frozen=True)
 class ActuationSettings:
     """Live control through Omnibattery (ADR-0007); ignored in ``shadow`` mode."""
 
@@ -460,6 +477,13 @@ class ActuationSettings:
     #: fails, so ``battery_liveness`` is the check that catches a non-responsive battery.
     battery_soc_max_age_s: float | None = None
     battery_ac_power_max_age_s: float | None = None
+    load_following: LoadFollowingSettings = field(default_factory=LoadFollowingSettings)
+
+    @property
+    def load_following_ceiling_w(self) -> float:
+        """The cap load-following asks for: ``max_w``, never above ``max_discharge_cap_w``."""
+        max_w = self.load_following.max_w
+        return self.max_discharge_cap_w if max_w is None else min(max_w, self.max_discharge_cap_w)
 
     def command_policy(self) -> Any:
         """The writer knobs as the validated :class:`~battery_optimizer.dispatch.CommandPolicy`.
@@ -1019,7 +1043,10 @@ _ACTUATION_KEYS = (
     "readback_timeout_s",
     "shutdown_timeout_s",
     "freshness_s",
+    "load_following",
 )
+#: Widest ``actuation.load_following.soc_hysteresis_pct`` (SOC points).
+MAX_LOAD_FOLLOWING_HYSTERESIS_PCT = 10.0
 
 
 def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
@@ -1125,6 +1152,7 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
         ),
         battery_soc_max_age_s=optional_age("battery_soc", "battery_soc_max_age_s"),
         battery_ac_power_max_age_s=optional_age("battery_ac_power", "battery_ac_power_max_age_s"),
+        load_following=_parse_load_following(_section(raw, "load_following"), f"{name}."),
     )
     cap = settings.import_cap_w
     for key in ("neutral_pd_target_w", "discharge_margin_w"):
@@ -1154,7 +1182,36 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
         raise ValueError(
             f"service config: {name}.min_discharge_cap_w must not exceed max_discharge_cap_w"
         )
+    max_w = settings.load_following.max_w
+    if max_w is not None and not (
+        settings.min_discharge_cap_w <= max_w <= settings.max_discharge_cap_w
+    ):
+        # The guard allowlists the cap only inside [min, max]_discharge_cap_w: never widened here.
+        raise ValueError(
+            f"service config: {name}.load_following.max_w must be within "
+            "[min_discharge_cap_w, max_discharge_cap_w]"
+        )
     return settings
+
+
+def _parse_load_following(raw: Mapping[str, Any], prefix: str) -> LoadFollowingSettings:
+    name = f"{prefix}load_following"
+    _keys(raw, name, ("enabled", "max_w", "soc_hysteresis_pct"))
+    defaults = LoadFollowingSettings()
+    max_w = raw.get("max_w", defaults.max_w)
+    hysteresis = _positive(
+        raw.get("soc_hysteresis_pct", defaults.soc_hysteresis_pct), f"{name}.soc_hysteresis_pct"
+    )
+    if hysteresis > MAX_LOAD_FOLLOWING_HYSTERESIS_PCT:
+        raise ValueError(
+            f"service config: {name}.soc_hysteresis_pct must be <= "
+            f"{MAX_LOAD_FOLLOWING_HYSTERESIS_PCT:g}"
+        )
+    return LoadFollowingSettings(
+        enabled=_bool(raw.get("enabled", defaults.enabled), f"{name}.enabled"),
+        max_w=None if max_w is None else _positive(max_w, f"{name}.max_w"),
+        soc_hysteresis_pct=hysteresis,
+    )
 
 
 _FULL_CHARGE_KEYS = (

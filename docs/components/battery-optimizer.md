@@ -111,12 +111,21 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
   is unchanged, so a forecast that runs high still leaves a shortfall
   ([known issue](../known-issues.md#planned-discharge-is-not-delivered-planner-bound-enabled-since-0140-monitoring)).
   Not benchmarked: the offline benchmark and replay leave the margin at 0.
+- **Load-following discharge (code default off, 2026-11-07).** With `actuation.load_following.enabled` the actuator, not
+  the plan, decides the discharge power inside a planned discharge slot: while the measured SOC is at or above the
+  plan's end-of-slot SOC it raises the discharge cap from the planned power to `max_w` (2500 W), so the battery covers
+  the real load (an evening heat-pump hot-water cycle the forecast places an hour off) and the plan's end-of-slot SOC
+  becomes a floor rather than a target ([ADR-0007 amendment](../adr/0007-live-battery-control.md#amendment-2026-11-07-load-following-discharge),
+  [service](../service.md#load-following-discharge)). The planner is unchanged: it still prices the forecast load, and
+  the 15-minute replan from the measured SOC absorbs the difference. Delivered discharge per slot can then exceed the
+  plan's, so planned-against-actual KPIs read differently from the day it is enabled.
 - Omnibattery's own price features will be off, so this is the only battery price reactor.
 
 ## Invalidated when
 
 - Any [battery-model](battery-model.md) parameter changes, or the wear cost, the high-SOC dwell cost, the thermal
-  charge soft cap or the discharge margin bound is changed (or `actuation.discharge_margin_w` while the bound is on).
+  charge soft cap or the discharge margin bound is changed (or `actuation.discharge_margin_w` while the bound is on),
+  or load-following discharge is enabled or its ceiling changed.
 - [tariff-prices](tariff-prices.md) changes (taxes confirmed, holidays added, new publication timing).
 - The load forecast changes regime (comfort schedule, boost): re-check floor-hit share and clipping.
 - At go-live: measured SOC replaces simulated SOC; the charge adapter caps the grid target below the
@@ -152,6 +161,7 @@ first plan that covered it, the *final plan* the plan of record at the slot open
 | Average price charging against average price discharging | offline `avg_price_charging_eur_per_kwh` and `avg_price_discharging_eur_per_kwh`; a working arbitrage has the second above the first by more than the round-trip loss and wear cost |
 | Planned against actual battery energy | `increase(shadow_day_ahead_energy_kwh_total{direction}[1d])`, `shadow_planned_energy_kwh_total` (final), `shadow_actual_battery_energy_kwh_total` (actual) |
 | Power and SOC target, day-ahead against final | `slot_battery_power_watts{plan}`, `slot_soc_target_ratio{plan}` |
+| Load-following discharge: when it raised the discharge cap and by how much (only with the feature on) | `actuator_load_following_engaged`, `actuator_load_following_raise_watts`; the `actuation/` rows (`load_following`, `planned_max_discharge_w`) |
 
 Offline: `uv run python hack/day_ahead_kpis.py --from <day> --to <day>`.
 
@@ -204,6 +214,14 @@ off), enabled in the deployed config since 0.14.0 on 2026-11-05 (margin 100 W, r
 for the reasons above; enabled, it changes the plans (discharge capped at load minus the actuation margin, so less
 planned and more delivered discharge). The replay benchmark is unaffected (margin 0); a
 benchmark made with the bound would not be comparable with earlier ones.
+
+Load-following discharge (2026-11-07, code only, `actuation.load_following.enabled: false`, regime log): an
+actuator change (the plan, `inputs_hash` and `config_hash` are untouched, and with the feature off the writes,
+records and metrics are as before), so merging changes nothing observable and nothing goes stale. Enabling it is a
+control change, recorded in the regime log when it happens: the status stays **stale** for the reasons above, the
+evening discharge, end-of-evening SOC and realised-against-perfect-foresight saving are re-read on the first 7 days
+(the figures of 2026-11-04 to 11-07 are in the ADR amendment), and [battery-thermal](battery-thermal.md) re-reads the
+discharge gain.
 
 Slot decisions (2026-11-04, code only, regime log): a slot that opened without an intent adopts one later in
 the slot (`late_intent`, see [service](../service.md#scheduling-and-the-slot-cycle)), and a solve inside such a

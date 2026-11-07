@@ -11,6 +11,16 @@ Omnibattery state:
   (a small import, never export), system power limits on and the system discharge cap
   ``max(P, min_discharge_cap_w)`` (never 0, which Omnibattery reads as *unlimited*).
 
+**Load-following discharge** (ADR-0007 amendment 2026-11-07; ``actuation.load_following``, off by
+default): in a discharge intent, while the measured SOC is at or above the plan's end-of-slot SOC
+(``soc_target_frac``), the discharge cap is raised to the load-following ceiling
+(``load_following.max_w``, at most ``max_discharge_cap_w``), so the battery covers the real house
+load up to that ceiling instead of the forecast one; the PD target stays the discharge margin, so
+the battery still never exports.  Hysteresis: it engages at ``plan SOC + soc_hysteresis_pct`` and
+releases below the plan SOC; the latch carries over between consecutive discharge intents and
+resets on anything else (charge, idle, safe idle, kill switch).  Same entity, same bounds, same
+write ordering as the planned cap.
+
 House load = grid power - battery AC power (charge positive), from fresh readings.
 
 **Safe idle** (both direction switches off, nothing else) replaces the mapping whenever the
@@ -212,11 +222,28 @@ class Desired:
     #: leave both entities alone.  Recorded only when set.
     full_charge_armed: bool | None = None
     full_charge_weekday: str | None = None
+    #: Load-following discharge (feature on, discharge intent only; ``None`` otherwise, and not
+    #: recorded): whether it is engaged (the cap is the ceiling, never below the planned cap), the
+    #: cap the plan alone gives, and the SOC floor (%, the plan's end-of-slot SOC) it is held to.
+    load_following: bool | None = None
+    planned_max_discharge_w: float | None = None
+    load_following_floor_pct: float | None = None
+
+    @property
+    def load_following_raise_w(self) -> float:
+        """How far load-following raised the discharge cap above the plan's (W; 0 when not)."""
+        if not self.load_following:
+            return 0.0
+        assert self.max_discharge_w is not None and self.planned_max_discharge_w is not None
+        return self.max_discharge_w - self.planned_max_discharge_w
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
         if self.full_charge_armed is None:
             del out["full_charge_armed"], out["full_charge_weekday"]
+        if self.load_following is None:
+            del out["load_following"], out["planned_max_discharge_w"]
+            del out["load_following_floor_pct"]
         return out
 
 
@@ -367,6 +394,8 @@ class Actuator:
         self.last_success_write_at: datetime | None = None
         self.last_heartbeat_at: datetime | None = None
         self._signature: Any = None
+        #: Load-following hysteresis latch: the last applied discharge intent had it engaged.
+        self._lf_engaged = False
 
     # ------------------------------------------------------------------ inputs
 
@@ -575,7 +604,7 @@ class Actuator:
                 s.max_discharge_cap_w,
             )
             margin, _ = self._number_target(e.pd_target, s.discharge_margin_w, 0.0, s.import_cap_w)
-            return Desired(
+            desired = Desired(
                 mode="discharge",
                 reason="intent",
                 allow_discharge=True,
@@ -586,7 +615,45 @@ class Actuator:
                 clamped=cut > 0,
                 clamped_w=round(min(cut, power), 3),
             )
+            return self._load_following(desired, intent, readings)
         return self.idle_desired(readings, "intent")
+
+    def _load_following(
+        self, desired: Desired, intent: ShadowIntent, readings: Mapping[str, Any]
+    ) -> Desired:
+        """Raise the planned discharge cap to the load-following ceiling while SOC allows.
+
+        Engages when the measured SOC is at least the plan's end-of-slot SOC plus
+        ``soc_hysteresis_pct``, stays engaged while it is at or above the plan's end-of-slot SOC,
+        and releases below it (the planned cap again).  The latch carries over between consecutive
+        discharge intents (each judged against its own SOC) and resets on anything else.  The
+        raised cap is bounded like every cap write (``[min, max]_discharge_cap_w`` and the
+        entity's own max) and never falls below the planned cap.
+        """
+        s, lf = self.settings, self.settings.load_following
+        if not lf.enabled:
+            return desired
+        assert desired.max_discharge_w is not None
+        floor = 100.0 * intent.soc_target_frac
+        soc = readings.get("battery_soc_pct")
+        threshold = floor if self._lf_engaged else floor + lf.soc_hysteresis_pct
+        engaged = soc is not None and soc >= threshold - 1e-9
+        cap = desired.max_discharge_w
+        if engaged:
+            raised, _ = self._number_target(
+                s.entities.max_discharge_power,
+                s.load_following_ceiling_w,
+                s.min_discharge_cap_w,
+                s.max_discharge_cap_w,
+            )
+            cap = max(cap, raised)
+        return replace(
+            desired,
+            max_discharge_w=cap,
+            load_following=engaged,
+            planned_max_discharge_w=desired.max_discharge_w,
+            load_following_floor_pct=round(floor, 3),
+        )
 
     def idle_desired(self, readings: Mapping[str, Any], reason: str) -> Desired:
         """Both directions off and the neutral PD target (the planned idle, or the settle hold)."""
@@ -940,6 +1007,7 @@ class Actuator:
             self._count("actuator_safe_idles", reason=desired.reason)
         self.reasons = tuple(reasons)
         self.desired = desired
+        self._lf_engaged = desired is not None and desired.load_following is True
         self._log_transitions(*before, readings)
         record = self._tick_record(ctx, readings, desired, writes, heartbeat)
         await self._maybe_record(now, record, bool(writes))
@@ -990,6 +1058,21 @@ class Actuator:
                 "-" if new.max_discharge_w is None else f"{new.max_discharge_w:g}",
                 new.clamped_w,
             )
+        engaged = bool(new is not None and new.load_following)
+        if engaged != bool(desired is not None and desired.load_following):
+
+            def num(value: float | None) -> str:
+                return "-" if value is None else f"{value:g}"
+
+            log.info(
+                "actuator load_following=%s max_discharge_w=%s planned_max_discharge_w=%s "
+                "soc_pct=%s floor_pct=%s",
+                "on" if engaged else "off",
+                num(new.max_discharge_w if new is not None else None),
+                num(new.planned_max_discharge_w if new is not None else None),
+                num(readings.get("battery_soc_pct")),
+                num(new.load_following_floor_pct if new is not None else None),
+            )
         if self.alert != alert:
             if self.alert is None:
                 log.info("actuator alert cleared previous=%s", alert)
@@ -1009,6 +1092,7 @@ class Actuator:
                 writes += await self._disarm()  # best effort, after the safe idle
                 self.in_control = not ok
                 self.desired = desired
+                self._lf_engaged = False
                 self._count("actuator_safe_idles", reason="shutdown")
                 log.log(
                     logging.INFO if ok else logging.ERROR,
@@ -1133,6 +1217,22 @@ class Actuator:
             "house_load_w": self.readings.get("house_load_w"),
             "observed_pd_target_w": self.readings.get("pd_target_w"),
             **({"full_charge": self._full_charge_snapshot()} if self._fc is not None else {}),
+            **(
+                {"load_following": self._load_following_snapshot()}
+                if self.settings.load_following.enabled
+                else {}
+            ),
+        }
+
+    def _load_following_snapshot(self) -> dict[str, float | None]:
+        """Engaged (1/0) and the cap raise (W) of the last tick; ``None`` before the first."""
+        desired = self.desired
+        if self.last_tick_at is None:
+            return {"engaged": None, "raise_w": None}
+        engaged = desired is not None and desired.load_following is True
+        return {
+            "engaged": 1.0 if engaged else 0.0,
+            "raise_w": desired.load_following_raise_w if desired is not None else 0.0,
         }
 
     def _full_charge_snapshot(self) -> dict[str, Any]:

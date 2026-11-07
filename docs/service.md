@@ -395,6 +395,7 @@ ID, price, timestamp or household reading is a label.
 | `actuator_desired_pd_target_watts`, `actuator_desired_allow_charge`, `actuator_desired_allow_discharge`, `actuator_desired_max_discharge_watts` | gauge (requested) | — |
 | `actuator_observed_pd_target_watts`, `actuator_observed_battery_power_watts` (+ charge), `actuator_observed_grid_power_watts`, `actuator_house_load_watts` | gauge (observed; absent when stale) | — |
 | `actuator_clamped_watts` | gauge (W of planned battery power the last tick could not request; 0 = none cut) | — |
+| `actuator_load_following_engaged`, `actuator_load_following_raise_watts` | gauge (only with `actuation.load_following.enabled`: 1 while [load-following discharge](#load-following-discharge) is engaged, and how far it raised the discharge cap above the planned cap; 0 otherwise) | — |
 | `actuator_writes_total` | counter | `role` (`allow_charge`, `allow_discharge`, `max_discharge_power`, `power_limits`, `pd_target`, `heartbeat`, `full_charge_day`, `full_charge_enable`), `result` (`ok`, `failed`, `dry_run`) |
 | `full_charge_mode` | gauge 0/1 (one-hot; only with `full_charge.enabled`, like every `full_charge_*`) | `mode` (`shadow`, `live`) |
 | `full_charge_state` | gauge 0/1 (one-hot) | `state` (`idle`, `scheduled`, `armed`, `charging`, `reached`, `settling`) |
@@ -814,7 +815,7 @@ the actuator takes the intent frozen for the current slot and maps it to Omnibat
 |---|---|---|---|
 | `idle` | charge off, discharge off | `neutral_pd_target_w` (0) | untouched |
 | `charge` at P W | discharge off, charge on | `min(house load + P, import_cap_w, entity max)` (never negative) | untouched |
-| `discharge` at P W | charge off, discharge on | `discharge_margin_w` (+100 deployed since 2026-11-05) | on, discharge cap `max(P, min_discharge_cap_w)` (never 0 = unlimited) |
+| `discharge` at P W | charge off, discharge on | `discharge_margin_w` (+100 deployed since 2026-11-05) | on, discharge cap `max(P, min_discharge_cap_w)` (never 0 = unlimited; raised by [load-following](#load-following-discharge) when enabled) |
 | safe idle | charge off, discharge off | untouched | untouched |
 
 House load = grid power − battery AC power, charge positive (`battery_ac_power_sign` turns the sensor's sign
@@ -895,10 +896,42 @@ outside shadow; -1 committed, measured 2026-11-03: `sensor.venus_ac_power` is ne
 `command_policy.min_setpoint_change_w` (100), `command_policy.min_command_interval_s` (30),
 `readback_timeout_s` (10), `shutdown_timeout_s` (15), `freshness_s.grid_power` (30),
 `freshness_s.battery_soc` (null = availability only), `freshness_s.battery_ac_power` (null; a number of
-seconds enables an age test). Validation: `import_cap_w + import_guard_margin_w` < 5000 (the contract),
-`discharge_margin_w` > 0, `tick_interval_s` ≤ 120, `0 < min_discharge_cap_w ≤ max_discharge_cap_w ≤ 2500`.
+seconds enables an age test), `load_following.enabled` (false), `load_following.max_w` (null =
+`max_discharge_cap_w`), `load_following.soc_hysteresis_pct` (1). Validation: `import_cap_w + import_guard_margin_w`
+< 5000 (the contract), `discharge_margin_w` > 0, `tick_interval_s` ≤ 120,
+`0 < min_discharge_cap_w ≤ max_discharge_cap_w ≤ 2500`, `load_following.max_w` within
+`[min_discharge_cap_w, max_discharge_cap_w]`, `0 < load_following.soc_hysteresis_pct ≤ 10`.
 `mode: live` also requires
 `planning.soc_source: entity`. The section is excluded from the plan's config hash.
+
+### Load-following discharge
+
+`actuation.load_following` (**off** by default; [ADR-0007 amendment 2026-11-07](adr/0007-live-battery-control.md#amendment-2026-11-07-load-following-discharge))
+lets a planned discharge cover the real house load instead of the forecast one. In a slot whose intent is
+`discharge`, while the measured SOC is at or above the plan's end-of-slot SOC (the intent's `soc_target_frac`),
+the system discharge cap is raised from `max(P, min_discharge_cap_w)` to the load-following ceiling,
+`load_following.max_w` (`null`: `max_discharge_cap_w`), bounded like every cap write by
+`[min_discharge_cap_w, max_discharge_cap_w]` (the guard's bound, not widened) and the entity's own max, and never
+below the planned cap. The PD target stays `discharge_margin_w`, so the battery follows the load up to the
+ceiling and still never exports; Omnibattery's own limits (Venus caps, a temperature limit if switched on) still
+apply below the system cap.
+
+- **Hysteresis:** it engages when the measured SOC reaches the plan SOC + `soc_hysteresis_pct` (1 point) and
+  releases when it falls below the plan SOC, so a SOC hovering at the plan SOC does not flap the cap; each edge is
+  one cap write (never rate limited, as before).
+- **Slot edges:** the first tick of a slot (the actuator wakes at every slot open) judges the new intent against
+  its own plan SOC. The latch carries over between consecutive discharge slots (released at once if the SOC is
+  below the new plan SOC) and resets on a charge or idle intent, a settle hold, a safe idle or the kill switch, so
+  the next discharge needs the hysteresis again. A raised cap left on the entity after a discharge is harmless
+  (discharge is off) and is rewritten before the next discharge switches on, as today.
+- **Floor:** the plan SOC is never below the plan's minimum SOC, so neither is the release threshold; the overshoot
+  is at most one SOC reading step plus one tick (30 s) at the ceiling. The MPC replans every slot from the measured
+  SOC, so energy delivered early is planned out of later slots.
+- **Records:** with the feature on, the desired state in the `actuation/` rows, `GET /status` and the log carries
+  `load_following` (engaged), `planned_max_discharge_w` (the cap the plan alone gives) and
+  `load_following_floor_pct` (the plan SOC); a row is written at every engage or release, with the log line
+  `actuator load_following=on|off`. Metrics: `actuator_load_following_engaged`,
+  `actuator_load_following_raise_watts`. With the feature off the records, metrics and writes are as before.
 
 ### Periodic full charge: the weekly-charge enabler
 

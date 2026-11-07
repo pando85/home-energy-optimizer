@@ -466,6 +466,19 @@ def _actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
         ),
     ):
         yield gauge(suffix, doc, a.get(key))
+    lf = a.get("load_following")
+    if lf is not None:  # only with actuation.load_following.enabled
+        yield gauge(
+            "load_following_engaged",
+            "1 while load-following discharge is engaged: the discharge cap is at the ceiling "
+            "(SOC at or above the plan's end-of-slot SOC in a discharge slot)",
+            lf.get("engaged"),
+        )
+        yield gauge(
+            "load_following_raise_watts",
+            "How far load-following raised the system discharge cap above the planned cap",
+            lf.get("raise_w"),
+        )
 
 
 #: Values of the ``status`` label of the gate state set.
