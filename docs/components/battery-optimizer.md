@@ -111,7 +111,7 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
   is unchanged, so a forecast that runs high still leaves a shortfall
   ([known issue](../known-issues.md#planned-discharge-is-not-delivered-planner-bound-enabled-since-0140-monitoring)).
   Not benchmarked: the offline benchmark and replay leave the margin at 0.
-- **Load-following discharge (code default off, 2026-11-07).** With `actuation.load_following.enabled` the actuator, not
+- **Load-following discharge (code default off, enabled in the homelab config 2026-11-07, release 0.15.0).** With `actuation.load_following.enabled` the actuator, not
   the plan, decides the discharge power inside a planned discharge slot: while the measured SOC is at or above the
   plan's end-of-slot SOC it raises the discharge cap from the planned power to `max_w` (2500 W), so the battery covers
   the real load (an evening heat-pump hot-water cycle the forecast places an hour off) and the plan's end-of-slot SOC
@@ -215,10 +215,10 @@ for the reasons above; enabled, it changes the plans (discharge capped at load m
 planned and more delivered discharge). The replay benchmark is unaffected (margin 0); a
 benchmark made with the bound would not be comparable with earlier ones.
 
-Load-following discharge (2026-11-07, code only, `actuation.load_following.enabled: false`, regime log): an
+Load-following discharge (2026-11-07, code, `actuation.load_following.enabled: false` by default and `true` in the homelab config since the 0.15.0 deploy, regime log): an
 actuator change (the plan, `inputs_hash` and `config_hash` are untouched, and with the feature off the writes,
-records and metrics are as before), so merging changes nothing observable and nothing goes stale. Enabling it is a
-control change, recorded in the regime log when it happens: the status stays **stale** for the reasons above, the
+records and metrics are as before), so merging changed nothing observable and nothing went stale. Enabling it (2026-11-07) is a
+control change, recorded in the regime log: the status stays **stale** for the reasons above, the
 evening discharge, end-of-evening SOC and realised-against-perfect-foresight saving are re-read on the first 7 days
 (the figures of 2026-11-04 to 11-07 are in the ADR amendment), and [battery-thermal](battery-thermal.md) re-reads the
 discharge gain.
