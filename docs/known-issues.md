@@ -355,6 +355,13 @@ byte-identical to before; on, the value joins both hashes. Enabled in the homela
 share below before and after. It does not touch the load-forecast bias: if the bias persists,
 recalibrate the load forecast ([battery-load-forecast](components/battery-load-forecast.md)) as well.
 
+**Evening finding (2026-11-04 to 11-07) and second fix (code default off).** The evening peaks reach 1.5 to 1.9 kW,
+mostly a 30-minute heat-pump hot-water cycle of about 1.4 kW that the forecast places an hour off since the end of
+summer time, while the discharge cap is the plan's power (about 1 kW): only 64% of the planned evening discharge was delivered (84% was deliverable at the measured load; of the gap, about 60% came from the cap and 40% from the margin and control tracking); the battery ended
+every evening at 40 to 49% SOC. `actuation.load_following` raises the cap to 2500 W in discharge slots while the
+measured SOC is at or above the plan's end-of-slot SOC ([service](service.md#load-following-discharge)); off until
+the owner enables it in the deployed config.
+
 **Decision criteria, after about 7 days of live data** (live days only, excluding the pre-live artefact):
 
 - daily planned against actual discharge;

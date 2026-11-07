@@ -432,3 +432,27 @@ run the actuator holds the existing idle intent (charge off, discharge off, neut
 until then, and only afterwards turns it off. The hold is a field of the directive, subject to the kill switch and the
 guard like any intent; a guard failure ends its effect (it is idle anyway). The service reads the balance sensors and
 Home Assistant's `time_zone` (`GET /api/config`, already allowed) and writes nothing else.
+
+## Amendment 2026-11-07 (load-following discharge)
+
+Decision 4's discharge row is extended, **only with `actuation.load_following.enabled`** (off in the code default;
+the owner enables it in the deployed config): in a `discharge` slot, while the measured SOC is at or above the
+plan's end-of-slot SOC for that slot (the intent's `soc_target_frac`), the system discharge cap is raised from
+`max(P, min_discharge_cap_w)` to `load_following.max_w` (null: `max_discharge_cap_w`). It engages at the plan SOC +
+`soc_hysteresis_pct` (1 point) and releases below the plan SOC; a charge, idle or safe-idle tick resets it.
+
+Why the cap may now exceed the planned power. The cap was the plan's power so that the battery delivered what the
+plan priced, but the plan's power is an average of a forecast load. Live data of 2026-11-04 to 11-07 showed evening
+peaks of 1.5 to 1.9 kW, mostly a 30-minute heat-pump hot-water cycle of about 1.4 kW whose timing the forecast gets an hour
+wrong (summer time ended 2026-10-25), against a cap of about 1 kW: only 64% of the planned evening discharge was delivered (84% was deliverable at the measured load; of the gap, about 60% came from the cap and 40% from the margin and control tracking), the battery ended every evening at 40 to 49% SOC while the grid covered peak-price load, and the realised
+saving was 74 to 81% of the perfect-foresight one. Above the plan SOC the battery holds more than the plan needs at
+the end of the slot, so covering the real load down to that SOC spends no energy the plan keeps for later slots (only
+the slot's own planned energy, sooner, plus anything left over from earlier under-delivery), and the 15-minute
+replan from the measured SOC re-plans the rest. Below the plan SOC the planned cap is kept.
+
+What does not change: the write path (same entity, `number.set_value`, the guard's bound `[min_discharge_cap_w,
+max_discharge_cap_w]` is not widened; `load_following.max_w` must lie inside it, checked at config load), the PD
+target (`discharge_margin_w`, so no export), the write ordering, the kill switch, the heartbeat, the guard and the
+planner (`discharge_margin_bound` included). The ceiling is at most `max_discharge_cap_w` (≤ 2500 W, the Venus
+rating); Omnibattery's per-battery caps and its temperature limit still bound the real power below the system cap.
+Operations: [service](../service.md#load-following-discharge).

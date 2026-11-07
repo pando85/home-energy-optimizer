@@ -73,6 +73,9 @@ for `k_c` 11.7 to 8.7; PR #91's 1.8 kW at 45 degC used the discharge gain).
   upgraded (the curve, the temperature source or the driver minimum may change).
 - The system charge caps change (the curve scales with them), or a second battery is added.
 - The sensor jumps (a firmware change that alters register 35000) or the discharge switch is enabled (the discharge gain is a prior).
+- Load-following discharge is enabled (`actuation.load_following`, [regime log](regime-log.md)): discharges up to 2.5 kW
+  become normal, far above the 0.82 kW the discharge gain was seen at, so a charge after an evening discharge starts hotter.
+  Re-read `k_d` on the first week of such discharges; the gain stays a prior until then.
 
 ## Recalibrate by
 

@@ -40,6 +40,7 @@ from battery_optimizer.service.config import (
     FullChargeCadence,
     FullChargeEntities,
     FullChargeSettings,
+    LoadFollowingSettings,
     load_service_config,
 )
 from battery_optimizer.service.entity_store import EntityStore
@@ -2101,3 +2102,291 @@ def test_enabling_the_feature_requires_its_inputs(tmp_path, override, message):
     off = {k: v for k, v in override.items() if k.startswith("full_charge.")}
     if off:
         load_service_config(write_service_config(tmp_path, **off))
+
+
+# ---------------------------------------------------------------------------
+# Load-following discharge (ADR-0007 amendment 2026-11-07)
+# ---------------------------------------------------------------------------
+
+LF = replace(SETTINGS, load_following=LoadFollowingSettings(enabled=True, max_w=2500.0))
+CAP = "omnibattery_system_max_discharge_power"
+
+
+def lf_intent(mode="discharge", power=1000.0, soc_target=0.5, **kw) -> ShadowIntent:
+    return replace(intent(mode, power, **kw), soc_target_frac=soc_target)
+
+
+def caps(ha):
+    return [v for _, e, v in ha.writes() if e == CAP]
+
+
+def set_soc(store, clock, soc, seconds=30):
+    clock.advance(seconds)
+    store.apply(entity_state(GRID, 400, clock.now()))
+    store.apply(entity_state(ENTS.battery_soc, soc, clock.now()))
+
+
+def lf_snapshot(actuator):
+    from battery_optimizer.service.metrics import _actuator_families
+
+    return {
+        f.name: [s.value for s in f.samples]
+        for f in _actuator_families(actuator.snapshot())
+        if "load_following" in f.name
+    }
+
+
+def test_load_following_raises_the_cap_to_the_ceiling_above_the_plan_soc():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=60)
+    actuator, ha, _ = make(clock, store, settings=LF)
+    record = tick(actuator, ctx(clock, lf_intent(soc_target=0.5)))
+    # same ordering as the planned cap: before the limits, the margin and the direction
+    assert ha.writes() == [
+        ("number.set_value", CAP, 2500.0),
+        ("switch.turn_on", "omnibattery_system_power_limits", None),
+        ("number.set_value", "omnibattery_pd_target_grid_power", 50.0),
+        ("switch.turn_on", "venus_battery_allow_discharge", None),
+    ]
+    desired = record["desired"]
+    assert desired["load_following"] is True and desired["max_discharge_w"] == 2500.0
+    assert desired["planned_max_discharge_w"] == 1000.0
+    assert desired["load_following_floor_pct"] == 50.0
+    assert desired["pd_target_w"] == 50.0  # the margin is unchanged: never export
+    assert lf_snapshot(actuator) == {
+        "battery_optimizer_actuator_load_following_engaged": [1.0],
+        "battery_optimizer_actuator_load_following_raise_watts": [1500.0],
+    }
+
+
+def test_load_following_keeps_the_planned_cap_below_the_plan_soc():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=49)
+    actuator, ha, _ = make(clock, store, settings=LF)
+    record = tick(actuator, ctx(clock, lf_intent(soc_target=0.5)))
+    assert caps(ha) == [1000.0]
+    assert record["desired"]["load_following"] is False
+    assert record["desired"]["planned_max_discharge_w"] == 1000.0
+    assert lf_snapshot(actuator) == {
+        "battery_optimizer_actuator_load_following_engaged": [0.0],
+        "battery_optimizer_actuator_load_following_raise_watts": [0.0],
+    }
+
+
+@pytest.mark.parametrize("mode", ["charge", "idle"])
+def test_load_following_leaves_charge_and_idle_slots_unchanged(mode):
+    runs = []
+    for settings in (SETTINGS, LF):
+        clock = FakeClock(NOW)
+        store = world(clock, grid=400, ac=0, soc=90, discharge="on", limits="on", cap=800)
+        actuator, ha, _ = make(clock, store, settings=settings)
+        record = tick(actuator, ctx(clock, lf_intent(mode, soc_target=0.2)))
+        runs.append((ha.writes(), record["desired"]))
+    assert runs[0] == runs[1]
+    assert "load_following" not in runs[1][1]
+    assert CAP not in [e for _, e, _ in runs[1][0]]
+
+
+@pytest.mark.parametrize(
+    "off",
+    [SETTINGS, replace(SETTINGS, load_following=LoadFollowingSettings(max_w=2500.0))],
+)
+def test_load_following_disabled_is_todays_behaviour(off):
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=90)
+    actuator, ha, _ = make(clock, store, settings=off)
+    record = tick(actuator, ctx(clock, lf_intent(soc_target=0.2)))
+    assert caps(ha) == [1000.0]
+    assert "load_following" not in record["desired"]
+    assert "planned_max_discharge_w" not in record["desired"]
+    assert "load_following" not in actuator.snapshot()
+    assert lf_snapshot(actuator) == {}
+
+
+@pytest.mark.parametrize(
+    ("max_w", "max_cap", "entity_max", "power", "cap"),
+    [
+        (2500.0, 2500.0, 2000, 1000.0, 2000.0),  # the entity's own max
+        (None, 1800.0, 2500, 1000.0, 1800.0),  # max_w unset: actuation.max_discharge_cap_w
+        (3000.0, 2200.0, 2500, 1000.0, 2200.0),  # never above max_discharge_cap_w
+        (1500.0, 2500.0, 2500, 2400.0, 2400.0),  # never below the planned cap
+        (1500.0, 2500.0, 2500, 30.0, 1500.0),  # a tiny plan still has the 100 W floor beneath
+    ],
+)
+def test_load_following_ceiling_is_clamped_to_every_bound(max_w, max_cap, entity_max, power, cap):
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=80)
+    clock.advance(1)
+    store.apply(
+        entity_state(
+            ENTS.max_discharge_power,
+            0,
+            clock.now(),
+            attributes={"min": 0, "max": entity_max, "step": 1},
+        )
+    )
+    settings = replace(
+        SETTINGS,
+        max_discharge_cap_w=max_cap,
+        load_following=LoadFollowingSettings(enabled=True, max_w=max_w),
+    )
+    actuator, ha, _ = make(clock, store, settings=settings)
+    record = tick(actuator, ctx(clock, lf_intent(power=power, soc_target=0.5)))
+    assert caps(ha) == [cap]
+    assert record["desired"]["load_following"] is True
+
+
+@pytest.mark.parametrize(("soc", "engaged"), [(10.0, False), (10.9, False), (11.0, True)])
+def test_load_following_never_goes_below_the_plans_minimum_soc(soc, engaged):
+    # The plan's end-of-slot SOC is the floor; at the planner's minimum SOC (10%) the measured
+    # SOC must exceed it by the hysteresis before the cap is raised.
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=soc)
+    actuator, ha, _ = make(clock, store, settings=LF)
+    tick(actuator, ctx(clock, lf_intent(power=400.0, soc_target=0.10)))
+    assert caps(ha) == [2500.0 if engaged else 400.0]
+
+
+def test_load_following_hysteresis_engages_above_and_releases_below_the_plan_soc(caplog):
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=50.5)
+    actuator, ha, _ = make(clock, store, settings=LF)
+    the_intent = lf_intent(soc_target=0.5)
+    states = []
+    with caplog.at_level("INFO", logger="battery_optimizer.service.actuator"):
+        for soc in (50.5, 51.0, 50.0, 50.0, 49.9, 50.5, 50.9, 51.0):
+            set_soc(store, clock, soc, seconds=10)
+            record = tick(actuator, ctx(clock, the_intent))
+            states.append(record["desired"]["load_following"])
+    # needs 51 to engage, holds at 50 (the plan SOC), releases below it, needs 51 again
+    assert states == [False, True, True, True, False, False, False, True]
+    assert caps(ha) == [1000.0, 2500.0, 1000.0, 2500.0]  # one write per edge, no flapping
+    lines = [r.getMessage() for r in caplog.records if "load_following=" in r.getMessage()]
+    assert [line.split()[1] for line in lines] == [
+        "load_following=on",
+        "load_following=off",
+        "load_following=on",
+    ]
+
+
+def test_load_following_latch_carries_over_discharge_slots_and_resets_otherwise():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=52)
+    actuator, ha, _ = make(clock, store, settings=LF)
+    tick(actuator, ctx(clock, lf_intent(soc_target=0.5)))
+    assert actuator.desired.load_following is True
+    # next discharge slot: its own plan SOC (48%), judged with the release threshold
+    nxt = SLOT + timedelta(minutes=15)
+    clock.advance((nxt - clock.now()).total_seconds())
+    set_soc(store, clock, 48.5, seconds=0)
+    tick(actuator, ctx(clock, lf_intent(soc_target=0.48, valid_from=nxt)))
+    assert actuator.desired.load_following is True
+    # an idle slot resets the latch; the next discharge slot needs the hysteresis again
+    idle = nxt + timedelta(minutes=15)
+    clock.advance((idle - clock.now()).total_seconds())
+    set_soc(store, clock, 48.5, seconds=0)
+    tick(actuator, ctx(clock, lf_intent("idle", valid_from=idle)))
+    assert actuator.desired.load_following is None
+    after = idle + timedelta(minutes=15)
+    clock.advance((after - clock.now()).total_seconds())
+    set_soc(store, clock, 48.5, seconds=0)
+    tick(actuator, ctx(clock, lf_intent(soc_target=0.48, valid_from=after)))
+    assert actuator.desired.load_following is False
+    assert caps(ha)[-1] == 1000.0
+
+
+def test_load_following_latch_resets_on_a_guard_failure():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=51)
+    actuator, _, _ = make(clock, store, settings=LF)
+    tick(actuator, ctx(clock, lf_intent(soc_target=0.5)))
+    assert actuator.desired.load_following is True
+    set_soc(store, clock, 50)
+    tick(actuator, ctx(clock, lf_intent(soc_target=0.5), price_fresh=False))
+    assert actuator.desired.mode == "safe_idle"
+    set_soc(store, clock, 50)
+    tick(actuator, ctx(clock, lf_intent(soc_target=0.5)))
+    assert actuator.desired.load_following is False  # 50 < 50 + 1: not re-engaged
+
+
+def test_load_following_in_dry_run_records_the_raised_cap_and_sends_nothing():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=60)
+    records: list = []
+    actuator, ha, metrics = make(clock, store, mode="dry_run", settings=LF, records=records)
+    record = tick(actuator, ctx(clock, lf_intent(soc_target=0.5)))
+    assert ha.calls == []
+    cap = [w for w in record["writes"] if w["role"] == "max_discharge_power"]
+    assert cap == [
+        {
+            "role": "max_discharge_power",
+            "entity_id": ENTS.max_discharge_power,
+            "service": "number.set_value",
+            "value": 2500.0,
+            "result": "dry_run",
+        }
+    ]
+    assert record["desired"]["load_following"] is True and record["sent"] is False
+    assert records == [record]
+    assert counter(metrics, "actuator_writes", role="max_discharge_power", result="dry_run") == 1
+    # released: the would-be write back to the planned cap is recorded too, still nothing sent
+    set_soc(store, clock, 49)
+    released = tick(actuator, ctx(clock, lf_intent(soc_target=0.5)))
+    assert [(w["role"], w["value"], w["result"]) for w in released["writes"]] == [
+        ("max_discharge_power", 1000.0, "dry_run")
+    ]
+    assert ha.calls == [] and store.get(ENTS.max_discharge_power).numeric() == 0
+
+
+def test_load_following_config_defaults_off_and_does_not_change_the_plan_identity(tmp_path):
+    committed = load_service_config(REPO / "config" / "service.yaml")
+    assert committed.actuation.load_following == LoadFollowingSettings()
+    assert committed.actuation.load_following.enabled is False
+    on = load_service_config(
+        write_service_config(
+            tmp_path,
+            **{
+                "actuation.load_following": {
+                    "enabled": True,
+                    "max_w": 2500,
+                    "soc_hysteresis_pct": 2,
+                }
+            },
+        )
+    )
+    assert on.actuation.load_following == LoadFollowingSettings(True, 2500.0, 2.0)
+    assert on.config_hash() == committed.config_hash()
+
+
+def test_load_following_ceiling_stays_inside_the_guard_allowlist(tmp_path):
+    from battery_optimizer.service.ha_guard import actuation_allowlist, actuation_request
+
+    config = load_service_config(
+        write_service_config(tmp_path, **{**LIVE, "actuation.load_following.enabled": True})
+    )
+    allowlist = actuation_allowlist(config)
+    assert allowlist is not None
+    ceiling = config.actuation.load_following_ceiling_w
+    assert ceiling == 2500.0
+    assert allowlist.numbers[ENTS.max_discharge_power] == (100.0, 2500.0)  # unchanged
+    frame = actuation_request(
+        1, "number", "set_value", ENTS.max_discharge_power, {"value": ceiling}, allowlist
+    )
+    assert frame["service_data"] == {"value": 2500.0}
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"actuation.load_following.max_w": 3000}, "within \\[min_discharge_cap_w"),
+        ({"actuation.load_following.max_w": 50}, "within \\[min_discharge_cap_w"),
+        ({"actuation.load_following.max_w": 0}, "max_w must be > 0"),
+        ({"actuation.load_following.soc_hysteresis_pct": 0}, "soc_hysteresis_pct must be > 0"),
+        ({"actuation.load_following.soc_hysteresis_pct": 11}, "soc_hysteresis_pct must be <="),
+        ({"actuation.load_following.enabled": "yes"}, "enabled must be true or false"),
+        ({"actuation.load_following.bogus": 1}, "unknown actuation.load_following keys"),
+    ],
+)
+def test_invalid_load_following_config_is_refused(tmp_path, override, message):
+    with pytest.raises(ValueError, match=message):
+        load_service_config(write_service_config(tmp_path, **override))

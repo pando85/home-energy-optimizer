@@ -124,6 +124,13 @@ IDs, import cap, margins, command policy, freshness) is documented in
 measured `actuation.battery_ac_power_sign`, and `live` also without `planning.soc_source: entity`. Changing the
 mode is a homelab config change of the deployed `service.yaml`, never an environment variable.
 
+`actuation.load_following` (`enabled`, `max_w`, `soc_hysteresis_pct`; **off by default**) lets a planned discharge
+follow the real house load: in a discharge slot, while the measured SOC is at or above the plan's end-of-slot SOC,
+the system discharge cap is raised from the planned power to `max_w` (null = `max_discharge_cap_w`, and never
+outside `[min_discharge_cap_w, max_discharge_cap_w]`, the guard's existing bound). It adds no entity, service call or
+credential and is excluded from the plan's config hash; see
+[service.md](service.md#load-following-discharge).
+
 The `full_charge:` section (periodic full charge for cell balancing, **off by default**) is documented in
 [service.md](service.md#periodic-full-charge-the-weekly-charge-enabler) (keys, the
 [scheduler](service.md#periodic-full-charge-the-scheduler) and

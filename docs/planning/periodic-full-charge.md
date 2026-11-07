@@ -185,6 +185,26 @@ Where the code differs from the text above (the code is what the tests cover):
 - **Startup checks**: Home Assistant's `time_zone` (REST `get_config`) and the weekly-entity contract suspend the
   feature (no directive: hands off) and alert; the entity check self-heals, the time-zone check retries every 60 s.
 
+## Observation 2026-11-06: BMS top-out at a displayed 89%
+
+Recorded from the live data, read only ([regime log](../components/regime-log.md)); it happened during a planned
+charge, not a full-charge run.
+
+- At about 13:57 UTC one cell reached **3.591 V at a displayed 89% SOC**, with an **82 mV** cell spread.
+- The BMS stopped the charge at about **1590 W with no taper** and the displayed SOC jumped to 100%.
+- Before the top-out the displayed SOC **under-read by about 11 points**; afterwards it matched the DC integral.
+
+What it means for this plan:
+
+- It supports the periodic full charge: between top-outs the displayed SOC drifts by this much, and a top-out is what
+  re-anchors it (and what the balancing needs).
+- The taper start `taper.start_soc_frac` 0.90 ([section 5](#5-lp-formulation)) **has no measured basis**: the cell hit
+  its limit below a displayed 90% and the charge stopped without any taper, so a taper keyed to the displayed SOC can
+  start too late or not match the BMS at all. It stays provisional, and the first supervised run must record the
+  cell voltages and the AC power from well below 90% (the recalibration of [section 11](#11-component-records-and-regime-log)).
+- A cell spread of 82 mV at the top is a data point for the balance cadence ([A3](#a3-adaptive-cadence)); it is not a
+  balance reading of Omnibattery's monitor and does not count as one.
+
 ## 1. Goal and owner decisions
 
 The Marstek Venus E V3 (5.12 kWh, LFP) needs a charge to 100% from time to time so that its BMS balances the cells at
@@ -687,7 +707,7 @@ Answers recorded 2026-11-04; the original questions follow the table.
 |---|---|---|
 | 1 | Cadence | **Answered: adaptive** (10/14, 14/28, 7/14, 5/7 days by balance status), [A3](#a3-adaptive-cadence) |
 | 2 | Threshold scale | Open: set from the `dry_run` distribution, now over the active row's `[min, max]` |
-| 3 | Taper parameters | Open: provisional until the first supervised run (the settle hold and the reading are recorded then too) |
+| 3 | Taper parameters | Open: provisional until the first supervised run (the settle hold and the reading are recorded then too); the [2026-11-06 top-out](#observation-2026-11-06-bms-top-out-at-a-displayed-89) shows `start_soc_frac` 0.90 has no measured basis |
 | 4 | Bootstrap | **Answered: eligible as soon as the feature is enabled**, forced at `max` days from enablement, first live run supervised, [A4](#a4-first-run) |
 | 5 | Service-owned entities | Open: not addressed by the amendment (the service still owns the weekly switch while enabled) |
 | 6 | Homelab watchdog | Standing prerequisite for unattended `live` use; listed as a step of [battery-longevity.md](battery-longevity.md#4-steps) |

@@ -255,6 +255,17 @@ actuation:
   # Go-live: the system caps are 2500/2500 W and Premium mode is on in the Marstek app; without
   # Premium the firmware limits discharge to 800 W, below what this cap and the planner assume.
   max_discharge_cap_w: 2500       # <= 2500
+  # Load-following discharge (ADR-0007 amendment 2026-11-07), OFF by default.  In a planned
+  # discharge slot, while the measured SOC is at or above the plan's end-of-slot SOC, the discharge
+  # cap above is raised from the plan's power to max_w, so the battery covers the real load (an
+  # evening heat-pump hot-water cycle the forecast placed an hour off) instead of the forecast
+  # one; the PD target stays discharge_margin_w, so no export.  It engages at plan SOC +
+  # soc_hysteresis_pct and releases below the plan SOC.  max_w: null = max_discharge_cap_w; it
+  # must lie in [min_discharge_cap_w, max_discharge_cap_w], the guard's bound on the cap.
+  load_following:
+    enabled: false
+    max_w: null
+    soc_hysteresis_pct: 1
   # Omnibattery integration_status values in which the intent may be applied; any other
   # (manual, grid_charging, backup_mode, initializing, a competing strategy...) holds safe idle.
   healthy_states: [balanced, charging, discharging]
