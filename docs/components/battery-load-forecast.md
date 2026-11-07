@@ -32,6 +32,9 @@ runs it as the causal mode of `day_ahead` and `rolling_horizon`. Owner: this rep
 - The last 28 days resemble the next day. Heat-pump load is the largest slot-irregular component under the
   legacy rule, so it is what makes the forecast poor ([decompose-load](../cli.md#decompose-load)).
 - Load is exogenous: the battery never changes it. Decoupling makes this more true.
+- **The servers are in the forecast.** Gross load = grid - charge + discharge keeps the servers on the battery's
+  backup port in, so the forecast already includes their flat load (about a third of the gross load, see
+  [battery-model](battery-model.md)); no forecaster change is needed for them.
 
 ## Invalidated when
 
@@ -39,6 +42,9 @@ runs it as the causal mode of `day_ahead` and `rolling_horizon`. Owner: this rep
   hours into 08:00 to 12:00 (weekday optimum start) and 09:00 weekend preheat. For up to 28 days the window
   mixes both shapes and the forecast under-reads exactly where discharge pays most.
 - Weekday and weekend schedules differ (12:00 against 09:00): the weekday-blind mean is structurally wrong.
+- **A clock change (summer time starts or ends).** The forecaster averages 28 days of local-time slots, but a
+  heat-pump hot-water cycle that stays fixed in UTC moves one local hour. It then sits in the wrong slot for up to 28
+  days: seen after 2026-10-25, correcting itself around 2026-11-22, and it will recur at the March 2027 change.
 - Boost runs: it smears rare large loads into the same clock slots of other days.
 - C7-F alternating-arm weeks mix arms in one window; the battery is commissioned (gross-load rebuild
   needed); a large new load appears.
@@ -73,6 +79,19 @@ below use `plan="day_ahead"` or `"final"`; metrics are prefixed `battery_optimiz
 
 Offline, per slot and over a window: `uv run python hack/day_ahead_kpis.py --from <day> --to <day>`; compare the
 two plans over the same window.
+
+## Live review (2026-11-07)
+
+Live data 2026-11-03 22:45 to 2026-11-07 07:30 UTC, about 80 h, scored on the final plan.
+
+- **Evening peak about 1 h late: a clock-change artefact, not a forecaster defect.** The roughly 1.4 kW, 30-minute
+  heat-pump hot-water cycle stayed fixed in UTC after 2026-10-25, while the forecaster averages local-time slots
+  over 28 days. It corrects itself around 2026-11-22. **Unverified:** whether the hot-water job in `dhw_control.py`
+  (or in Home Assistant) is scheduled in UTC.
+- Error on the final plan: about 0.08 kWh per slot. Bias: night heat-pump spikes are under-forecast, 20 to 23 h is
+  over-forecast by about 65 to 85 W.
+- **To do:** recheck forecast quality (gate G2) after 2026-11-22, the end of the 28-day settling window, and again
+  after the March 2027 change. This was a diagnosis, not a recalibration: the status below is unchanged.
 
 ## Status
 

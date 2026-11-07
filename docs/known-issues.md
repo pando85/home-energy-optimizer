@@ -235,11 +235,36 @@ setting) would allow a smaller margin still.
 
 **Analysis 2026-11-06: no PD defect.** 66 h of 2-second data at the baseline settings showed a steady discharge
 error std of about 24 W and no limit cycle. Export comes almost only from load-down steps while the battery is
-pinned at its per-slot cap, because of 1 to 4 s of dead time (the feedforward's 2-sample confirm plus
-Modbus and inverter); gains cannot remove it. On 2026-11-06 09:30 UTC the owner changed
+pinned at its per-slot cap, because of 1 to 4 s of dead time (the grid meter's update lag, the wait for the next
+cycle, Modbus and inverter); gains cannot remove it. On 2026-11-06 09:30 UTC the owner changed
 `pd_min_cycle_interval` 1.0 -> 0.5 s and kp 0.35 -> 0.40 ([regime log](components/regime-log.md)). The full
 settings log and the evaluation criteria are in the homelab deployment doc, section "Omnibattery PD controller
 settings log".
+
+**Correction 2026-11-07.** The first analysis blamed the feedforward's 2-sample confirm for the load-down dead time. A
+load-down is corrected by Omnibattery's `_apply_discharge_ceiling` guard (`control/residual_load.py`, Omnibattery
+1.5.1b1), not by the feedforward: after the rate limiter it caps the discharge at grid + battery AC power - target, and
+removes a step in one cycle (three events matched its prediction within 1 to 2 W). kp, kd and `max_power_change` do not
+decide load-downs. A cycle runs on every Shelly update plus a 2 s timer; because the timer resets the throttle clock, an
+update dropped inside `pd_min_cycle_interval` waits up to about 2 s (about 50% of updates at 1.0 s, about 25% at 0.5 s).
+Without the guard, cutting 1.4 kW takes 5 to 6 cycles, about 10 to 12 s.
+
+**Interim verdict on the owner's change, 2026-11-07: keep, no revert criterion hit.** Oscillation 0 s after the change
+(6 episodes before, longest 120 s); 4 export episodes, longest 2.0 s, largest 0.20 Wh; `non_responsive_batteries`
+`None` throughout; maximum import while charging 4563 W against the 4700 W limit, but only about 0.9 h of charging, so
+weak evidence; steady 60 s std median/p90/p99 of 10/16/30 W after against 12/29/54 W before. The 7-day review is due
+around 2026-11-13. Meter timing (the Shelly's mean update interval 1.69 s, dropouts of 12 to 35 s about 20 times
+between 2026-11-03 and 11-05 and none since the Home Assistant restart on 11-05 17:18 UTC, during which Omnibattery
+holds its last command) is in the homelab doc.
+
+**Export expected with load-following (0.15.0).** With the cap raised, a load-down step leaves a peak export of about
+the step minus 100 W, 1.3 to 1.8 kW for about 2 s: 1 to 2 Wh per event, 2 to 10 Wh per evening, a negligible cost. A
+load drop during a Shelly dropout is the rare worst case, about 15 Wh. This exceeds the 0.5 Wh per-episode revert
+criterion and may trip `BatteryGridExport` (5 Wh/24 h); the owner chose to keep that alert at 5 Wh. An optional owner
+lever is `pd_min_cycle_interval` 0, which cuts about 15 to 20% of the export at the cost of more Modbus traffic.
+**Open:** whether the grid registration is "self-consumption without surplus" (zero export required; RD 244/2019,
+UNE 217001-IN). Check with the installer, as part of
+[TODO-0.6](planning/home-battery-optimizer-implementation.md).
 
 ### The battery holds its last command when Home Assistant is down
 
@@ -357,7 +382,8 @@ recalibrate the load forecast ([battery-load-forecast](components/battery-load-f
 
 **Evening finding (2026-11-04 to 11-07) and second fix (code default off).** The evening peaks reach 1.5 to 1.9 kW,
 mostly a 30-minute heat-pump hot-water cycle of about 1.4 kW that the forecast places an hour off since the end of
-summer time, while the discharge cap is the plan's power (about 1 kW): only 64% of the planned evening discharge was delivered (84% was deliverable at the measured load; of the gap, about 60% came from the cap and 40% from the margin and control tracking); the battery ended
+summer time (a clock-change artefact that corrects itself around 2026-11-22, see
+[battery-load-forecast](components/battery-load-forecast.md#live-review-2026-11-07)), while the discharge cap is the plan's power (about 1 kW): only 64% of the planned evening discharge was delivered (84% was deliverable at the measured load; of the gap, about 60% came from the cap and 40% from the margin and control tracking); the battery ended
 every evening at 40 to 49% SOC. `actuation.load_following` raises the cap to 2500 W in discharge slots while the
 measured SOC is at or above the plan's end-of-slot SOC ([service](service.md#load-following-discharge)); off in the
 code default, enabled in the deployed config with release 0.15.0 on 2026-11-07 (owner decision, regime log).
@@ -376,6 +402,28 @@ If the shortfall remains after the bound, the bias dominates: recalibrate the fo
 per-slot cap whenever the load allowed, with no temperature or actuator derating. The gap is load below forecast:
 the evening peak was forecast about 1 h late and overestimated. Lesson: 15-minute means mix load-limited and
 cap-limited minutes, so do not infer an actuator shortfall from them. Next review about 2026-11-11 (7 live days).
+
+## Battery losses and idle drain are not in the model
+
+Status: **open, proposed for the 7-day review (around 2026-11-11 to 11-14).** Live data 2026-11-03 22:45 to 2026-11-07
+07:30 UTC (about 80 h) disagree with the model's scalar 0.80 round trip and zero idle draw
+([battery-model](components/battery-model.md#calibrated-on)).
+
+- Measured per-leg efficiency about 0.92 charging and 0.90 discharging, about 0.835 round trip. The discharge loss is
+  roughly constant at 36 to 47 W (efficiency about 0.86 at 250 W, 0.95 at about 1 kW) and the charge loss is about 25 W
+  plus 6.7%, so efficiency depends on power.
+- An idle drain: the idle DC power reads about -30 W and seven idle runs of 3 to 6 h show the SOC falling at about
+  34 W. The cause is unknown, possibly standby of the backup port. At this duty cycle the all-in round trip is about 0.75.
+- The apparent "missing" energy is these losses, not the servers (flat, about 240 W on the backup port, already in
+  the gross load the forecaster learns).
+- Proposal: a fixed overhead plus a proportional efficiency, and the drain in the SOC dynamics (battery block of
+  `config/tariff.yaml`, `battery.py`, `oracle.py`). Not applied: it re-mints every `dataset_id`.
+
+## No outage reserve for the servers on the backup port
+
+Status: **open, owner decision pending.** The servers (flat, about 240 W) sit on the battery's backup (EPS) port, but
+the planner keeps no state-of-charge reserve for an outage. The 20% SOC floor covers about 3.5 h of them. Adding a
+reserve is a planner and cost trade-off that the owner has not decided ([battery-model](components/battery-model.md)).
 
 ## Charge pauses: allow_charge off 25 to 30 s while charging
 
