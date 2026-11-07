@@ -63,6 +63,12 @@ for `k_c` 11.7 to 8.7; PR #91's 1.8 kW at 45 degC used the discharge gain).
 - Discharge heats the battery too: the Venus internal temperature reached 40 degC at about 900 W of discharge
   (2026-11-05 evening). The 40 degC charge temperature limit (band 10, floor 40 %) can therefore already be active when a
   charge starts after a discharge, which matters for the first full charge.
+- **Open item, cooling (2026-11-07).** The shadow model at 09:04 UTC on 2026-11-07 showed status `degraded`, `tau` about
+  54 min and a fitted ambient of about 34 degC, and the battery reached 40 degC at about 900 W of discharge. A cooling
+  controller exists in the homelab (an ESPHome Sinilink XY-WFMS, homelab PR #4752). Its value is unquantified: the
+  case for fans rests on battery longevity more than on the energy the derate costs. A deeper analysis is scheduled for
+  the 7-day review, once load-following data exists: measure how much charge temperature derating cost and whether it
+  limited the evening discharge, then propose fan thresholds.
 - Omnibattery's curve is the documented one (1 up to the limit, linear to the floor over the band, continuous, no hysteresis,
   never below the driver minimum, no temperature means no derate), checked only between 48.3 and 50.2 degC.
 

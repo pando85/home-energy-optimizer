@@ -24,15 +24,35 @@ discharge on the temporary test socket, below the modelled 2.5 kW. Confirmed fro
 5.0 kW contracted import limit. Provisional values are in the next section. Datasets built at
 `config_hash` `7a901801...` (RTE 0.80); everything computed at the earlier 0.88 is superseded.
 
+**Measured on live data, not adopted (2026-11-07; about 80 h, 2026-11-03 22:45 to 2026-11-07 07:30 UTC).**
+
+- Per-leg efficiency about 0.92 charging and 0.90 discharging, about 0.835 round trip, against 0.80 in the model.
+- The discharge loss is roughly constant at 36 to 47 W, so efficiency depends on power: about 0.86 at 250 W and
+  0.95 at about 1 kW. The charge loss is about 25 W plus 6.7% of the power.
+- The apparent "missing" energy is conversion loss plus an idle drain, not the servers. The idle DC power reads
+  about -30 W, and seven idle runs of 3 to 6 h show the SOC falling at about 34 W. The cause is unknown, possibly
+  standby of the backup port.
+- At this duty cycle the all-in round trip, drain included, is about 0.75.
+- **Servers on the backup (EPS) port.** The load is flat, about 240 W (p5 to p95 220 to 276 W, maximum 370 W), about a
+  third of the house's gross load. While idle or charging they pass through from the grid and are not in the AC
+  charge counter (the integrated AC charge power matches the counter); while discharging they are in the
+  discharge counter, and about 69% of the AC discharge went to them. The model has no backup-port load (it plans
+  the house load, servers included, see [battery-load-forecast](battery-load-forecast.md)).
+- **No outage reserve.** The planner keeps none for the servers: the 20% SOC floor covers about 3.5 h of them in an
+  outage. Whether to add a reserve is the owner's decision, open.
+- **Proposed for the 7-day review (around 2026-11-11 to 11-14), not now:** model a fixed overhead plus a
+  proportional efficiency instead of the scalar, and add the idle drain to the SOC dynamics. It touches the battery
+  block of `config/tariff.yaml` (every `dataset_id` re-minted), `battery.py`, `oracle.py` and this page.
+
 ## Assumptions
 
 | Parameter | Value | Basis |
 |---|---|---|
-| Round-trip efficiency | 0.80 (0.89443 per leg) | Owner choice 2026-10-24, bottom of the 0.80 to 0.84 range reported by others; a scalar, not a curve |
+| Round-trip efficiency | 0.80 (0.89443 per leg) | Owner choice 2026-10-24, bottom of the 0.80 to 0.84 range reported by others; a scalar, not a curve. Measured 2026-11-07, not adopted: about 0.835 round trip, power-dependent, about 0.75 all-in with the idle drain (see Calibrated on) |
 | SOC window | 0.20 to 0.95 (3.84 kWh usable), **except on a chosen full-charge day, when the ceiling is 1.00** (ceiling 0.95 before that day, 1.00 from its start to the horizon end) | Owner's life-extension choice; real controller limits not read. The lifted day is chosen by the scheduler of [the periodic full-charge plan](../planning/periodic-full-charge.md) (off by default, `full_charge.enabled`); after completion the actuator holds the battery idle for `settle_timeout_s` (300 s) so Omnibattery's cell-spread measurement is not taken under load |
 | Charge limit near full | 200 W once a cell latches at 3.48 V (Omnibattery's `switch.venus_full_charge_voltage_taper`, voltage-latched, not SOC-based); modelled by one convex half-space per slot of the full-charge day, a ramp from full power at `taper.start_soc_frac` down to `taper.power_kw` at 100%. **Provisional**: `start_soc_frac` 0.90 and `power_kw` 0.2 are not measured, and the ramp is a relaxation of the real step (it allows more than 200 W just above the start), so it only binds when `start_soc_frac` is lower; `start_soc_frac: null` drops the rows | Omnibattery source read 2026-11-04 (plan section 2); to be calibrated on the first supervised run |
 | Initial SOC | 0.20 | Floor, so no free stored energy |
-| Idle draw | 0, not modelled | `battery.py`; unmeasured |
+| Idle draw | 0, not modelled | `battery.py`. Measured 2026-11-07, not adopted: the SOC falls at about 34 W when idle, cause unknown |
 | High-SOC dwell cost | 0 (off); study value 0.01 EUR/kWh/h above 0.90 (`planning.high_soc_cost_eur_per_kwh_h`, `high_soc_threshold_frac`) | LFP calendar ageing is worse at high SOC; a planning convention, not a measured rate, same status as the wear cost; [study](../planning/high-soc-dwell-cost.md). The SOC window itself is unchanged |
 | Thermal charge-power soft cap | 0 (off); study value 1.5 kW at 0.005 EUR/kWh (`planning.charge_soft_cap_kw`, `charge_soft_cap_eur_per_kwh`) | The internal temperature rose about 10 degC in a 50 min charge at about 1.4 kW (2026-11-04) and LFP ageing is worse hot; a convex price on AC kWh charged above the knee, a planning convention like the wear cost, not a thermal model. The knee is a documented conservative choice because the thermal fit rests on 21 h and two charge sessions; [study](../planning/thermal-charge-soft-cap.md). The 2.5 kW limit itself is unchanged |
 | Discharge import margin | 0 in the model; the live actuator keeps `actuation.discharge_margin_w` (100 W deployed since 2026-11-05, 200 W before) of grid import while discharging, so deliverable discharge is at most load minus that. Optional planner bound `planning.discharge_margin_bound` (code default off, enabled in the deployed config since 0.14.0, 2026-11-05) | Owner-chosen to stop brief exports (-10 to -94 W at 50 W, 2026-11-03); a control setting, not a battery parameter, so the model only notes it ([known issue](../known-issues.md#planned-discharge-is-not-delivered-planner-bound-enabled-since-0140-monitoring)) |
@@ -133,7 +153,8 @@ Observability only; they show whether the battery does what the model assumes. M
 **stale** (2026-11-04, reason added: the owner's Omnibattery Temperature Charge Limit now derates the charge power, see the assumptions table and the [regime log](regime-log.md)); first stale on 2026-11-03: the battery is commissioned and, since go-live (2026-11-03 23:45, regime log), live
 with Omnibattery's system caps at 2500 W charge / 2500 W discharge and Marstek Premium mode on (from the test
 socket's 1000/800 W: an "Omnibattery configuration changes limits" trigger, now matching the modelled 2.5 kW).
-RTE, SOC window and idle draw are still assumptions, and the wear cost (0.01) is a planning convention to be
+RTE, SOC window and idle draw are still assumptions (RTE and idle draw measured on 2026-11-07, not adopted: the
+proposal is in Calibrated on), and the wear cost (0.01) is a planning convention to be
 re-checked on measured data. Recalibrate by step 1 on the live cycles; idle draw was not set before go-live.
 The full-charge ceiling and taper rows (above) are provisional and unmeasured, which extends the same reason; no
 benchmark claim changes (the benchmark ladder does not model the full-charge day).

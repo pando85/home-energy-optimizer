@@ -43,7 +43,10 @@ and the data volume are deployed from the homelab repository.
   While discharging the battery feeds the backup port, and that supply is in the discharge counter
   (measured 2026-11-03 22:44 to 23:01 UTC, first live discharge: `sensor.venus_ac_power`, which includes the
   backup-port supply, integrates to 0.074 kWh, 0.072 kWh of it to the backup port; the discharge counter rose
-  0.08 kWh). So `grid - charge + discharge` keeps the servers in `gross_kwh` (no undercount).
+  0.08 kWh). So `grid - charge + discharge` keeps the servers in `gross_kwh` (no undercount). Over about 80 h of live
+  data (2026-11-07) the servers' about 240 W flat load is not in the AC charge counter (they pass through from the grid
+  while idle or charging; the integrated AC charge power matches the counter) and about 69% of the AC discharge went
+  to them.
   `sensor.venus_ac_power` likewise includes the supply to the backup (EPS) port, so it is not the load of the
   main circuit: measured, the plug net was about 14 W while `ac_power` read 259 W with the servers at 246 W.
 - `washer_plug` ends at `features.WASHER_PLUG_REFLASHED_AT` (2026-11-03 22:46 UTC, plug reflashed for

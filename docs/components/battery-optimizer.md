@@ -46,6 +46,8 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
   `target - normal` is a diagnostic only). The solve is a MILP with one binary per eligible slot: the target
   solve takes about 13 times the regular solve at the median (taper on, random windows) and about 1.5 s at the
   worst, against a 20 s limit.
+- **No outage reserve for the servers on the backup port.** The 20% SOC floor covers about 3.5 h of them (flat, about
+  240 W) in an outage; whether to reserve more is the owner's open decision ([battery-model](battery-model.md)).
 - Load is exogenous. The decoupled design keeps the objective unchanged; only price-driven heat-pump
   planning and a joint MPC are dropped ([ADR-0006](../adr/0006-decouple-heat-pump-comfort-from-battery-price-optimisation.md)).
 - The horizon ends at the last published price slot; there is no unpublished-price forecast live.
@@ -222,6 +224,15 @@ control change, recorded in the regime log: the status stays **stale** for the r
 evening discharge, end-of-evening SOC and realised-against-perfect-foresight saving are re-read on the first 7 days
 (the figures of 2026-11-04 to 11-07 are in the ADR amendment), and [battery-thermal](battery-thermal.md) re-reads the
 discharge gain.
+
+Decision quality, 2026-11-04 to 11-07 (review of 2026-11-07, live data, no change): realised savings were 74 to 81% of a
+perfect-foresight run under the deployed parameters, and 58 to 63% of one with the measured efficiencies
+([battery-model](battery-model.md)), no wear cost and no margin. The main cause on the discharge side is the cap at the
+planned power while real peaks reached 1.5 to 1.9 kW, which led to load-following in 0.15.0. On the charge side about
+79% of the planned charge was delivered, because of 351 minutes of charging above 40 degC under the owner's
+Temperature Charge Limit ([battery-thermal](battery-thermal.md)) plus the BMS stop at a displayed 89%
+([regime log](regime-log.md)). The measured efficiencies and idle drain are proposed for the 7-day review, not applied.
+The evening peak the plan misplaces is the clock-change artefact of [battery-load-forecast](battery-load-forecast.md).
 
 Slot decisions (2026-11-04, code only, regime log): a slot that opened without an intent adopts one later in
 the slot (`late_intent`, see [service](../service.md#scheduling-and-the-slot-cycle)), and a solve inside such a
