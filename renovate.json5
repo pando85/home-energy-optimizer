@@ -85,11 +85,15 @@
       groupSlug: 'github-actions',
     },
     {
+      description: 'Group all pre-commit hook updates and update once a month',
       matchManagers: [
         'pre-commit',
       ],
       groupName: 'pre-commit hooks',
       groupSlug: 'pre-commit-hooks',
+      schedule: [
+        'after 4am and before 10am on the first day of the month',
+      ],
     },
     {
       description: 'One uv version everywhere: CI action, Dockerfile image and pre-commit hook',
