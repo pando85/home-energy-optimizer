@@ -478,6 +478,13 @@ class ActuationSettings:
     battery_soc_max_age_s: float | None = None
     battery_ac_power_max_age_s: float | None = None
     load_following: LoadFollowingSettings = field(default_factory=LoadFollowingSettings)
+    #: Reserve protection (ADR-0007 amendment 2026-11-08): the AC charge power (W) the actuator
+    #: requests when the *measured* SOC is at or below the tariff's floor and the plan does not
+    #: already ask for more.  Modest and bounded, never above ``import_cap_w``; a control setting,
+    #: not an energy-model claim about the standby drain's cause.
+    soc_floor_recovery_w: float = 200.0
+    #: SOC points above the floor at which the reserve protection releases (anti-chatter).
+    soc_floor_hysteresis_pct: float = 1.0
 
     @property
     def load_following_ceiling_w(self) -> float:
@@ -1044,9 +1051,13 @@ _ACTUATION_KEYS = (
     "shutdown_timeout_s",
     "freshness_s",
     "load_following",
+    "soc_floor_recovery_w",
+    "soc_floor_hysteresis_pct",
 )
 #: Widest ``actuation.load_following.soc_hysteresis_pct`` (SOC points).
 MAX_LOAD_FOLLOWING_HYSTERESIS_PCT = 10.0
+#: Widest ``actuation.soc_floor_hysteresis_pct`` (SOC points): reserve-protection release band.
+MAX_SOC_FLOOR_HYSTERESIS_PCT = 10.0
 
 
 def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
@@ -1153,6 +1164,8 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
         battery_soc_max_age_s=optional_age("battery_soc", "battery_soc_max_age_s"),
         battery_ac_power_max_age_s=optional_age("battery_ac_power", "battery_ac_power_max_age_s"),
         load_following=_parse_load_following(_section(raw, "load_following"), f"{name}."),
+        soc_floor_recovery_w=num("soc_floor_recovery_w"),
+        soc_floor_hysteresis_pct=_parse_soc_floor_hysteresis(raw, name, defaults),
     )
     cap = settings.import_cap_w
     for key in ("neutral_pd_target_w", "discharge_margin_w"):
@@ -1191,6 +1204,11 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
             f"service config: {name}.load_following.max_w must be within "
             "[min_discharge_cap_w, max_discharge_cap_w]"
         )
+    if settings.soc_floor_recovery_w > settings.import_cap_w:
+        raise ValueError(
+            f"service config: {name}.soc_floor_recovery_w must not exceed import_cap_w "
+            f"(the recovery charge shares the PD target's import bound)"
+        )
     return settings
 
 
@@ -1212,6 +1230,20 @@ def _parse_load_following(raw: Mapping[str, Any], prefix: str) -> LoadFollowingS
         max_w=None if max_w is None else _positive(max_w, f"{name}.max_w"),
         soc_hysteresis_pct=hysteresis,
     )
+
+
+def _parse_soc_floor_hysteresis(
+    raw: Mapping[str, Any], name: str, defaults: ActuationSettings
+) -> float:
+    """Validate ``actuation.soc_floor_hysteresis_pct`` (reserve protection)."""
+    value = raw.get("soc_floor_hysteresis_pct", defaults.soc_floor_hysteresis_pct)
+    hysteresis = _positive(value, f"{name}.soc_floor_hysteresis_pct")
+    if hysteresis > MAX_SOC_FLOOR_HYSTERESIS_PCT:
+        raise ValueError(
+            f"service config: {name}.soc_floor_hysteresis_pct must be <= "
+            f"{MAX_SOC_FLOOR_HYSTERESIS_PCT:g}"
+        )
+    return hysteresis
 
 
 _FULL_CHARGE_KEYS = (

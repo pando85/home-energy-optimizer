@@ -121,6 +121,15 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
   [service](../service.md#load-following-discharge)). The planner is unchanged: it still prices the forecast load, and
   the 15-minute replan from the measured SOC absorbs the difference. Delivered discharge per slot can then exceed the
   plan's, so planned-against-actual KPIs read differently from the day it is enabled.
+- **Reserve protection (code default 200 W, not deployed, 2026-11-08).** With the actuator running (`dry_run` or
+  `live`), while the **measured** SOC sits at or below the tariff's floor (`battery.soc_window_min`, the same value
+  the planner clamps to) a tick the plan maps to idle or discharge becomes a bounded recovery charge
+  (`actuation.soc_floor_recovery_w`) through the existing charge row; a planned charge at or above it is untouched and
+  a weaker one is raised to it ([ADR-0007 amendment](../adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection),
+  [service](../service.md#reserve-protection)). It exists because the idle-drain measurement of 2026-11-08 (about
+  26 W, 18% to 15% over 6 h) shows that holding idle does not hold the floor, and every plan of that night started
+  from a SOC clamped to 0.200 while the battery read 0.150. The planner, its SOC clamp and the plans are unchanged,
+  so nothing is re-calibrated for the model; the recovery kWh are off-plan, so their price can differ from the plan's.
 - Omnibattery's own price features will be off, so this is the only battery price reactor.
 
 ## Invalidated when
@@ -128,6 +137,9 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
 - Any [battery-model](battery-model.md) parameter changes, or the wear cost, the high-SOC dwell cost, the thermal
   charge soft cap or the discharge margin bound is changed (or `actuation.discharge_margin_w` while the bound is on),
   or load-following discharge is enabled or its ceiling changed.
+- The SOC floor the reserve protection holds changes (`tariff.yaml battery.soc_window_min`), or
+  `actuation.soc_floor_recovery_w` or `soc_floor_hysteresis_pct` changes: re-read how often and how long it engages
+  and the off-plan recovery kWh.
 - [tariff-prices](tariff-prices.md) changes (taxes confirmed, holidays added, new publication timing).
 - The load forecast changes regime (comfort schedule, boost): re-check floor-hit share and clipping.
 - At go-live: measured SOC replaces simulated SOC; the charge adapter caps the grid target below the
@@ -164,6 +176,7 @@ first plan that covered it, the *final plan* the plan of record at the slot open
 | Planned against actual battery energy | `increase(shadow_day_ahead_energy_kwh_total{direction}[1d])`, `shadow_planned_energy_kwh_total` (final), `shadow_actual_battery_energy_kwh_total` (actual) |
 | Power and SOC target, day-ahead against final | `slot_battery_power_watts{plan}`, `slot_soc_target_ratio{plan}` |
 | Load-following discharge: when it raised the discharge cap and by how much (only with the feature on) | `actuator_load_following_engaged`, `actuator_load_following_raise_watts`; the `actuation/` rows (`load_following`, `planned_max_discharge_w`) |
+| Reserve protection: ticks held below the SOC floor (only where the actuator runs) | `actuator_reserve_engaged`; the `actuation/` rows (`desired.reason == below_soc_floor`) and `GET /status` `reserve` |
 
 Offline: `uv run python hack/day_ahead_kpis.py --from <day> --to <day>`.
 
@@ -224,6 +237,14 @@ control change, recorded in the regime log: the status stays **stale** for the r
 evening discharge, end-of-evening SOC and realised-against-perfect-foresight saving are re-read on the first 7 days
 (the figures of 2026-11-04 to 11-07 are in the ADR amendment), and [battery-thermal](battery-thermal.md) re-reads the
 discharge gain.
+
+Reserve protection (2026-11-08, code only, **not deployed**, [regime log](regime-log.md)): an actuator layer that
+synthesizes a bounded recovery charge while the measured SOC sits at or below the tariff's floor. The plan,
+`inputs_hash` and `config_hash` are untouched and the committed config keeps the defaults, so merging changes nothing
+observable; it takes effect only on a deployment in `dry_run` or `live` (`shadow` has no actuator) and needs no new
+enable flag. The status stays **stale** for the reasons above. After such a deploy, re-read how many ticks engage
+(`actuator_reserve_engaged`), the off-plan recovery kWh, and whether the floor is still crossed; the drain itself and
+its source stay open ([battery-model](battery-model.md)).
 
 Decision quality, 2026-11-04 to 11-07 (review of 2026-11-07, live data, no change): realised savings were 74 to 81% of a
 perfect-foresight run under the deployed parameters, and 58 to 63% of one with the measured efficiencies

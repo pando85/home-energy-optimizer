@@ -266,6 +266,21 @@ actuation:
     enabled: false
     max_w: null
     soc_hysteresis_pct: 1
+  # Reserve protection (ADR-0007 amendment 2026-11-08).  While the MEASURED SOC sits at or below
+  # the tariff's floor, a tick the plan maps to idle or discharge becomes a bounded recovery charge
+  # of this many W through the existing charge row (the PD target is house load + this, inside
+  # min(import_cap_w, entity max)); a planned charge at or above it is kept, a weaker one is raised
+  # to it.  Forcing idle is not enough: the measured residual drain continues in idle (about 26 W on
+  # 2026-11-08).  The floor is NOT set here: it is battery.soc_window_min of config/tariff.yaml, the
+  # value the planner clamps to.  Hysteresis: engages at the floor, releases at floor + this many SOC
+  # points (0 < soc_floor_hysteresis_pct <= 10).  No enable flag: inert in shadow (no actuator),
+  # recorded in dry_run, sent in live under the kill switch; the guard and the settle hold keep
+  # priority.  During the import trip's import_trip_hold_s above the recovery sends no charge AND
+  # refuses the planned discharge (the guard scopes that refusal to charge intents): the tick holds
+  # idle with both directions off.  Likewise it does not raise the setpoint to the ceiling when the
+  # headroom above the house load is below this power.  Must be <= import_cap_w.
+  soc_floor_recovery_w: 200
+  soc_floor_hysteresis_pct: 1
   # Omnibattery integration_status values in which the intent may be applied; any other
   # (manual, grid_charging, backup_mode, initializing, a competing strategy...) holds safe idle.
   healthy_states: [balanced, charging, discharging]

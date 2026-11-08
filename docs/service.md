@@ -396,6 +396,7 @@ ID, price, timestamp or household reading is a label.
 | `actuator_observed_pd_target_watts`, `actuator_observed_battery_power_watts` (+ charge), `actuator_observed_grid_power_watts`, `actuator_house_load_watts` | gauge (observed; absent when stale) | — |
 | `actuator_clamped_watts` | gauge (W of planned battery power the last tick could not request; 0 = none cut) | — |
 | `actuator_load_following_engaged`, `actuator_load_following_raise_watts` | gauge (only with `actuation.load_following.enabled`: 1 while [load-following discharge](#load-following-discharge) is engaged, and how far it raised the discharge cap above the planned cap; 0 otherwise) | — |
+| `actuator_reserve_engaged` | gauge (1 while [reserve protection](#reserve-protection) holds: the measured SOC is at or below the tariff's SOC floor) | — |
 | `actuator_writes_total` | counter | `role` (`allow_charge`, `allow_discharge`, `max_discharge_power`, `power_limits`, `pd_target`, `heartbeat`, `full_charge_day`, `full_charge_enable`), `result` (`ok`, `failed`, `dry_run`) |
 | `full_charge_mode` | gauge 0/1 (one-hot; only with `full_charge.enabled`, like every `full_charge_*`) | `mode` (`shadow`, `live`) |
 | `full_charge_state` | gauge 0/1 (one-hot) | `state` (`idle`, `scheduled`, `armed`, `charging`, `reached`, `settling`) |
@@ -897,11 +898,12 @@ outside shadow; -1 committed, measured 2026-11-03: `sensor.venus_ac_power` is ne
 `readback_timeout_s` (10), `shutdown_timeout_s` (15), `freshness_s.grid_power` (30),
 `freshness_s.battery_soc` (null = availability only), `freshness_s.battery_ac_power` (null; a number of
 seconds enables an age test), `load_following.enabled` (false), `load_following.max_w` (null =
-`max_discharge_cap_w`), `load_following.soc_hysteresis_pct` (1). Validation: `import_cap_w + import_guard_margin_w`
-< 5000 (the contract), `discharge_margin_w` > 0, `tick_interval_s` ≤ 120,
-`0 < min_discharge_cap_w ≤ max_discharge_cap_w ≤ 2500`, `load_following.max_w` within
-`[min_discharge_cap_w, max_discharge_cap_w]`, `0 < load_following.soc_hysteresis_pct ≤ 10`.
-`mode: live` also requires
+`max_discharge_cap_w`), `load_following.soc_hysteresis_pct` (1), `soc_floor_recovery_w` (200),
+`soc_floor_hysteresis_pct` (1). Validation: `import_cap_w + import_guard_margin_w` < 5000 (the contract),
+`discharge_margin_w` > 0, `tick_interval_s` ≤ 120, `0 < min_discharge_cap_w ≤ max_discharge_cap_w ≤ 2500`,
+`load_following.max_w` within `[min_discharge_cap_w, max_discharge_cap_w]`,
+`0 < load_following.soc_hysteresis_pct ≤ 10`, `soc_floor_recovery_w` > 0 and ≤ `import_cap_w`,
+`0 < soc_floor_hysteresis_pct ≤ 10`. `mode: live` also requires
 `planning.soc_source: entity`. The section is excluded from the plan's config hash.
 
 ### Load-following discharge
@@ -932,6 +934,43 @@ apply below the system cap.
   `load_following_floor_pct` (the plan SOC); a row is written at every engage or release, with the log line
   `actuator load_following=on|off`. Metrics: `actuator_load_following_engaged`,
   `actuator_load_following_raise_watts`. With the feature off the records, metrics and writes are as before.
+
+### Reserve protection
+
+[ADR-0007 amendment 2026-11-08](adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection): while the
+**measured** SOC sits at or below the tariff's floor, a tick the plan maps to idle or discharge asks for a bounded
+recovery charge instead (`reason: below_soc_floor`). Forcing idle was not enough: the measured residual drain
+(about 26 W on 2026-11-08) continues in idle, so only opposing it holds the floor.
+
+- **The floor is not configured twice:** it is `battery.soc_window_min` of `config/tariff.yaml` (0.20 here), the same
+  value the planner clamps to, passed per tick as `ActuationContext.soc_floor_pct`. A tariff without a usable floor
+  (missing, not finite, outside 0..1) means no protection. The planner's clamp is left as it is (a plan must stay
+  feasible); the protection reads the meter, not the plan's assumption.
+- **`actuation.soc_floor_recovery_w` (default 200 W, must be > 0 and <= `import_cap_w`)** is the AC charge power the
+  recovery wants. It goes through the existing charge row: the PD target becomes `house load + power`, bounded by
+  `min(import_cap_w, entity max)` like any planned charge, with the same write ordering, dwell and readback. Only the
+  already-allowlisted PD target and charge allow switch are written; no entity, service or bound is added or widened.
+- **It never weakens the plan:** a planned charge at or above the recovery power is mapped untouched
+  (`reason: intent`); a weaker one is raised to it. When `min(import_cap_w, entity max)` leaves less headroom above the
+  house load than the recovery power, nothing is raised to the ceiling the plan never asked for: an idle or discharge
+  tick holds the idle mapping (`reason: below_soc_floor`, charge off) and a weaker planned charge keeps its own row
+  (`reason: intent`, clamped by that ceiling as usual). Either way the tick never discharges below the floor.
+- **Precedence:** `ha_not_synced`, the owner's kill switch, every guard reason (stale or non-finite SOC or load, an
+  unresponsive or unhealthy battery, an expired or foreign plan, a stale price, import over cap) all come first, then
+  the settle hold, then the recovery, then the normal mapping. During the import trip's `import_trip_hold_s` the
+  recovery sends no charge (a recovery charge is a charge, so it waits for the hold), and because the guard scopes that
+  refusal to *charge* intents, the recovery also refuses a planned discharge: the tick holds the idle mapping with both
+  directions off instead of draining the floor while no charge is allowed.
+- **Hysteresis:** engages at the floor, releases at floor + `actuation.soc_floor_hysteresis_pct` (default 1.0 SOC
+  point, `0 < value <= 10`, validated at load), latched between ticks and starting released after a restart, so a
+  service that comes back at 15% recovers immediately and a SOC hovering at the floor does not flap the setpoint.
+- **Enable semantics:** no separate flag. It is part of the actuator, so it applies automatically in `dry_run`
+  (computed and recorded, nothing sent) and in `live` for whichever deployment runs this release; `shadow` has no
+  actuator and stays inert, and nothing here makes a service live. Recovery grid energy is off-plan: its cost can
+  differ from the optimized plan, and the kWh stay recorded in the `actuation/` rows.
+- **Records and metrics:** `GET /status` carries `reserve` (`floor_pct`, `engaged`, `recovery_w`,
+  `hysteresis_pct`); the tick records carry `below_soc_floor` as the desired reason (a deliberate recovery, not a
+  guard fallback). Metric: `battery_optimizer_actuator_reserve_engaged`.
 
 ### Periodic full charge: the weekly-charge enabler
 

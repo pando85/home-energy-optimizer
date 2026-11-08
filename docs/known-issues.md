@@ -414,16 +414,30 @@ Status: **open, proposed for the 7-day review (around 2026-11-11 to 11-14).** Li
   plus 6.7%, so efficiency depends on power.
 - An idle drain: the idle DC power reads about -30 W and seven idle runs of 3 to 6 h show the SOC falling at about
   34 W. The cause is unknown, possibly standby of the backup port. At this duty cycle the all-in round trip is about 0.75.
+- **Observed again 2026-11-08 (read only): about 26 W.** The SOC fell from 18% to 15% between 03:30 and 09:45 UTC in
+  slots the actuator mapped to idle (mode power 0, no charge or discharge energy) — 3 points over 6 h at 5.12 kWh
+  nameplate. The backup port's about 240 to 245 W is AC *output*, which passes through from the grid while idle or
+  charging, so it is not evidence of a 245 W DC draw; the source of the drain stays unproven and is not modelled.
 - The apparent "missing" energy is these losses, not the servers (flat, about 240 W on the backup port, already in
   the gross load the forecaster learns).
 - Proposal: a fixed overhead plus a proportional efficiency, and the drain in the SOC dynamics (battery block of
   `config/tariff.yaml`, `battery.py`, `oracle.py`). Not applied: it re-mints every `dataset_id`.
+- Control side (code only, **not deployed**): while the measured SOC sits at or below the tariff's floor the actuator
+  asks for a bounded recovery charge instead of the planned idle or discharge, because idling does not oppose the
+  drain ([ADR-0007 amendment](adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection)). It reduces
+  the symptom near the floor; it neither models the drain nor replaces the fix above.
 
 ## No outage reserve for the servers on the backup port
 
 Status: **open, owner decision pending.** The servers (flat, about 240 W) sit on the battery's backup (EPS) port, but
 the planner keeps no state-of-charge reserve for an outage. The 20% SOC floor covers about 3.5 h of them. Adding a
 reserve is a planner and cost trade-off that the owner has not decided ([battery-model](components/battery-model.md)).
+
+The reserve protection of [ADR-0007](adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection) does
+not settle this: it holds the floor the owner already set (the tariff's `battery.soc_window_min`), it does not raise
+it and it keeps no extra energy for an outage. Raising the floor, or planning an explicit reserve, remains open; the
+protection only changes what a floor that has been reached means (a bounded recovery charge, not an idle that keeps
+draining).
 
 ## Charge pauses: allow_charge off 25 to 30 s while charging
 

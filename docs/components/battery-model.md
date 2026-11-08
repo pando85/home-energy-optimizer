@@ -39,10 +39,25 @@ discharge on the temporary test socket, below the modelled 2.5 kW. Confirmed fro
   discharge counter, and about 69% of the AC discharge went to them. The model has no backup-port load (it plans
   the house load, servers included, see [battery-load-forecast](battery-load-forecast.md)).
 - **No outage reserve.** The planner keeps none for the servers: the 20% SOC floor covers about 3.5 h of them in an
-  outage. Whether to add a reserve is the owner's decision, open.
+  outage. Whether to add a reserve is the owner's decision, open. Protecting the **existing** 20% floor (the
+  reserve protection of [ADR-0007](../adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection))
+  does not decide this: it holds the floor the owner already set, it does not raise it and keeps no extra energy for
+  an outage.
 - **Proposed for the 7-day review (around 2026-11-11 to 11-14), not now:** model a fixed overhead plus a
   proportional efficiency instead of the scalar, and add the idle drain to the SOC dynamics. It touches the battery
   block of `config/tariff.yaml` (every `dataset_id` re-minted), `battery.py`, `oracle.py` and this page.
+
+**Observed 2026-11-08 (read only, not adopted; 03:30-09:45 UTC).** The SOC fell from 18% to 15% while the battery was
+idle every slot (actuation mode power 0, no charge or discharge energy in the 09:00-09:45 slots). About 3 points over
+6 h at 5.12 kWh nameplate is about **26 W** of residual drain, in line with the 34 W measured on 2026-11-07; the
+source of that parasitic drain is **not proven** (the backup port's about 240 to 245 W is AC *output*, which passes
+through from the grid while idle or charging, so it is not evidence of a 245 W DC draw). Each plan started from a SOC
+**clamped to the 0.20 floor while the battery measured 0.150** (`soc=0.200 soc_measured=0.150 soc_clamped=True`), so
+the optimizer never saw the shortfall; the telemetry was not hidden, the planning state was clamped. Nothing in the
+model changes here: the drain and the clamp are handled on the control side by the reserve protection of
+[ADR-0007](../adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection), which reads the measured SOC.
+Hardware validation still open: the backup-port DC current and the battery's internal standby loss are not measured
+(the installed HA entities for backup power and the native Omnibattery reserve were not available to read).
 
 ## Assumptions
 
@@ -52,7 +67,7 @@ discharge on the temporary test socket, below the modelled 2.5 kW. Confirmed fro
 | SOC window | 0.20 to 0.95 (3.84 kWh usable), **except on a chosen full-charge day, when the ceiling is 1.00** (ceiling 0.95 before that day, 1.00 from its start to the horizon end) | Owner's life-extension choice; real controller limits not read. The lifted day is chosen by the scheduler of [the periodic full-charge plan](../planning/periodic-full-charge.md) (off by default, `full_charge.enabled`); after completion the actuator holds the battery idle for `settle_timeout_s` (300 s) so Omnibattery's cell-spread measurement is not taken under load |
 | Charge limit near full | 200 W once a cell latches at 3.48 V (Omnibattery's `switch.venus_full_charge_voltage_taper`, voltage-latched, not SOC-based); modelled by one convex half-space per slot of the full-charge day, a ramp from full power at `taper.start_soc_frac` down to `taper.power_kw` at 100%. **Provisional**: `start_soc_frac` 0.90 and `power_kw` 0.2 are not measured, and the ramp is a relaxation of the real step (it allows more than 200 W just above the start), so it only binds when `start_soc_frac` is lower; `start_soc_frac: null` drops the rows | Omnibattery source read 2026-11-04 (plan section 2); to be calibrated on the first supervised run |
 | Initial SOC | 0.20 | Floor, so no free stored energy |
-| Idle draw | 0, not modelled | `battery.py`. Measured 2026-11-07, not adopted: the SOC falls at about 34 W when idle, cause unknown |
+| Idle draw | 0, not modelled | `battery.py`. Measured 2026-11-07, not adopted: the SOC falls at about 34 W when idle, cause unknown. Observed again 2026-11-08 at about 26 W during idle slots; the reserve protection of [ADR-0007](../adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection) opposes it on the control side near the floor, it is not in the model |
 | High-SOC dwell cost | 0 (off); study value 0.01 EUR/kWh/h above 0.90 (`planning.high_soc_cost_eur_per_kwh_h`, `high_soc_threshold_frac`) | LFP calendar ageing is worse at high SOC; a planning convention, not a measured rate, same status as the wear cost; [study](../planning/high-soc-dwell-cost.md). The SOC window itself is unchanged |
 | Thermal charge-power soft cap | 0 (off); study value 1.5 kW at 0.005 EUR/kWh (`planning.charge_soft_cap_kw`, `charge_soft_cap_eur_per_kwh`) | The internal temperature rose about 10 degC in a 50 min charge at about 1.4 kW (2026-11-04) and LFP ageing is worse hot; a convex price on AC kWh charged above the knee, a planning convention like the wear cost, not a thermal model. The knee is a documented conservative choice because the thermal fit rests on 21 h and two charge sessions; [study](../planning/thermal-charge-soft-cap.md). The 2.5 kW limit itself is unchanged |
 | Discharge import margin | 0 in the model; the live actuator keeps `actuation.discharge_margin_w` (100 W deployed since 2026-11-05, 200 W before) of grid import while discharging, so deliverable discharge is at most load minus that. Optional planner bound `planning.discharge_margin_bound` (code default off, enabled in the deployed config since 0.14.0, 2026-11-05) | Owner-chosen to stop brief exports (-10 to -94 W at 50 W, 2026-11-03); a control setting, not a battery parameter, so the model only notes it ([known issue](../known-issues.md#planned-discharge-is-not-delivered-planner-bound-enabled-since-0140-monitoring)) |

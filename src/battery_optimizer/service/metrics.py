@@ -466,6 +466,13 @@ def _actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
         ),
     ):
         yield gauge(suffix, doc, a.get(key))
+    yield gauge(
+        "reserve_engaged",
+        "1 while reserve protection holds: the measured SOC is at or below the tariff's SOC "
+        "floor, so the tick requests the bounded recovery charge instead of the planned idle "
+        "or discharge (ADR-0007 amendment 2026-11-08)",
+        a.get("reserve_engaged"),
+    )
     lf = a.get("load_following")
     if lf is not None:  # only with actuation.load_following.enabled
         yield gauge(

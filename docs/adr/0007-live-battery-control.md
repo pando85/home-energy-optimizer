@@ -88,6 +88,13 @@ Two separate limits apply and both stay in force:
    limits **off**; with them on the bound is `[-system max discharge, +system max charge]`, which caps the charge
    at the system max charge − house load (see [Commissioning findings](#commissioning-findings-2026-11-03)).
 
+   **Amendment 2026-11-08:** while the **measured** SOC sits at or below the tariff's SOC floor, a slot the plan maps
+   to `idle` or `discharge` goes through the `charge` row instead at `actuation.soc_floor_recovery_w`, and a planned
+   charge below it is raised to it. While the import trip's hold is running the tick holds the idle mapping instead
+   (no charge, and the planned discharge is refused too). The rows and their bounds are unchanged, and the energy is
+   off-plan, so its price can differ from the optimized plan's (see
+   [reserve protection](#amendment-2026-11-08-reserve-protection)).
+
 5. **Ordering, one write in flight, readback.** Writes are ordered restrictive first: switch off the direction(s)
    being removed, set the discharge cap, enable the power limits, set the PD target, and only then switch on the
    direction being enabled. Each write is confirmed by reading the entity back from the entity store (WebSocket
@@ -456,3 +463,53 @@ target (`discharge_margin_w`, so no export), the write ordering, the kill switch
 planner (`discharge_margin_bound` included). The ceiling is at most `max_discharge_cap_w` (≤ 2500 W, the Venus
 rating); Omnibattery's per-battery caps and its temperature limit still bound the real power below the system cap.
 Operations: [service](../service.md#load-following-discharge).
+
+## Amendment 2026-11-08 (reserve protection)
+
+**Measured, read only:** on 2026-11-08 03:30-09:45 UTC the battery sat in idle slots (actuation mode power 0, no
+charge or discharge energy) and the SOC fell from 18% to 15%: about **26 W** of residual drain, consistent with the
+about 34 W measured on 2026-11-07. **The source of that drain is not proven** — the backup port's about 240 to 245 W
+is AC *output*, which passes through from the grid while idle or charging and is not in the AC charge counter, so it
+is not evidence of a 245 W DC draw. Every plan of that night started from a SOC **clamped to the 0.20 floor while the
+battery measured 0.150** (`soc=0.200 soc_measured=0.150 soc_clamped=True`): the planning state was clamped, the
+telemetry was not hidden, and nothing in the plan could see or act on the shortfall.
+
+Forcing idle does not help — the tick that was already idle is where the drain happened. So the actuator now
+synthesizes a **bounded recovery charge** while the **measured** SOC sits at or below the tariff's floor
+(`battery.soc_window_min`, 0.20 here): a tick the plan maps to idle or discharge becomes a charge of
+`actuation.soc_floor_recovery_w` (200 W) with `reason: below_soc_floor`. It uses the existing charge row, so the PD
+target is `house load + power` inside `min(import_cap_w, entity max)`, with the same write ordering, dwell and
+readback, and only the already-allowlisted PD target and charge allow switch are written: **no entity, service or
+bound is added or widened**, and nothing here makes a service live. A planned charge at or above the recovery power
+is the stronger command and is mapped untouched; a weaker one is raised to it. When `min(import_cap_w, entity max)`
+leaves less headroom above the house load than the recovery power, the setpoint is not pushed to that ceiling: an
+idle or discharge tick holds the idle mapping, and a weaker planned charge keeps its own row (clamped by the ceiling
+as it is today).
+
+- **One floor, not two:** the floor comes from `config/tariff.yaml`, which the planner already uses, and is passed per
+  tick as `ActuationContext.soc_floor_pct`. There is no second floor setting, and the planner's clamp stays (a plan
+  must remain feasible); the protection reads the meter, not the plan's assumption.
+- **Hysteresis:** engages at the floor, releases at floor + `actuation.soc_floor_hysteresis_pct` (default 1.0 SOC
+  point, `0 < value <= 10`), latched between ticks, released only by a fresh SOC above the release point (a guard
+  failure or a bad read does not drop it) and starting released after a restart, so a service that comes back at 15%
+  recovers at once.
+- **Everything else keeps priority:** `ha_not_synced`, the owner's kill switch and every guard reason (stale or
+  non-finite SOC or load, an unresponsive or unhealthy battery, an expired or foreign plan, a stale price, import over
+  cap) come first, then the settle hold, then the recovery, then the normal mapping. The import trip's
+  `import_trip_hold_s` (300 s) is honoured in the recovery itself: the guard scopes that refusal to *charge* intents,
+  so while the hold is running and the reserve is latched the recovery sends no charge **and refuses the planned
+  discharge as well**, holding the idle mapping with both directions off rather than letting the floor drain further
+  while no charge is allowed.
+- **Cost:** the recovery kWh are off-plan, so their price can differ from the optimized plan's. They are recorded in
+  the `actuation/` rows and in `GET /status` (`reserve`), and exported as `actuator_reserve_engaged`; the plan itself
+  is not rewritten.
+- **Enable semantics:** no separate flag. It is part of the actuator, so it takes effect automatically in `dry_run`
+  (computed and recorded, nothing sent) and `live` for whichever deployment runs this release; `shadow` has no
+  actuator and stays inert.
+- What does not change: the allowlist, the write path and ordering, the guard (no new reason; `below_soc_floor` is a
+  mapping reason after the guard passes), the planner and its SOC clamp, the heartbeat, the kill switch.
+
+Operations: [service](../service.md#reserve-protection). Open hardware validation, not blocking this change: measure
+the backup port's DC current and the battery's internal standby loss to attribute the residual drain; this amendment
+holds the floor the owner already set, it does not decide a larger outage reserve and does not claim to prevent drain
+physically.

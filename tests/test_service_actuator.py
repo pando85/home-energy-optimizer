@@ -2390,3 +2390,559 @@ def test_load_following_ceiling_stays_inside_the_guard_allowlist(tmp_path):
 def test_invalid_load_following_config_is_refused(tmp_path, override, message):
     with pytest.raises(ValueError, match=message):
         load_service_config(write_service_config(tmp_path, **override))
+
+
+# ---------------------------------------------------------------------------
+# Reserve protection (ADR-0007 amendment 2026-11-08): a bounded recovery charge
+# while the measured SOC sits at or below the tariff's floor.  Forcing idle would
+# not stop the measured residual drain (2026-11-08: idle slots, 18% to 15% in 6 h),
+# so the tick must oppose it with the existing charge row.
+# ---------------------------------------------------------------------------
+
+
+def test_idle_at_the_floor_becomes_a_bounded_recovery_charge():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=20.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    desired = record["desired"]
+    assert desired["mode"] == "charge" and desired["reason"] == "below_soc_floor"
+    assert desired["allow_charge"] is True and desired["allow_discharge"] is False
+    # the existing charge row: the PD target is house load + power, so it sits above the load
+    assert desired["house_load_w"] == 400 and desired["pd_target_w"] == 600.0
+    assert desired["pd_target_w"] > desired["house_load_w"]
+    assert desired["clamped"] is False
+    assert ha.writes() == [
+        ("number.set_value", "omnibattery_pd_target_grid_power", 600.0),
+        ("switch.turn_on", "venus_battery_allow_charge", None),
+    ]
+    assert actuator._floor_engaged is True
+
+
+def test_recovery_engages_below_the_floor_after_a_restart():
+    # A restart at 15% (floor 20%): the latch starts down, the fresh measured SOC raises it.
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0, discharge="on", cap=800, limits="on", pd=50)
+    actuator, ha, _ = make(clock, store)
+    assert actuator._floor_engaged is False  # nothing evaluated before the first tick
+    record = tick(actuator, ctx(clock, intent("discharge", 800), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "charge"
+    assert record["desired"]["reason"] == "below_soc_floor"
+    # restrictive first: discharge goes off before the recovery charge is enabled
+    assert ha.writes() == [
+        ("switch.turn_off", "venus_battery_allow_discharge", None),
+        ("number.set_value", "omnibattery_pd_target_grid_power", 600.0),
+        ("switch.turn_on", "venus_battery_allow_charge", None),
+    ]
+
+
+def test_recovery_uses_the_load_reconstructed_with_the_battery_sign():
+    # grid 100 W import while the battery gives back 800 W: the house load is 900 W, so the
+    # recovery opposes the house's draw, not what the meter happens to show.
+    clock = FakeClock(NOW)
+    store = world(clock, soc=18.0, grid=100, ac=-800)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["house_load_w"] == 900
+    assert record["desired"]["pd_target_w"] == 1100.0
+
+
+@pytest.mark.parametrize("soc", [20.0, 19.9, 15.0, 0.0])
+def test_recovery_engages_at_or_below_the_floor(soc):
+    clock = FakeClock(NOW)
+    store = world(clock, soc=soc, grid=400, ac=0)
+    actuator, _, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "charge"
+    assert record["desired"]["reason"] == "below_soc_floor"
+
+
+def test_a_stronger_planned_charge_is_preserved():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("charge", 1500), soc_floor_pct=20.0))
+    desired = record["desired"]
+    assert desired["mode"] == "charge" and desired["reason"] == "intent"
+    assert desired["pd_target_w"] == 1900.0  # the plan's own 1500 W, not the 200 W recovery
+    assert actuator._floor_engaged is True  # the latch is evaluated either way
+
+
+def test_a_weaker_planned_charge_is_raised_to_the_recovery_power():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("charge", 50), soc_floor_pct=20.0))
+    desired = record["desired"]
+    assert desired["mode"] == "charge" and desired["reason"] == "below_soc_floor"
+    assert desired["pd_target_w"] == 600.0  # load 400 + recovery 200, not the plan's 450
+
+
+def test_a_weaker_planned_charge_without_headroom_keeps_its_own_row():
+    # ceiling 2500 (the entity max), load 2400: only 100 W of headroom, less than the 200 W
+    # recovery.  Raising would push the target to the ceiling the plan never asked for, so the
+    # plan's own charge row runs, with its normal clamp accounting.
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=2400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("charge", 50), soc_floor_pct=20.0))
+    desired = record["desired"]
+    assert desired["mode"] == "charge" and desired["reason"] == "intent"
+    assert desired["pd_target_w"] == 2450.0  # the plan's own 50 W, not 2500 (the ceiling)
+    assert actuator._floor_engaged is True  # the latch is still reported
+
+
+def test_a_stronger_planned_charge_is_never_reduced_even_without_headroom():
+    # The same tight ceiling with a plan that wants more than fits: preserved, clamped as usual,
+    # never lowered to the recovery power.
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=2400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("charge", 1500), soc_floor_pct=20.0))
+    desired = record["desired"]
+    assert desired["mode"] == "charge" and desired["reason"] == "intent"
+    assert desired["pd_target_w"] == 2500.0  # min(load + P, import_cap_w, entity max)
+    assert desired["clamped"] is True
+
+
+def test_the_recovery_power_is_a_setting():
+    clock = FakeClock(NOW)
+    settings = replace(SETTINGS, soc_floor_recovery_w=500.0)
+    store = world(clock, soc=15.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store, settings=settings)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["pd_target_w"] == 900.0  # load 400 + 500
+
+
+def test_the_entity_charge_maximum_bounds_the_recovery():
+    # System power limits on: the PD target's max is the system max charge (here 900 W).
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0, limits="on")
+    clock.advance(1)
+    store.apply(
+        entity_state(
+            ENTS.pd_target, 0, clock.now(), attributes={"min": -800, "max": 900, "step": 1}
+        )
+    )
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "charge"
+    assert record["desired"]["pd_target_w"] == 600.0  # 400 + 200 fits under the 900 W ceiling
+    assert record["desired"]["clamped"] is False
+
+
+@pytest.mark.parametrize("grid", [2400, 2500, 2600, 4600])
+def test_no_import_headroom_holds_idle_instead_of_a_clamped_charge(grid):
+    # ceiling min(import_cap 4500, entity max 2500) = 2500; headroom under 200 W buys no recovery,
+    # so the tick idles instead of pushing the setpoint to the cap for nothing.
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=grid, ac=0, pd=1400)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("discharge", 800), soc_floor_pct=20.0))
+    desired = record["desired"]
+    assert desired["mode"] == "idle" and desired["reason"] == "below_soc_floor"
+    assert desired["allow_charge"] is False and desired["pd_target_w"] == 0.0
+    assert ha.writes() == [("number.set_value", "omnibattery_pd_target_grid_power", 0.0)]
+    # the discharge the plan asked for is never enabled near the floor
+    assert ("switch.turn_on", "venus_battery_allow_discharge", None) not in ha.writes()
+
+
+def test_a_missing_load_never_produces_a_recovery_charge():
+    # The guard is the first line; this checks the layer itself refuses to invent headroom.
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, ac=None)
+    actuator, ha, _ = make(clock, store)
+    readings = {"battery_soc_pct": 15.0, "house_load_w": None}
+    context = ctx(clock, intent("idle"), soc_floor_pct=20.0)
+    assert actuator._below_floor(context, readings) is True
+    assert actuator._charge_headroom_w(readings) == 0.0
+    assert actuator.reserve_desired(context, readings).mode == "idle"
+
+
+def test_hysteresis_holds_until_the_floor_plus_one_point():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=20.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert actuator._floor_engaged is True
+    # inside the band (floor + 0.5): the latch holds, the recovery keeps charging
+    clock.advance(60)
+    store.apply(entity_state(ENTS.battery_soc, 20.5, clock.now()))
+    store.apply(entity_state(GRID, 400, clock.now()))
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["reason"] == "below_soc_floor"
+    assert actuator._floor_engaged is True
+    # floor + 1.0: releases, the planned mapping runs again
+    clock.advance(60)
+    store.apply(entity_state(ENTS.battery_soc, 21.0, clock.now()))
+    store.apply(entity_state(GRID, 400, clock.now()))
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["reason"] == "intent"
+    assert record["desired"]["mode"] == "idle"
+    assert actuator._floor_engaged is False
+
+
+def test_the_hysteresis_width_is_a_setting():
+    clock = FakeClock(NOW)
+    settings = replace(SETTINGS, soc_floor_hysteresis_pct=3.0)
+    store = world(clock, soc=20.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store, settings=settings)
+    tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    clock.advance(60)
+    store.apply(entity_state(ENTS.battery_soc, 22.0, clock.now()))
+    store.apply(entity_state(GRID, 400, clock.now()))
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["reason"] == "below_soc_floor"  # still inside the 3-point band
+    clock.advance(60)
+    store.apply(entity_state(ENTS.battery_soc, 23.0, clock.now()))
+    store.apply(entity_state(GRID, 400, clock.now()))
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["reason"] == "intent"
+
+
+def test_no_floor_means_no_protection():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0, discharge="on", cap=800, limits="on")
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("discharge", 800), soc_floor_pct=None))
+    assert record["desired"]["mode"] == "discharge" and record["desired"]["reason"] == "intent"
+    assert actuator._floor_engaged is False
+
+
+@pytest.mark.parametrize(
+    ("soc", "floor", "expected"),
+    [
+        (None, 20.0, "safe_idle"),  # stale or missing SOC: the guard holds safe idle first
+        (float("nan"), 20.0, "safe_idle"),  # not a number: never a reason to engage
+        (150.0, 20.0, "safe_idle"),  # outside the SOC range the readings accept
+        (15.0, None, "idle"),  # no tariff floor: nothing to protect, the plan runs
+    ],
+)
+def test_bad_or_missing_inputs_never_command_a_recovery(soc, floor, expected):
+    clock = FakeClock(NOW)
+    store = world(clock, soc=soc, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=floor))
+    assert record["desired"]["mode"] == expected
+    if floor is not None:
+        assert "battery_soc_stale" in actuator.reasons
+    assert actuator._floor_engaged is False
+    assert not any(e == ENTS.allow_charge and s == "turn_on" for _d, s, e, _x in ha.calls)
+
+
+def test_the_latch_survives_a_guard_failure():
+    # A stale reading must not silently drop protection: the guard is safe idle anyway, and only
+    # a fresh SOC above the release point clears the latch.
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert actuator._floor_engaged is True
+    clock.advance(60)
+    store.apply(entity_state(ENTS.battery_soc, None, clock.now()))  # SOC unreadable
+    store.apply(entity_state(GRID, 400, clock.now()))
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "safe_idle"
+    assert actuator._floor_engaged is True
+
+
+def test_the_import_trip_and_its_hold_win_over_the_recovery():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=4800, ac=0, charge="on", pd=1400)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "safe_idle"
+    assert "import_over_cap" in actuator.reasons and actuator.trip_until is not None
+    # the hold refuses charge: an idle tick inside it does not synthesize a recovery charge, and it
+    # stays idle because the floor is latched (reason below_soc_floor, not the plan's idle intent)
+    clock.advance(60)
+    store.apply(entity_state(GRID, 1000, clock.now()))  # the headroom is back, the hold is not
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "idle"
+    assert record["desired"]["reason"] == "below_soc_floor"
+    assert record["desired"]["allow_charge"] is False
+    assert not any(e == ENTS.allow_charge and s == "turn_on" for _d, s, e, _x in ha.calls)
+    # once the hold expires the recovery resumes (the SOC is still below the floor)
+    clock.advance(SETTINGS.import_trip_hold_s)
+    store.apply(entity_state(GRID, 1000, clock.now()))
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "charge"
+    assert record["desired"]["reason"] == "below_soc_floor"
+
+
+@pytest.mark.parametrize("discharge", ["off", "on"])
+def test_the_import_trip_hold_blocks_a_planned_discharge_below_the_floor(discharge):
+    # The guard scopes the trip's refusal to charge intents, so this layer must refuse the
+    # discharge as well: idling with no charge is the floor standing, extra discharge is not.
+    clock = FakeClock(NOW)
+    store = world(
+        clock,
+        soc=15.0,
+        grid=4800,
+        ac=0,
+        charge="on",
+        discharge=discharge,
+        cap=800,
+        limits="on",
+        pd=1400,
+    )
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("charge", 1000), soc_floor_pct=20.0))  # the trip fires here
+    assert "import_over_cap" in actuator.reasons and actuator.trip_until is not None
+    clock.advance(60)
+    store.apply(entity_state(GRID, 1000, clock.now()))  # the import is back below the cap
+    record = tick(actuator, ctx(clock, intent("discharge", 800), soc_floor_pct=20.0))
+    desired = record["desired"]
+    assert desired["mode"] == "idle" and desired["reason"] == "below_soc_floor"
+    assert desired["allow_charge"] is False and desired["allow_discharge"] is False
+    assert not any(e == ENTS.allow_charge and s == "turn_on" for _d, s, e, _x in ha.calls)
+    assert not any(e == ENTS.allow_discharge and s == "turn_on" for _d, s, e, _x in ha.calls)
+    # after the hold the recovery takes over (and the planned discharge does not)
+    clock.advance(SETTINGS.import_trip_hold_s)
+    store.apply(entity_state(GRID, 1000, clock.now()))
+    record = tick(actuator, ctx(clock, intent("discharge", 800), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "charge"
+    assert record["desired"]["reason"] == "below_soc_floor"
+
+
+@pytest.mark.parametrize(
+    ("kw", "reason"),
+    [
+        ({"ha_synced": False}, "ha_not_synced"),
+        ({"decision": "no_plan"}, "no_plan"),
+        ({"decision": "plan_expired"}, "plan_expired"),
+        ({"decision": "not_ready"}, "inputs_not_ready"),
+        ({"plan_from_this_process": False}, "plan_not_from_this_process"),
+        ({"price_fresh": False}, "price_stale"),
+    ],
+)
+def test_plan_readiness_and_sync_guards_keep_priority(kw, reason):
+    clock = FakeClock(NOW)
+    the_intent = None if "decision" in kw else intent("idle")
+    store = world(clock, soc=15.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, the_intent, soc_floor_pct=20.0, **kw))
+    assert reason in actuator.reasons
+    if "ha_synced" in kw:  # nothing can be sent: no desired at all, let alone a charge
+        assert record["desired"] is None
+    else:
+        assert record["desired"]["mode"] == "safe_idle"
+    assert not any(e == ENTS.allow_charge and s == "turn_on" for _d, s, e, _x in ha.calls)
+
+
+def test_an_unhealthy_integration_status_wins_over_the_recovery():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0, status="backup_mode")
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "safe_idle"
+    assert "integration_unhealthy" in actuator.reasons
+    assert actuator._floor_engaged is False  # the guard ran before the latch could be consulted
+
+
+def test_the_kill_switch_wins_and_leaves_the_latch_alone():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0, kill="off")
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert actuator.in_control is False and actuator._floor_engaged is False
+    assert ha.writes() == []
+
+
+def test_an_unresponsive_battery_holds_safe_idle_not_a_recovery():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0, liveness="1")
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "safe_idle"
+    assert "battery_unresponsive" in actuator.reasons
+    assert actuator._floor_engaged is False
+
+
+def test_the_settle_hold_keeps_priority_over_the_recovery():
+    clock = FakeClock(NOW)
+    store = fc_world(
+        clock, weekly="on", day=TODAY, status="balanced", soc=15.0, grid=400, ac=0, pd=1400
+    )
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    record = tick(actuator, ctx(clock, intent("charge", 1000), full_charge=hold(clock)))
+    assert record["desired"]["mode"] == "idle" and record["desired"]["reason"] == "settle_hold"
+    assert record["desired"]["allow_charge"] is False
+    assert not any(e == ENTS.allow_charge and s == "turn_on" for _d, s, e, _x in ha.calls)
+
+
+def test_a_recovery_charge_still_arms_the_weekly_full_charge():
+    clock = FakeClock(NOW)
+    store = fc_world(
+        clock, weekly="off", day=TODAY, status="balanced", soc=15.0, grid=400, ac=0, pd=0
+    )
+    actuator, ha, _ = make(clock, store, full_charge=FC)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0, full_charge=ARMED))
+    desired = record["desired"]
+    assert desired["mode"] == "charge" and desired["reason"] == "below_soc_floor"
+    assert desired["full_charge_armed"] is True and desired["full_charge_weekday"] == TODAY
+    # the day select already reads TODAY, so only the switch is written (idempotent arming)
+    assert ("switch.turn_on", "omnibattery_weekly_full_charge_enabled", None) in ha.writes()
+    entities = [e for _s, e, _v in ha.writes()]
+    assert entities.index("omnibattery_weekly_full_charge_enabled") < entities.index(
+        "venus_battery_allow_charge"
+    )  # armed before the direction is switched on
+
+
+@pytest.mark.parametrize("mode", ["dry_run", "live"])
+def test_reserve_protection_applies_in_both_actuation_modes(mode):
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store, mode=mode)
+    record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert record["desired"]["mode"] == "charge"
+    assert record["desired"]["reason"] == "below_soc_floor"
+    assert record["sent"] is (mode == "live")
+    if mode == "dry_run":
+        assert ha.writes() == []  # computed and recorded, nothing sent
+        assert record["writes"][0]["result"] == "dry_run"
+    else:
+        assert ("number.set_value", "omnibattery_pd_target_grid_power", 600.0) in ha.writes()
+
+
+def test_the_recovery_reason_is_not_counted_as_a_safe_idle():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0)
+    actuator, ha, metrics = make(clock, store)
+    tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert actuator.desired.mode == "charge"
+    # the safe-idle counter covers real guard fallbacks; a deliberate recovery is not one
+    assert counter(metrics, "actuator_safe_idles", reason="below_soc_floor") == 0
+
+
+def test_status_view_reports_the_reserve_state():
+    import json
+
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    assert actuator.view()["reserve"] == {
+        "floor_pct": 20.0,
+        "engaged": True,
+        "recovery_w": 200.0,
+        "hysteresis_pct": 1.0,
+    }
+    json.dumps(actuator.view())  # /status must stay serialisable
+
+
+def test_the_reserve_engaged_gauge_is_exported():
+    from battery_optimizer.service.metrics import _actuator_families
+
+    clock = FakeClock(NOW)
+    store = world(clock, soc=15.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+    family = next(
+        f for f in _actuator_families(actuator.snapshot()) if f.name.endswith("_reserve_engaged")
+    )
+    assert family.name == "battery_optimizer_actuator_reserve_engaged"
+    assert [s.value for s in family.samples] == [1.0]
+
+
+def test_actuation_context_passes_the_tariff_floor(tmp_path, cleanup):
+    # One authoritative floor: battery.soc_window_min of config/tariff.yaml, never a second setting.
+    from battery_optimizer.service.runtime import _soc_floor_pct
+
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock)
+    cleanup(service)
+    assert service.tariff.battery.soc_window_min == 0.20
+    assert service.actuation_context(clock.now()).soc_floor_pct == 20.0
+    assert _soc_floor_pct(None) is None
+
+    def window(value):
+        return replace(
+            service.tariff, battery=replace(service.tariff.battery, soc_window_min=value)
+        )
+
+    assert _soc_floor_pct(window(None)) is None
+    assert _soc_floor_pct(window(float("nan"))) is None  # a bogus floor disables, never arms
+    assert _soc_floor_pct(window(1.5)) is None
+    assert _soc_floor_pct(window(0.15)) == 15.0
+
+
+def test_the_tariff_floor_recovers_a_live_slot_below_it(tmp_path, cleanup):
+    # End to end through the runtime's own context, as after a restart at 15%.
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, mode="dry_run")
+    cleanup(service)
+    _live_world(service, clock)
+    service.ha.stats.synced = False  # the slot opens before the first HA sync
+    asyncio.run(service.open_slot(SLOT))
+    assert service.actuation_context(NOW).decision == "not_ready"
+    service.ha.stats.synced = True
+    feed(service, NOW)
+
+    async def go():
+        assert await service.request_solve("event:resync") == "ok"  # a catch-up plan
+        clock.advance(1)  # the store keeps the newest report, and _live_world reported at NOW
+        service.store.apply(entity_state(ENTS.battery_soc, 15.0, clock.now()))
+        return await service.actuator.tick(service.actuation_context(clock.now()))
+
+    record = asyncio.run(go())
+    assert service._slot_open[SLOT].decision == "late_intent"
+    context = service.actuation_context(clock.now())
+    assert context.soc_floor_pct == 20.0 and context.intent is not None
+    assert record["guard_reasons"] == []
+    assert record["desired"]["reason"] == "below_soc_floor"
+    assert record["desired"]["mode"] == "charge"
+    assert service.actuator.view()["reserve"] == {
+        "floor_pct": 20.0,
+        "engaged": True,
+        "recovery_w": 200.0,
+        "hysteresis_pct": 1.0,
+    }
+
+
+def test_reserve_defaults_are_modest_and_the_committed_config_keeps_them(tmp_path):
+    committed = load_service_config(REPO / "config" / "service.yaml")
+    assert committed.actuation.soc_floor_recovery_w == 200.0
+    assert committed.actuation.soc_floor_hysteresis_pct == 1.0
+    on = load_service_config(
+        write_service_config(
+            tmp_path,
+            **{
+                "actuation.soc_floor_recovery_w": 300,
+                "actuation.soc_floor_hysteresis_pct": 2,
+            },
+        )
+    )
+    assert on.actuation.soc_floor_recovery_w == 300.0
+    assert on.actuation.soc_floor_hysteresis_pct == 2.0
+    assert on.config_hash() == committed.config_hash()
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"actuation.soc_floor_recovery_w": 0}, "soc_floor_recovery_w"),
+        ({"actuation.soc_floor_recovery_w": -200}, "soc_floor_recovery_w"),
+        ({"actuation.soc_floor_recovery_w": 5000}, "must not exceed import_cap_w"),
+        ({"actuation.soc_floor_hysteresis_pct": 0}, "soc_floor_hysteresis_pct must be > 0"),
+        ({"actuation.soc_floor_hysteresis_pct": 11}, "soc_floor_hysteresis_pct must be <= 10"),
+        ({"actuation.soc_floor_bogus": 1}, "unknown actuation keys"),
+    ],
+)
+def test_invalid_reserve_config_is_refused(tmp_path, override, message):
+    with pytest.raises(ValueError, match=message):
+        load_service_config(write_service_config(tmp_path, **{**LIVE, **override}))
+
+
+def test_the_recovery_only_writes_allowlisted_entities(tmp_path):
+    from battery_optimizer.service.ha_guard import actuation_allowlist, actuation_request
+
+    config = load_service_config(write_service_config(tmp_path, **LIVE))
+    allowlist = actuation_allowlist(config)
+    assert allowlist is not None
+    # the recovery uses only the two entities the charge row already uses, inside their bounds
+    frame = actuation_request(1, "number", "set_value", ENTS.pd_target, {"value": 600}, allowlist)
+    assert frame["service_data"] == {"value": 600}
+    actuation_request(1, "switch", "turn_on", ENTS.allow_charge, None, allowlist)
+    with pytest.raises(ForbiddenHACallError):
+        actuation_request(1, "switch", "turn_on", ENTS.kill_switch, None, allowlist)

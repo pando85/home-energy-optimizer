@@ -61,6 +61,33 @@ sending ``armed: false``; the switch then goes off in the restrictive block of t
 resumes the normal intent.  The guard wins: a guard-failure safe idle ends the hold's effect (it
 is idle anyway), and no new entity or service is involved.
 
+**Reserve protection** (ADR-0007 amendment 2026-11-08; ``actuation.soc_floor_recovery_w``, the
+floor from ``config/tariff.yaml``): while the **measured** SOC sits at or below the tariff's SOC
+floor, a tick that the plan maps to idle or discharge becomes a bounded recovery charge
+(``reason: below_soc_floor``), because the measured residual drain continues even in idle (about
+26 W on 2026-11-08) and only opposing it holds the floor.  The charge at or above
+``soc_floor_recovery_w`` the plan already asked for is preserved untouched, and a weaker planned
+charge is raised to it through the same charge row.  It reuses the charge mapping and the existing
+allowlist entries (the PD target and the charge allow switch) with the same
+``min(import_cap_w, entity max)`` ceiling, ordering, dwell and readback: no entity, service or
+bound is added or widened.  Everything else keeps its priority: the kill switch, ``ha_not_synced``,
+every guard reason (a stale SOC, an unresponsive battery, an expired or foreign plan, a stale
+price, an unhealthy ``integration_status``) and the import trip, then the settle hold, then the
+reserve recovery, then the normal mapping.  During the trip's ``import_trip_hold_s`` the recovery
+sends no charge, and because the guard scopes that refusal to *charge* intents the recovery refuses
+the planned discharge as well: the tick holds the idle mapping (both directions off) rather than
+draining the floor while no charge is allowed.  Likewise, when the ceiling leaves less than
+``soc_floor_recovery_w`` above the house load it does not synthesize a charge: an idle or discharge
+tick holds the idle mapping, and a planned charge below the recovery power keeps its own row
+(``reason: intent``, clamped by that ceiling as usual) instead of being raised to a target the cap
+would only clamp away.  Hysteresis: it engages at the floor and releases at
+floor + ``actuation.soc_floor_hysteresis_pct`` (1.0 SOC point).  The floor is never configured
+twice: ``ActuationContext.soc_floor_pct`` comes from ``battery.soc_window_min``, which the planner
+also uses, and the planner's own clamp of a measured SOC into the window is left as it is (a plan
+must stay feasible); the protection reads the meter, not the plan's assumption.  It applies in
+``dry_run`` (recorded, nothing sent) and ``live``; ``shadow`` has no actuator, and nothing here
+makes a service live.
+
 Numeric targets are bounded by the entity's own ``min``/``max`` as well as ours: Omnibattery
 bounds the PD target by the batteries' summed charge limit (±2500 W here), so the effective
 charge ceiling is ``min(import_cap_w, entity max)``; ``Desired`` carries the value actually
@@ -183,6 +210,8 @@ class ActuationContext:
     price_fresh: bool
     #: The periodic full charge: ``None`` = feature off, the two roles are never touched.
     full_charge: FullChargeDirective | None = None
+    #: The tariff's SOC floor (%); ``None`` disables reserve protection.
+    soc_floor_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -208,7 +237,7 @@ class Desired:
     """The Omnibattery state one tick wants; ``None`` fields are left untouched."""
 
     mode: str  # idle | charge | discharge | safe_idle
-    reason: str  # "intent", "settle_hold", or a SAFE_IDLE_REASONS member
+    reason: str  # "intent", "settle_hold", "below_soc_floor", or a SAFE_IDLE_REASONS member
     allow_charge: bool = False
     allow_discharge: bool = False
     pd_target_w: float | None = None
@@ -396,6 +425,10 @@ class Actuator:
         self._signature: Any = None
         #: Load-following hysteresis latch: the last applied discharge intent had it engaged.
         self._lf_engaged = False
+        #: Reserve-protection hysteresis latch: SOC at/below the tariff floor.
+        self._floor_engaged = False
+        #: The authoritative floor (%) the last tick came from the tariff; ``None`` if no floor.
+        self._floor_pct: float | None = None
 
     # ------------------------------------------------------------------ inputs
 
@@ -535,6 +568,88 @@ class Actuator:
             reasons.append("integration_unhealthy")
         return reasons
 
+    def _below_floor(self, ctx: ActuationContext, readings: Mapping[str, Any]) -> bool:
+        """Reserve protection: True while SOC is at/below the tariff floor (latched, hysteresis).
+
+        Engages when the measured SOC is at or below the floor, releases at floor plus
+        ``soc_floor_hysteresis_pct``, and holds in between, so a recovery that only just crosses
+        the floor does not re-engage on the next tick.  It uses the tick's fresh measured SOC,
+        never the planner's clamped SOC: the 2026-11-08 night the plan started from a clamped
+        0.200 while the battery read 0.150, so nothing in the plan could see the shortfall.
+        A missing floor or a non-finite SOC leaves the latch as it is (the guard already holds
+        safe idle on a stale SOC, and clearing the latch on a bad read would drop protection).
+        """
+        floor = ctx.soc_floor_pct
+        self._floor_pct = floor
+        soc = readings.get("battery_soc_pct")
+        if floor is None or soc is None or not math.isfinite(soc):
+            return self._floor_engaged
+        hysteresis = self.settings.soc_floor_hysteresis_pct
+        engaged = (
+            soc <= floor + 1e-9 if not self._floor_engaged else soc < floor + hysteresis - 1e-9
+        )
+        self._floor_engaged = engaged
+        return engaged
+
+    def reserve_desired(self, ctx: ActuationContext, readings: Mapping[str, Any]) -> Desired | None:
+        """The recovery the floor protection wants, or ``None`` when the planned mapping stands.
+
+        Call only after a passing guard (``ha_not_synced``, the kill switch and every guard reason
+        keep their priority) and after the settle hold.  It never weakens a planned charge: a charge
+        at or above ``soc_floor_recovery_w`` returns ``None`` so :meth:`desired_for` maps the plan
+        as usual, and a weaker planned charge is raised to the recovery power through the *same*
+        charge row.  An idle or discharge tick below the floor becomes a bounded recovery charge:
+        forcing idle would not stop the measured residual drain, so the only way to hold the floor
+        is to oppose it.
+
+        The recovery reuses ``number.set_value`` on the PD target and the charge allow switch
+        (``allow_charge``), with the existing ``min(import_cap_w, entity max)`` ceiling, the
+        ordering, dwell and readback of :meth:`_charge_desired`; no entity, service or bound is
+        widened.  Two cases deliberately do not command a charge.  During the import trip's
+        ``import_trip_hold_s`` the tick holds the idle mapping (``reason: below_soc_floor``): the
+        guard scopes the trip's refusal to *charge* intents, so this layer has to refuse the
+        planned discharge as well instead of letting it drain the floor further while no charge is
+        allowed.  And when the ceiling leaves less than ``soc_floor_recovery_w`` above the house
+        load the recovery holds back rather than pushing the setpoint to the cap the plan never
+        asked for: a non-charge tick holds the idle mapping, a planned charge keeps its own
+        (smaller, already clamped) row.
+        """
+        if not self._below_floor(ctx, readings):
+            return None
+        if self.trip_until is not None and ctx.now < self.trip_until:
+            # The trip refuses charge for import_trip_hold_s, and the guard scopes that refusal to
+            # charge intents: a discharge or idle intent passes it.  Returning None here would hand
+            # the tick to the normal mapping and let the discharge drain the floor further while the
+            # reserve is latched, so the hold keeps both directions off: no recovery charge (the
+            # refusal stands) and no discharge (the floor stands).
+            return self.idle_desired(readings, "below_soc_floor")
+        power = self.settings.soc_floor_recovery_w
+        intent = ctx.intent
+        planned_charge = intent is not None and intent.mode == "charge"
+        if planned_charge and float(intent.target_power_w) >= power:
+            return None  # the plan already charges at least as hard: preserve it
+        if self._charge_headroom_w(readings) < power:
+            # The whole recovery does not fit under min(import_cap_w, entity max).  Raising anyway
+            # would push the target to that ceiling, i.e. import at the cap while the house load is
+            # already near it, so the recovery holds back: a non-charge tick keeps the idle mapping
+            # and a planned charge keeps its own (smaller, already clamped) row untouched.
+            return None if planned_charge else self.idle_desired(readings, "below_soc_floor")
+        return self._charge_desired(power, readings, "below_soc_floor")
+
+    def _charge_headroom_w(self, readings: Mapping[str, Any]) -> float:
+        """W the charge mapping can still ask for above the house load (``0.0`` when none).
+
+        The same effective ceiling the mapping uses: ``min(import_cap_w, entity max)``.  A missing
+        load or ceiling is no headroom, so the recovery never invents one.
+        """
+        s, e = self.settings, self.settings.entities
+        load = readings.get("house_load_w")
+        if load is None:
+            return 0.0
+        entity_max = _attr(self._observed(e.pd_target), "max")
+        ceiling = s.import_cap_w if entity_max is None else min(s.import_cap_w, entity_max)
+        return max(0.0, ceiling - load)
+
     def _local_weekday(self, now: datetime) -> str:
         assert self._tz is not None
         return WEEKDAY_OPTIONS[now.astimezone(self._tz).weekday()]
@@ -580,22 +695,7 @@ class Actuator:
         load = readings.get("house_load_w")
         power = float(intent.target_power_w)
         if intent.mode == "charge":
-            if load is None:
-                return safe_idle("battery_power_stale")
-            # Effective ceiling min(import_cap_w, entity max): Omnibattery bounds the target by
-            # the batteries' charge limit, so the charge is at most that ceiling - house load.
-            target, cut = self._number_target(
-                e.pd_target, float(math.floor(max(load + power, 0.0))), 0.0, s.import_cap_w
-            )
-            return Desired(
-                mode="charge",
-                reason="intent",
-                allow_charge=True,
-                pd_target_w=target,
-                house_load_w=load,
-                clamped=cut > 0,
-                clamped_w=round(min(cut, power), 3),
-            )
+            return self._charge_desired(power, readings, "intent")
         if intent.mode == "discharge":
             cap, cut = self._number_target(
                 e.max_discharge_power,
@@ -617,6 +717,31 @@ class Actuator:
             )
             return self._load_following(desired, intent, readings)
         return self.idle_desired(readings, "intent")
+
+    def _charge_desired(self, power: float, readings: Mapping[str, Any], reason: str) -> Desired:
+        """The charge row of the mapping table, shared by the plan and the reserve protection.
+
+        ``power`` is the AC charge power wanted; the PD target is ``house load + power`` bounded by
+        ``min(import_cap_w, entity max)``: Omnibattery bounds the target by the batteries' charge
+        limit, so the charge is at most that ceiling minus the house load.  Needs a fresh load;
+        the floor or no-load cases never reach here (the guard holds safe idle first).
+        """
+        s, e = self.settings, self.settings.entities
+        load = readings.get("house_load_w")
+        if load is None:
+            return safe_idle("battery_power_stale")
+        target, cut = self._number_target(
+            e.pd_target, float(math.floor(max(load + power, 0.0))), 0.0, s.import_cap_w
+        )
+        return Desired(
+            mode="charge",
+            reason=reason,
+            allow_charge=True,
+            pd_target_w=target,
+            house_load_w=load,
+            clamped=cut > 0,
+            clamped_w=round(min(cut, power), 3),
+        )
 
     def _load_following(
         self, desired: Desired, intent: ShadowIntent, readings: Mapping[str, Any]
@@ -967,7 +1092,16 @@ class Actuator:
                 if self._settling(ctx):
                     desired = self.idle_desired(readings, "settle_hold")
                 else:
-                    desired = self.desired_for(ctx.intent, readings)
+                    # Reserve protection (ADR-0007 amendment 2026-11-08): a bounded recovery
+                    # charge while the measured SOC sits at or below the tariff floor.  The guard
+                    # and the settle hold keep their priority; the recovery itself keeps no charge
+                    # during the import trip's hold and refuses the planned discharge there too.
+                    # The normal mapping runs when it does not apply, so a plan is only ever
+                    # overridden near the floor.
+                    recovery = self.reserve_desired(ctx, readings)
+                    desired = (
+                        recovery if recovery is not None else self.desired_for(ctx.intent, readings)
+                    )
             if fc_armed is False or (fc_armed and desired.mode != "safe_idle"):
                 # A safe idle never arms; it disarms only when the directive says so.
                 desired = replace(
@@ -1174,6 +1308,12 @@ class Actuator:
             "alert": self.alert,
             "last_error": self.last_error,
             "import_trip_until": iso(self.trip_until),
+            "reserve": {
+                "floor_pct": self._floor_pct,
+                "engaged": self._floor_engaged,
+                "recovery_w": self.settings.soc_floor_recovery_w,
+                "hysteresis_pct": self.settings.soc_floor_hysteresis_pct,
+            },
             "last_tick_at": iso(self.last_tick_at),
             "last_successful_write_at": iso(self.last_success_write_at),
             "last_heartbeat_at": iso(self.last_heartbeat_at),
@@ -1216,6 +1356,7 @@ class Actuator:
             "observed_grid_power_w": self.readings.get("grid_power_w"),
             "house_load_w": self.readings.get("house_load_w"),
             "observed_pd_target_w": self.readings.get("pd_target_w"),
+            "reserve_engaged": 1.0 if self._floor_engaged else 0.0,
             **({"full_charge": self._full_charge_snapshot()} if self._fc is not None else {}),
             **(
                 {"load_following": self._load_following_snapshot()}

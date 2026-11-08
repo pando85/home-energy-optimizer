@@ -87,6 +87,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -189,6 +190,25 @@ def _intent_text(intent: ShadowIntent | None) -> str:
     if intent is None:
         return "mode=- power_w=- plan_id=-"
     return f"mode={intent.mode} power_w={intent.target_power_w:.0f} plan_id={intent.plan_id}"
+
+
+def _soc_floor_pct(tariff: TariffConfig | None) -> float | None:
+    """The authoritative SOC floor in percent for reserve protection, or ``None`` (protection off).
+
+    Single source: ``battery.soc_window_min`` of ``config/tariff.yaml``, the same value the
+    planner clamps to.  A tariff that does not parse as a finite fraction of nameplate gives
+    ``None``: the actuator then protects nothing rather than acting on a bogus floor (the spec
+    build in :meth:`ShadowService._base_spec` is where a bad window is reported).
+    """
+    if tariff is None:
+        return None
+    try:
+        floor = float(tariff.battery.soc_window_min)  # type: ignore[arg-type]
+    except TypeError, ValueError:
+        return None
+    if not math.isfinite(floor) or not 0.0 <= floor <= 1.0:
+        return None
+    return 100.0 * floor
 
 
 def _log_plan(result: PlanResult, trigger: str, elapsed: float) -> None:
@@ -2521,6 +2541,7 @@ class ShadowService:
         )
         curve = self.price_curve
         price_fresh = curve is not None and curve.price_at(current) is not None
+        soc_floor_pct = _soc_floor_pct(self.tariff)
         return ActuationContext(
             now=now,
             ha_synced=self.ha is not None and self.ha.stats.synced,
@@ -2529,6 +2550,7 @@ class ShadowService:
             plan_from_this_process=own,
             price_fresh=price_fresh,
             full_charge=self._fc_directive,
+            soc_floor_pct=soc_floor_pct,
         )
 
     async def _send_actuation(
