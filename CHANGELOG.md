@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.16.0](https://github.com/pando85/home-energy-optimizer/tree/v0.16.0) - 2026-11-08
+
+### Added
+
+- actuator: Add reserve protection with bounded recovery charge below 20% SOC floor ([fe80f17](https://github.com/pando85/home-energy-optimizer/commit/fe80f17a47bfb1ae038ce5bcd21b5261f7b619b5))
+
+### Documentation
+
+- components: Record load-following discharge enabled with release 0.15.0 ([5e7327b](https://github.com/pando85/home-energy-optimizer/commit/5e7327b12e463025b638bb2931291fac2ffa47fa))
+- components: Record the 2026-11-07 battery review findings ([659c6c0](https://github.com/pando85/home-energy-optimizer/commit/659c6c07b6deea5a2888b10da79ccc3f652258ee))
+
 ## [v0.15.0](https://github.com/pando85/home-energy-optimizer/tree/v0.15.0) - 2026-11-07
 
 ### Added
