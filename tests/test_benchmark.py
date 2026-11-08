@@ -526,12 +526,12 @@ class TestResolveBatteryAssumptions:
         assert assumptions.initial_soc_frac == 0.20
 
         # The provisional framing must survive a change of value: the symmetric sqrt
-        # mapping stays a labelled assumption, and idle losses stay unmeasured rather
-        # than silently becoming a measured zero.
+        # mapping stays a labelled assumption.  Idle drain is now adopted (26 W in
+        # the shipped config, 2026-11-08).
         assert "symmetric assumption" in assumptions.efficiency_mapping
         assert "provisional assumption" in assumptions.efficiency_mapping
-        assert assumptions.idle_losses_measured is False
-        assert assumptions.idle_loss_kwh_per_hour == 0.0
+        assert assumptions.idle_losses_measured is True
+        assert assumptions.idle_loss_kwh_per_hour == pytest.approx(0.026)
 
     def test_unsolvable_policy_is_recorded_not_fabricated(
         self, tmp_path: Path, monkeypatch

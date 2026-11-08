@@ -23,10 +23,12 @@ Physics invariants (ADR-0003 §"Battery physical simulator")
 -----------------------------------------------------------
 For every interval ``t``, with ``h = interval_seconds / 3600``:
 
-1. SOC recurrence ``soc[t] = soc[t-1] + charge[t]*eta_c - discharge[t]/eta_d``
-   with ``soc[-1] = capacity * initial_soc_frac``.  Round-trip loss is applied
-   on **both** legs: one-way ``eta_c`` on the way in, one-way ``eta_d`` on the
-   way out, so a full cycle returns ``eta_c * eta_d`` of the energy put in.
+1. SOC recurrence ``soc[t] = soc[t-1] + charge[t]*eta_c - discharge[t]/eta_d
+   - idle_drain_kwh`` with ``soc[-1] = capacity * initial_soc_frac``.
+   Round-trip loss is applied on **both** legs: one-way ``eta_c`` on the way in,
+   one-way ``eta_d`` on the way out, so a full cycle returns ``eta_c * eta_d``
+   of the energy put in.  ``idle_drain_kwh`` is the parasitic drain per interval
+   (``idle_loss_kwh_per_hour * interval_seconds / 3600``); zero when unconfigured.
 2. ``capacity*soc_min_frac <= soc[t] <= capacity*soc_max_frac`` at *every*
    step, not just at the end of the horizon.
 3. ``0 <= charge[t] <= power_kw*h`` and ``0 <= discharge[t] <= power_kw*h``.
@@ -138,9 +140,13 @@ For every interval ``t``, with ``h = interval_seconds / 3600``:
      at zero").  This is the ADR's "initial and terminal SOC are equal or have
      an explicit defensible valuation" requirement.
 
-Idle self-discharge is **not** modelled: SOC changes only through the charge and
-discharge flows.  This is a documented, unmeasured assumption, not a measured
-property — no standby/parasitic drain term is applied anywhere in this module.
+Idle self-discharge (parasitic drain) is modelled as a constant loss per interval
+when ``idle_loss_kwh_per_hour > 0``.  The drain is subtracted from the SOC in every
+interval — a constant parasitic loss measured at about 26 W DC when the battery is
+idle (2026-11-07/08).  During charge and discharge the efficiency already captures
+the dominant conversion loss; the parasitic term is negligible at those power levels
+(26 W vs up to 2.5 kW) but is applied unconditionally for linearity in the MILP
+oracle and consistency between the simulator and the solver.
 
 Efficiency, EFC and the SOC window
 ----------------------------------
@@ -264,6 +270,15 @@ class BatterySpec:
     terminal_soc_frac: float | None = None
     """Required end-of-horizon SOC.  ``None`` => must equal
     ``initial_soc_frac`` (energy-neutral over the horizon)."""
+
+    idle_loss_kwh_per_hour: float = 0.0
+    """Constant parasitic drain in kW (kWh per hour of idle or active time).
+
+    Measured at about 26 W DC when the battery is idle (2026-11-07/08).
+    Applied unconditionally to every interval's SOC recurrence as a constant
+    per-interval loss (``idle_loss_kwh_per_hour * interval_seconds / 3600``).
+    Zero (the default) reproduces the historical model with no drain.
+    """
 
     def __post_init__(self) -> None:
         for f in fields(self):
@@ -658,6 +673,10 @@ def validate_spec(spec: BatterySpec) -> None:
     ):
         if not 0.0 < eta <= 1.0:
             raise ValueError(f"{name}.{label} must be in (0, 1], got {eta}")
+    if spec.idle_loss_kwh_per_hour < 0.0:
+        raise ValueError(
+            f"{name}.idle_loss_kwh_per_hour must be >= 0, got {spec.idle_loss_kwh_per_hour}"
+        )
     if not 0.0 <= spec.soc_min_frac < spec.soc_max_frac <= 1.0:
         raise ValueError(
             f"{name} needs 0 <= soc_min_frac < soc_max_frac <= 1, got "
@@ -711,14 +730,27 @@ def _describe(label: str, mask: np.ndarray, detail: np.ndarray | None = None) ->
 # ---------------------------------------------------------------------------
 
 
-def soc_trajectory_kwh(spec: BatterySpec, charge: np.ndarray, discharge: np.ndarray) -> np.ndarray:
+def soc_trajectory_kwh(
+    spec: BatterySpec,
+    charge: np.ndarray,
+    discharge: np.ndarray,
+    *,
+    interval_seconds: float = 900.0,
+) -> np.ndarray:
     """End-of-interval SOC (kWh) for a plan, from the signed-flow recurrence.
 
     Single source of truth for the recurrence: the simulator, both policies and
     the oracle all take their SOC from here, so a "feasible" schedule can never
     disagree with the physics by construction.
+
+    When ``spec.idle_loss_kwh_per_hour > 0`` a constant parasitic drain is
+    subtracted from every interval's SOC delta.  The drain is
+    ``idle_loss_kwh_per_hour * interval_seconds / 3600`` kWh per interval.
     """
     delta = charge * spec.charge_efficiency - discharge / spec.discharge_efficiency
+    if spec.idle_loss_kwh_per_hour > 0.0:
+        drain_kwh = spec.idle_loss_kwh_per_hour * interval_seconds / 3600.0
+        delta = delta - drain_kwh
     return spec.soc_bound_kwh("init") + np.cumsum(delta)
 
 
@@ -836,7 +868,7 @@ def check_feasible(
     charge, discharge = _as_plan(horizon, charge_kwh, discharge_kwh)
 
     limit = spec.interval_energy_limit_kwh(horizon.interval_seconds)
-    soc = soc_trajectory_kwh(spec, charge, discharge)
+    soc = soc_trajectory_kwh(spec, charge, discharge, interval_seconds=horizon.interval_seconds)
     grid = grid_import_kwh(horizon, charge, discharge)
     floor_kwh = spec.soc_bound_kwh("min")
     ceil_kwh = spec.soc_bound_kwh("max")
@@ -997,7 +1029,7 @@ def simulate(
             + "\n  ".join(violations)
         )
 
-    soc = soc_trajectory_kwh(spec, charge, discharge)
+    soc = soc_trajectory_kwh(spec, charge, discharge, interval_seconds=horizon.interval_seconds)
     grid = grid_import_kwh(horizon, charge, discharge)
     throughput = float(discharge.sum())  # AC/metered delivered energy
     meter_cost = horizon_cost_eur(horizon, grid)

@@ -1750,3 +1750,39 @@ class TestBatterySpecOnPlan:
         request = simulate(_spec(), unconstrained, [0.5], [0.0], enforce_terminal_soc=False)
         with pytest.raises(BatteryPhysicsError, match="ceiling headroom"):
             _bridge(request, _horizon(1, load=[4.5], import_limit_kw=5.0), _spec())
+
+
+class TestDispatchWithIdleDrain:
+    """Dispatch validation with nonzero idle drain."""
+
+    def test_simulate_with_drain_matches_manual_walk(self) -> None:
+        """simulate() with drain matches a manual SOC walk accounting for drain."""
+        drain_kw = 0.026
+        drain_per_interval = drain_kw * QUARTER / 3600.0
+        s = _spec(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.5,
+            charge_efficiency=0.9,
+            discharge_efficiency=0.9,
+        )
+        n = 2
+        h = Horizon(
+            interval_seconds=QUARTER,
+            prices=np.array([0.1, 0.3]),
+            load_kwh=np.full(n, 0.3),
+            usable=np.ones(n, dtype=bool),
+        )
+        # A simple plan: charge in first interval, idle in second
+        charge = np.array([0.5, 0.0])
+        discharge = np.array([0.0, 0.0])
+        sched = simulate(s, h, charge, discharge, enforce_terminal_soc=False)
+        # Verify the SOC trajectory matches a manual walk with drain
+        eta_c = s.charge_efficiency
+        eta_d = s.discharge_efficiency
+        soc_init = s.soc_bound_kwh("init")
+        expected_soc_0 = soc_init + charge[0] * eta_c - discharge[0] / eta_d - drain_per_interval
+        expected_soc_1 = (
+            expected_soc_0 + charge[1] * eta_c - discharge[1] / eta_d - drain_per_interval
+        )
+        assert sched.soc_kwh[0] == pytest.approx(expected_soc_0)
+        assert sched.soc_kwh[1] == pytest.approx(expected_soc_1)

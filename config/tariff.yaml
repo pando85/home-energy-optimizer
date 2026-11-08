@@ -79,6 +79,14 @@ battery:
   # requires a recorded supersession of dataset
   # da2ac07a7a39affc43ef9e94523fb6a154ee6213d590086d8c261b265d957140.
   round_trip_efficiency: 0.80
+  # Constant parasitic drain in watts, measured when the battery is idle (no
+  # charge or discharge).  About 26 W DC on 2026-11-08 (18% to 15% SOC over 6 h
+  # at 5.12 kWh nameplate), in line with the 34 W measured on 2026-11-07.
+  # Source of the drain is not proven (possibly standby of the backup port).
+  # The benchmark resolver converts this to idle_loss_kwh_per_hour (kW) for the
+  # battery spec.  Applied unconditionally to every interval's SOC recurrence.
+  # Changing this value changes dataset_id (the tariff file is hashed).
+  idle_drain_w: 26.0
   # User chose a 20-95% SOC window to extend battery life.  The usable window is
   # 95% - 20% = 75% of nameplate = 3.84 kWh.  This is NOT the illustrative
   # "80% window" in ADR-0003, and it is a different thing from the efficiency

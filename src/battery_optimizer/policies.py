@@ -123,6 +123,7 @@ by the oracle and the simulator.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -147,6 +148,8 @@ from .oracle import (
     validate_charge_soft_cap,
     validate_high_soc_cost,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_FORECAST_WINDOW_DAYS",
@@ -227,7 +230,12 @@ def policy_no_battery(spec: BatterySpec, horizon: Horizon) -> Schedule:
     ``is_certified=False``.
     """
     zero = np.zeros(horizon.n)
-    return simulate(spec, horizon, zero, zero)
+    # A counterfactual with no battery must not incur battery standby loss:
+    # the drain is a physical property of the installed cell, and without a
+    # battery there is nothing to drain.  Override idle_loss to zero so that
+    # the SOC trajectory stays flat at the seed regardless of drain config.
+    no_drain_spec = dataclasses.replace(spec, idle_loss_kwh_per_hour=0.0)
+    return simulate(no_drain_spec, horizon, zero, zero)
 
 
 # ---------------------------------------------------------------------------
@@ -348,12 +356,17 @@ def policy_causal_price(
     usable = horizon.usable
     eta_c = spec.charge_efficiency
     eta_d = spec.discharge_efficiency
+    drain_kwh = spec.idle_loss_kwh_per_hour * horizon.interval_seconds / 3600.0
 
     # Strictly sequential: interval t may read prices[..t] and its own SOC only.
     soc = spec.soc_bound_kwh("init")
     for t in range(n):
         if not usable[t]:
-            continue  # gap-excluded interval: forced zero flow, identical for all policies
+            # Gap-excluded interval: forced zero flow, but drain still applies
+            # (the battery is physically present and losing energy even when no
+            # dispatch decision is made).  This matches simulate() and the oracle.
+            soc -= drain_kwh
+            continue
         price = prices[t]
         if price < charge_threshold:
             soc_headroom = max((ceil_kwh - soc) / eta_c, 0.0)
@@ -366,11 +379,29 @@ def policy_causal_price(
             charge[t] = min(cap, soc_headroom)
         elif price > discharge_threshold:
             available_load = max(load[t], 0.0)
-            stored = max((soc - floor_kwh) * eta_d, 0.0)
+            # Discharge availability must account for the drain that will be applied
+            # after the discharge: the SOC after discharge and drain must stay above
+            # the floor.  So the available energy is (soc - drain - floor) * eta_d.
+            stored = max((soc - drain_kwh - floor_kwh) * eta_d, 0.0)
             # The ceiling never limits discharge: discharging lowers the draw,
             # so it is the physically correct response to a tight ceiling.
             discharge[t] = max(min(limit, stored, available_load), 0.0)
-        soc += charge[t] * eta_c - discharge[t] / eta_d
+        # Maintenance charging: when idle drain would push SOC below floor,
+        # charge just enough to offset the drain (subject to power limit and
+        # import cap).  This keeps the causal policy feasible at the floor
+        # without look-ahead — it reacts to the deficit drain creates.
+        if drain_kwh > 0.0:
+            projected_soc = soc + charge[t] * eta_c - discharge[t] / eta_d - drain_kwh
+            if projected_soc < floor_kwh:
+                deficit_kwh = floor_kwh - projected_soc
+                maintenance = deficit_kwh / eta_c
+                cap = limit
+                if charge_headroom_kwh is not None:
+                    cap = min(cap, float(charge_headroom_kwh[t]))
+                additional = min(maintenance, max(cap - charge[t], 0.0))
+                if additional > 0.0:
+                    charge[t] += additional
+        soc += charge[t] * eta_c - discharge[t] / eta_d - drain_kwh
 
     # enforce_terminal_soc=False: a causal policy cannot guarantee end-of-horizon
     # energy neutrality, and it must not be allowed to fake it by look-ahead.
@@ -741,6 +772,7 @@ def _clip_plan_to_model_bounds(
     eta_d = spec.discharge_efficiency
     load = day_horizon.load_kwh
     usable = day_horizon.usable
+    drain_kwh = spec.idle_loss_kwh_per_hour * day_horizon.interval_seconds / 3600.0
 
     out_charge = np.zeros(m, dtype=float)
     out_discharge = np.zeros(m, dtype=float)
@@ -749,15 +781,21 @@ def _clip_plan_to_model_bounds(
     clipped_discharge = 0.0
     for t in range(m):
         if not usable[t]:
-            continue  # gap-excluded: zero flow, SOC carried — identical for every policy
+            # Gap-excluded: zero flow, but drain still applies (the battery is
+            # physically present and losing energy).  Matches simulate() and oracle.
+            soc -= drain_kwh
+            continue
         cap = limit
         if headroom is not None:
             cap = min(cap, float(headroom[t]))
         cap = min(cap, max((ceil_kwh - soc) / eta_c, 0.0))
         c = min(max(float(charge[t]), 0.0), cap)
+        # Discharge availability must account for the drain that will be applied
+        # after the discharge: the SOC after discharge and drain must stay above
+        # the floor.  So the available energy is (soc - drain - floor) * eta_d.
         available = min(
             limit,
-            max((soc - floor_kwh) * eta_d, 0.0),
+            max((soc - drain_kwh - floor_kwh) * eta_d, 0.0),
             max(float(load[t]), 0.0),  # no-export rule, on measured load
         )
         d = min(max(float(discharge[t]), 0.0), max(available, 0.0))
@@ -765,7 +803,7 @@ def _clip_plan_to_model_bounds(
         out_discharge[t] = d
         clipped_charge += float(charge[t]) - c
         clipped_discharge += float(discharge[t]) - d
-        soc += c * eta_c - d / eta_d
+        soc += c * eta_c - d / eta_d - drain_kwh
     return out_charge, out_discharge, soc, clipped_charge, clipped_discharge
 
 
@@ -992,7 +1030,13 @@ def policy_day_ahead(
     # to a single point: no discharge without spending the seed, no charge without
     # breaching the window.  That is not a dispatch problem to solve, it is a degenerate
     # spec, and it is reported instead of being smuggled into an invalid BatterySpec.
-    frozen_by_seed = horizon_floor_kwh >= spec.soc_bound_kwh("max") - _SOC_NOISE_KWH
+    # However, when idle drain is nonzero, the battery CAN charge to offset drain even
+    # at ceiling (maintenance charging), so frozen_by_seed only applies when drain is 0.
+    _day_ahead_drain_kwh = spec.idle_loss_kwh_per_hour * horizon.interval_seconds / 3600.0
+    frozen_by_seed = (
+        _day_ahead_drain_kwh == 0.0
+        and horizon_floor_kwh >= spec.soc_bound_kwh("max") - _SOC_NOISE_KWH
+    )
     full_charge = np.zeros(n, dtype=float)
     full_discharge = np.zeros(n, dtype=float)
     per_day: list[dict[str, Any]] = []
@@ -1007,6 +1051,7 @@ def policy_day_ahead(
         "skipped_no_usable_intervals": 0,
         "frozen_by_seed": 0,
         "clipped": 0,
+        "floor_violations": 0,
     }
     clip_charge_total = 0.0
     clip_discharge_total = 0.0
@@ -1041,16 +1086,32 @@ def policy_day_ahead(
         }
 
         if not day_usable.any():
-            # Hold SOC, no flows.  Not a solver failure: an all-gap day has no cost
-            # basis, so there is nothing to optimise and nothing to spend.
+            # No flows, but drain still applies: the battery is physically present
+            # and losing energy in every interval, gap-excluded or not.  This matches
+            # simulate() and the oracle's SOC recurrence.
+            drain_kwh = spec.idle_loss_kwh_per_hour * horizon.interval_seconds / 3600.0
+            carried_kwh -= drain_kwh * m
             counters["skipped_no_usable_intervals"] += 1
             record["degradation"] = "skipped_no_usable_intervals"
             record["note"] = (
                 "every interval of this local day is gap-excluded, so no MILP was built "
-                "and SOC was carried unchanged with zero flow; a gap-excluded interval "
-                "contributes no cost to any policy, so this day is neutral in the "
+                "and SOC was carried with zero flow but idle drain applied; a gap-excluded "
+                "interval contributes no cost to any policy, so this day is neutral in the "
                 "comparison rather than missing from it"
             )
+            # Check for substantive floor violation from drain
+            deficit = horizon_floor_kwh - carried_kwh
+            if deficit > 1e-6:
+                logger.warning(
+                    "day-ahead all-gap day: SOC %.6f kWh fell %.6g kWh below floor %.6f kWh",
+                    carried_kwh,
+                    deficit,
+                    horizon_floor_kwh,
+                )
+                record["degradation"] = "floor_violation_drain"
+                record["note"] += f"; SOC fell {deficit:.6g} kWh below floor due to idle drain"
+                counters["floor_violations"] += 1
+            record["soc_end_kwh"] = float(carried_kwh)
             per_day.append(record)
             continue
 
@@ -1059,12 +1120,31 @@ def policy_day_ahead(
         # last bit.  Un-clamped, a battery parked exactly at soc_max could hand a
         # fraction of 1 + 1e-16 to validate_spec and kill the run over noise.  The
         # reported trajectory is the kernel's, never this loop's.
-        carried_frac = min(max(carried_kwh / capacity, soc_min_frac), soc_max_frac)
+        # Detect substantive floor violations (drain pushed SOC below floor by more
+        # than floating-point tolerance) before clamping restores it silently.
+        raw_frac = carried_kwh / capacity
+        if raw_frac < soc_min_frac - 1e-9 / capacity:
+            deficit_kwh = (soc_min_frac - raw_frac) * capacity
+            logger.warning(
+                "day-ahead carried SOC %.6f kWh is %.6g kWh below floor %.6f kWh "
+                "before clamping; plan is degraded",
+                carried_kwh,
+                deficit_kwh,
+                soc_min_frac * capacity,
+            )
+            record["degradation"] = "floor_violation_drain"
+            record["note"] = (
+                f"carried SOC fell {deficit_kwh:.6g} kWh below floor due to idle drain; "
+                "clamped to floor but plan is degraded"
+            )
+            counters["floor_violations"] += 1
+        carried_frac = min(max(raw_frac, soc_min_frac), soc_max_frac)
         if frozen_by_seed:
             # Nothing to decide: seed protection forbids spending the opening charge, and
             # the opening charge already fills the window.  Same zero-flow outcome as the
             # causal rule reaches on the same spec, reported as its own degradation class
-            # so it can never be mistaken for an optimised day.
+            # so it can never be mistaken for an optimised day.  Drain still applies: the
+            # battery is physically present and losing energy in every interval.
             counters["frozen_by_seed"] += 1
             day_horizon = Horizon(
                 interval_seconds=horizon.interval_seconds,
@@ -1073,6 +1153,8 @@ def policy_day_ahead(
                 usable=day_usable,
                 import_limit_kw=horizon.import_limit_kw,
             )
+            drain_kwh = spec.idle_loss_kwh_per_hour * horizon.interval_seconds / 3600.0
+            carried_kwh -= drain_kwh * m
             record["soc_end_kwh"] = float(carried_kwh)
             record["meter_cost_eur"] = float(horizon_cost_eur(day_horizon, day_horizon.load_kwh))
             rollup_meter_cost += record["meter_cost_eur"]
@@ -1080,8 +1162,9 @@ def policy_day_ahead(
             record["degradation"] = "frozen_by_seed_at_ceiling"
             record["note"] = (
                 "the opening seed is at the SOC ceiling, so under seed protection nothing "
-                "can be charged and nothing may be spent: zero flows, SOC held. The causal "
-                "rule reaches the same zero-flow outcome on the same spec"
+                "can be charged and nothing may be spent: zero flows, SOC carried with idle "
+                "drain applied. The causal rule reaches the same zero-flow outcome on the "
+                "same spec"
             )
             per_day.append(record)
             continue
@@ -1130,9 +1213,24 @@ def policy_day_ahead(
             counters[kind] += 1
             record["degradation"] = f"{kind}_hold_soc_no_charging"
             record["note"] = f"{type(exc).__name__}: {exc}"
-            # Flows stay zero for this day: hold SOC, charge nothing, spend nothing.
-            # The meter cost is therefore the no-battery cost of this day, and the
-            # terminal value neither rewards nor punishes an unchanged SOC.
+            # Flows stay zero for this day: charge nothing, spend nothing.
+            # But drain still applies: the battery is physically present and
+            # losing energy in every interval, even when no plan is executed.
+            drain_kwh = spec.idle_loss_kwh_per_hour * horizon.interval_seconds / 3600.0
+            carried_kwh -= drain_kwh * m
+            # Check for substantive floor violation from drain
+            deficit = horizon_floor_kwh - carried_kwh
+            if deficit > 1e-6:
+                logger.warning(
+                    "day-ahead oracle error fallback: SOC %.6f kWh fell %.6g kWh "
+                    "below floor %.6f kWh",
+                    carried_kwh,
+                    deficit,
+                    horizon_floor_kwh,
+                )
+                record["degradation"] = "floor_violation_drain"
+                record["note"] += f"; SOC fell {deficit:.6g} kWh below floor due to idle drain"
+                counters["floor_violations"] += 1
             record["soc_end_kwh"] = float(carried_kwh)
             # Zero flows, so net import equals the measured load on every interval.
             record["meter_cost_eur"] = float(
@@ -1255,6 +1353,7 @@ def policy_day_ahead(
         "days_with_clipping": counters["clipped"],
         "charge_clipped_kwh": float(clip_charge_total),
         "discharge_clipped_kwh": float(clip_discharge_total),
+        "floor_violations": counters["floor_violations"],
         "clipping_note": (
             "a forecast-derived plan can exceed what the MEASURED load allows: discharge "
             "beyond it would export, charging beyond the measured-load headroom would "

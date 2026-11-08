@@ -2067,3 +2067,300 @@ class TestSeedProtectionIsHorizonLevel:
         assert np.all(sched.discharge_kwh == 0.0)
         assert sched.cost_eur == pytest.approx(policy_no_battery(s, h).cost_eur)
         assert "no headroom" in tele["degradation_note"]
+
+
+# ---------------------------------------------------------------------------
+# Idle drain integration — all policy paths agree with simulate()
+# ---------------------------------------------------------------------------
+
+
+class TestIdleDrainIntegration:
+    """Every policy path accounts for idle drain consistently with simulate()."""
+
+    def test_no_battery_with_configured_drain_has_zero_drain(self) -> None:
+        """A counterfactual with no battery must not incur battery standby loss."""
+        drain_kw = 0.026
+        s = spec(idle_loss_kwh_per_hour=drain_kw, initial_soc_frac=0.2)
+        h = horizon([0.1, 0.2, 0.3], [1.0, 0.5, 2.0])
+        sched = policy_no_battery(s, h)
+        # SOC stays flat at the initial value — no drain applied
+        expected_soc = s.capacity_kwh * 0.2
+        assert np.allclose(sched.soc_kwh, expected_soc)
+        assert sched.soc_min_frac == pytest.approx(0.2)
+        assert sched.soc_max_frac == pytest.approx(0.2)
+
+    def test_causal_with_drain_tracks_soc_correctly(self) -> None:
+        """Causal policy with drain: SOC trajectory matches manual walk with drain."""
+        drain_kw = 0.026
+        drain_per_interval = drain_kw * QUARTER / 3600.0
+        # Start high enough that drain doesn't cause floor violations
+        s = spec(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.8,
+            soc_min_frac=0.2,
+            soc_max_frac=0.95,
+            terminal_soc_frac=0.2,
+        )
+        floor_kwh = s.soc_bound_kwh("min")
+        # Mixed prices - some charge, some discharge
+        n = 4
+        prices = [0.05, 0.4, 0.05, 0.4]
+        load = [0.3] * n
+        h = horizon(prices, load)
+        sched = policy_causal_price(s, h, charge_threshold=0.1, discharge_threshold=0.3)
+        # SOC trajectory matches manual walk with drain
+        soc = s.soc_bound_kwh("init")
+        eta_c = s.charge_efficiency
+        eta_d = s.discharge_efficiency
+        for t in range(n):
+            soc += sched.charge_kwh[t] * eta_c - sched.discharge_kwh[t] / eta_d - drain_per_interval
+            assert sched.soc_kwh[t] == pytest.approx(soc)
+        # SOC stays above the floor (high initial SOC prevents violations)
+        assert all(sched.soc_kwh >= floor_kwh - 1e-9)
+
+    def test_causal_multi_window_soc_carry_with_drain(self) -> None:
+        """Causal policy carries SOC correctly across multiple intervals with drain."""
+        drain_kw = 0.026
+        drain_per_interval = drain_kw * QUARTER / 3600.0
+        s = spec(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.5,
+            charge_efficiency=0.9,
+            discharge_efficiency=0.9,
+        )
+        n = 6
+        prices = [0.05, 0.05, 0.4, 0.4, 0.05, 0.4]
+        load = [0.3] * n
+        h = horizon(prices, load)
+        sched = policy_causal_price(s, h, charge_threshold=0.1, discharge_threshold=0.3)
+        # Verify SOC trajectory matches a manual walk with drain
+        soc = s.soc_bound_kwh("init")
+        eta_c = s.charge_efficiency
+        eta_d = s.discharge_efficiency
+        for t in range(n):
+            soc += sched.charge_kwh[t] * eta_c - sched.discharge_kwh[t] / eta_d - drain_per_interval
+            assert sched.soc_kwh[t] == pytest.approx(soc)
+
+    def test_clipping_with_drain(self) -> None:
+        """_clip_plan_to_model_bounds accounts for drain in the SOC walk."""
+        from battery_optimizer.policies import _clip_plan_to_model_bounds
+
+        drain_kw = 0.026
+        drain_per_interval = drain_kw * QUARTER / 3600.0
+        s = spec(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.5,
+            charge_efficiency=0.9,
+            discharge_efficiency=0.9,
+        )
+        n = 4
+        h = horizon([0.1] * n, [0.3] * n)
+        # A plan that charges and discharges
+        charge = np.array([1.0, 0.0, 0.0, 0.0])
+        discharge = np.array([0.0, 0.0, 1.0, 0.0])
+        out_c, out_d, end_soc, clip_c, clip_d = _clip_plan_to_model_bounds(
+            s, h, charge, discharge, floor_kwh=s.soc_bound_kwh("min")
+        )
+        # Verify end SOC matches a manual walk with drain
+        soc = s.soc_bound_kwh("init")
+        eta_c = s.charge_efficiency
+        eta_d = s.discharge_efficiency
+        for t in range(n):
+            soc += out_c[t] * eta_c - out_d[t] / eta_d - drain_per_interval
+        assert end_soc == pytest.approx(soc)
+
+    def test_excluded_intervals_with_drain(self) -> None:
+        """Gap-excluded intervals still incur drain in all policy paths."""
+        drain_kw = 0.026
+        drain_per_interval = drain_kw * QUARTER / 3600.0
+        s = spec(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.5,
+        )
+        n = 4
+        prices = [0.05, 0.4, 0.05, 0.4]
+        load = [0.3] * n
+        usable = [True, False, True, False]  # alternating usable/gap
+        h = horizon(prices, load, usable=usable)
+        sched = policy_causal_price(s, h, charge_threshold=0.1, discharge_threshold=0.3)
+        # SOC decreases by drain in every interval, including gap-excluded ones
+        soc = s.soc_bound_kwh("init")
+        eta_c = s.charge_efficiency
+        eta_d = s.discharge_efficiency
+        for t in range(n):
+            if usable[t]:
+                soc += sched.charge_kwh[t] * eta_c - sched.discharge_kwh[t] / eta_d
+            soc -= drain_per_interval
+            assert sched.soc_kwh[t] == pytest.approx(soc)
+
+    def test_day_ahead_all_gap_day_applies_drain(self) -> None:
+        """An all-gap day applies drain to the carried SOC."""
+        drain_kw = 0.026
+        drain_per_interval = drain_kw * QUARTER / 3600.0
+        # Start at 50% SOC with terminal at 20%, so causal floor is 50% (initial).
+        # Drain will cause a floor violation, which is now detected and reported.
+        s = spec(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.5,
+            terminal_soc_frac=0.2,
+        )
+        per_day = 4
+        n = 2 * per_day
+        prices = [0.1] * n
+        load = [0.3] * n
+        days = [
+            DayAheadDay(label="a", start=0, stop=per_day, forecast_load=load[:per_day]),
+            DayAheadDay(label="b", start=per_day, stop=n, forecast_load=load[per_day:]),
+        ]
+        # Make day "a" all gap-excluded
+        day_usable = [False] * per_day + [True] * per_day
+        h_with_gaps = Horizon(
+            interval_seconds=QUARTER,
+            prices=np.array(prices),
+            load_kwh=np.array(load),
+            usable=np.array(day_usable),
+        )
+        sched, tele = policy_day_ahead(
+            s,
+            h_with_gaps,
+            days,
+            terminal_value_eur_per_kwh=0.1,
+            time_limit_s=10.0,
+            mip_rel_gap=1e-6,
+            mip_abs_gap=1e-9,
+        )
+        # Day "a" should have drain applied
+        day_a = tele["per_day"][0]
+        expected_soc_after_a = s.soc_bound_kwh("init") - drain_per_interval * per_day
+        assert day_a["soc_end_kwh"] == pytest.approx(expected_soc_after_a)
+        # Drain causes floor violation (initial SOC is the causal floor), so degradation
+        # is now "floor_violation_drain" instead of "skipped_no_usable_intervals"
+        assert day_a["degradation"] == "floor_violation_drain"
+        assert tele["floor_violations"] >= 1
+
+    def test_day_ahead_frozen_by_seed_applies_drain(self) -> None:
+        """Frozen-by-seed only applies when drain is 0; with drain the solver handles it."""
+        # With drain > 0, frozen_by_seed does NOT apply — the battery can charge to
+        # offset drain even at ceiling (maintenance charging).
+        drain_kw = 0.026
+        drain_per_interval = drain_kw * QUARTER / 3600.0
+        s = spec(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.95,
+            soc_max_frac=0.95,
+        )
+        per_day = 4
+        n = per_day
+        prices = [0.05] * n  # cheap prices — would charge, but at ceiling
+        load = [0.3] * n
+        h = horizon(prices, load)
+        days = [DayAheadDay(label="a", start=0, stop=per_day, forecast_load=load)]
+        sched, tele = policy_day_ahead(
+            s,
+            h,
+            days,
+            terminal_value_eur_per_kwh=0.1,
+            time_limit_s=10.0,
+            mip_rel_gap=1e-6,
+            mip_abs_gap=1e-9,
+        )
+        # With drain > 0, frozen_by_seed does NOT apply — solver handles maintenance
+        day_a = tele["per_day"][0]
+        assert day_a["degradation"] != "frozen_by_seed_at_ceiling"
+        # Solver should charge to offset drain, keeping SOC near ceiling
+        assert day_a["soc_end_kwh"] > s.soc_bound_kwh("init") - drain_per_interval * per_day
+
+    def test_day_ahead_frozen_by_seed_zero_drain(self) -> None:
+        """Frozen-by-seed applies when drain is 0 and at ceiling."""
+        s = spec(
+            idle_loss_kwh_per_hour=0.0,  # no drain
+            initial_soc_frac=0.95,
+            soc_max_frac=0.95,
+        )
+        per_day = 4
+        n = per_day
+        prices = [0.05] * n
+        load = [0.3] * n
+        h = horizon(prices, load)
+        days = [DayAheadDay(label="a", start=0, stop=per_day, forecast_load=load)]
+        sched, tele = policy_day_ahead(
+            s,
+            h,
+            days,
+            terminal_value_eur_per_kwh=0.1,
+            time_limit_s=10.0,
+            mip_rel_gap=1e-6,
+            mip_abs_gap=1e-9,
+        )
+        # Frozen by seed: at ceiling with no drain, nothing to do
+        day_a = tele["per_day"][0]
+        assert day_a["degradation"] == "frozen_by_seed_at_ceiling"
+        assert day_a["soc_end_kwh"] == pytest.approx(s.soc_bound_kwh("init"))
+
+    def test_simulate_agrees_with_causal_on_soc_with_drain(self) -> None:
+        """simulate() and the causal policy agree on SOC trajectory with drain."""
+        drain_kw = 0.026
+        s = spec(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.5,
+            charge_efficiency=0.9,
+            discharge_efficiency=0.9,
+        )
+        n = 8
+        prices = [0.05, 0.05, 0.4, 0.4, 0.05, 0.4, 0.05, 0.4]
+        load = [0.3] * n
+        h = horizon(prices, load)
+        causal = policy_causal_price(s, h, charge_threshold=0.1, discharge_threshold=0.3)
+        sim = simulate(s, h, causal.charge_kwh, causal.discharge_kwh, enforce_terminal_soc=False)
+        assert np.allclose(causal.soc_kwh, sim.soc_kwh)
+
+    def test_causal_at_floor_with_drain_maintenance_charges(self) -> None:
+        """Causal policy at floor with drain: maintenance charging keeps SOC at floor."""
+        drain_kw = 0.26  # larger drain to make the effect visible
+        drain_per_interval = drain_kw * QUARTER / 3600.0
+        eta_c = 0.95
+        # Start at floor (20% of 5.12 = 1.024 kWh)
+        s = spec(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.2,
+            soc_min_frac=0.2,
+            soc_max_frac=0.95,
+            charge_efficiency=eta_c,
+            terminal_soc_frac=0.2,
+        )
+        floor_kwh = s.soc_bound_kwh("min")
+        # All prices in idle band (between charge and discharge thresholds)
+        n = 4
+        prices = [0.2] * n  # between thresholds
+        load = [0.3] * n
+        h = horizon(prices, load)
+        # Should not crash — maintenance charging offsets drain
+        sched = policy_causal_price(s, h, charge_threshold=0.1, discharge_threshold=0.3)
+        # SOC stays at or above floor (maintenance charging offsets drain)
+        assert all(sched.soc_kwh >= floor_kwh - 1e-9)
+        # Some charging happened (maintenance charge)
+        assert sched.charge_kwh.sum() > 0
+        # The charge should be approximately drain/eta_c per interval
+        expected_maintenance = drain_per_interval / eta_c
+        for t in range(n):
+            assert sched.charge_kwh[t] == pytest.approx(expected_maintenance, abs=1e-9)
+
+    def test_causal_at_floor_no_crash(self) -> None:
+        """Causal policy starting at floor with drain does not raise BatteryPhysicsError."""
+        drain_kw = 0.026
+        s = spec(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.2,
+            soc_min_frac=0.2,
+            soc_max_frac=0.95,
+            terminal_soc_frac=0.2,
+        )
+        n = 8
+        prices = [0.2] * n  # idle band
+        load = [0.3] * n
+        h = horizon(prices, load)
+        # Should not raise
+        sched = policy_causal_price(s, h, charge_threshold=0.1, discharge_threshold=0.3)
+        # SOC stays above floor
+        floor_kwh = s.soc_bound_kwh("min")
+        assert all(sched.soc_kwh >= floor_kwh - 1e-9)

@@ -1187,10 +1187,14 @@ def intents_from_schedule(
     capacity = battery_spec.capacity_kwh
     eta_c = battery_spec.charge_efficiency
     eta_d = battery_spec.discharge_efficiency
+    # Account for idle drain if configured (kWh per interval).
+    drain_kwh = (
+        getattr(battery_spec, "idle_loss_kwh_per_hour", 0.0) * horizon.interval_seconds / 3600.0
+    )
     # SOC is end-of-interval, so the interval's opening state is one recurrence step
     # back.  If that does not equal the spec's seed, this is not the spec the plan
     # was solved with — the classic cause being an un-reanchored sliced window.
-    opening_kwh = float(soc_kwh[0] - (charge[0] * eta_c - discharge[0] / eta_d))
+    opening_kwh = float(soc_kwh[0] - (charge[0] * eta_c - discharge[0] / eta_d) + drain_kwh)
     seed_kwh = battery_spec.soc_bound_kwh("init")
     if abs(opening_kwh - seed_kwh) > _SOC_TOL_KWH:
         raise DispatchError(

@@ -140,6 +140,13 @@ class BatteryConfig:
     soc_window_max: float | None
     import_limit_kw: float | None
     initial_soc_frac: float | None = None
+    idle_drain_w: float | None = None
+    """Constant parasitic drain in watts when the battery is idle.
+
+    Measured at about 26 W DC (2026-11-07/08).  Converted to
+    ``idle_loss_kwh_per_hour`` (kW) by the benchmark resolver.  ``None`` means
+    unconfigured (no drain modelled, the historical behaviour).
+    """
 
 
 @dataclass(frozen=True)
@@ -318,6 +325,7 @@ def load_config(path: Path) -> TariffConfig:
         soc_window_max=bat_raw.get("soc_window_max"),
         import_limit_kw=bat_raw.get("import_limit_kw"),
         initial_soc_frac=bat_raw.get("initial_soc_frac"),
+        idle_drain_w=bat_raw.get("idle_drain_w"),
     )
 
     return TariffConfig(

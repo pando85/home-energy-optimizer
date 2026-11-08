@@ -654,6 +654,7 @@ def build_model(
     eta_c = spec.charge_efficiency
     eta_d = spec.discharge_efficiency
     usable = horizon.usable
+    drain_kwh = spec.idle_loss_kwh_per_hour * horizon.interval_seconds / 3600.0
 
     t_of = np.arange(n)
     c_idx = 3 * t_of
@@ -721,17 +722,19 @@ def build_model(
         add_row([(_discharge_idx(t), 1.0), (_mode_idx(t), limit)], -np.inf, limit)
 
     for t in range(n):
-        # 2. SOC recurrence
+        # 2. SOC recurrence (with idle drain: constant parasitic loss per interval)
         coefs = [
             (_soc_idx(n, t), 1.0),
             (_charge_idx(t), -eta_c),
             (_discharge_idx(t), 1.0 / eta_d),
         ]
+        # Use 0.0 (not -0.0) when drain is zero to keep byte-identical digests.
+        rhs = 0.0 if drain_kwh == 0.0 else -drain_kwh
         if t == 0:
-            add_row(coefs, soc_init, soc_init)
+            add_row(coefs, soc_init + rhs, soc_init + rhs)
         else:
             coefs.append((_soc_idx(n, t - 1), -1.0))
-            add_row(coefs, 0.0, 0.0)
+            add_row(coefs, rhs, rhs)
 
     for t in range(n):
         # 5. no intentional export

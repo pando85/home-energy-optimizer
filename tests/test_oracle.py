@@ -2013,3 +2013,93 @@ class TestDayAheadReusesOracleAssembly:
             assert entry["kwargs"]["time_limit_s"] == 7.0
             assert entry["kwargs"]["mip_rel_gap"] == 1e-8
             assert entry["kwargs"]["mip_abs_gap"] == 1e-11
+
+
+class TestOracleIdleDrain:
+    """Oracle MILP accounts for the constant parasitic drain in SOC recurrence."""
+
+    def test_oracle_with_drain_produces_feasible_plan(self) -> None:
+        """The oracle solves successfully with a positive idle drain."""
+        drain_kw = 0.026
+        s = spec(idle_loss_kwh_per_hour=drain_kw, initial_soc_frac=0.5)
+        n = 8
+        h = Horizon(
+            interval_seconds=QUARTER,
+            prices=np.array([0.3, 0.1, 0.05, 0.05, 0.1, 0.2, 0.35, 0.4]),
+            load_kwh=np.full(n, 0.3),
+            usable=np.ones(n, dtype=bool),
+        )
+        result = solve_oracle(s, h, terminal_mode="free", terminal_value_eur_per_kwh=0.0)
+        # Plan is feasible: SOC stays within bounds
+        floor = s.soc_bound_kwh("min")
+        ceil = s.soc_bound_kwh("max")
+        assert all(soc >= floor - 1e-9 for soc in result.soc_kwh)
+        assert all(soc <= ceil + 1e-9 for soc in result.soc_kwh)
+
+    def test_oracle_drain_reduces_terminal_soc_vs_no_drain(self) -> None:
+        """With the same plan, drain reduces the terminal SOC."""
+        n = 4
+        h = Horizon(
+            interval_seconds=QUARTER,
+            prices=np.full(n, 0.2),
+            load_kwh=np.full(n, 0.3),
+            usable=np.ones(n, dtype=bool),
+        )
+        # All idle plan
+        charge = np.zeros(n)
+        discharge = np.zeros(n)
+
+        s_no_drain = spec(initial_soc_frac=0.5)
+        s_with_drain = spec(initial_soc_frac=0.5, idle_loss_kwh_per_hour=0.026)
+
+        soc_no = simulate(s_no_drain, h, charge, discharge, enforce_terminal_soc=False)
+        soc_with = simulate(s_with_drain, h, charge, discharge, enforce_terminal_soc=False)
+        # With drain, terminal SOC is lower
+        assert soc_with.terminal_soc_kwh < soc_no.terminal_soc_kwh
+        drain_total = 0.026 * QUARTER / 3600.0 * n
+        assert soc_no.terminal_soc_kwh - soc_with.terminal_soc_kwh == pytest.approx(drain_total)
+
+    def test_build_model_includes_drain_in_soc_recurrence(self) -> None:
+        """The MILP constraint matrix accounts for the drain in the SOC recurrence."""
+        drain_kw = 0.026
+        s = spec(idle_loss_kwh_per_hour=drain_kw, initial_soc_frac=0.5)
+        n = 2
+        h = Horizon(
+            interval_seconds=QUARTER,
+            prices=np.array([0.1, 0.3]),
+            load_kwh=np.full(n, 0.2),
+            usable=np.ones(n, dtype=bool),
+        )
+        obj, integrality, bounds, constraints = build_model(s, h, terminal_mode="fixed")
+        # The model was built without error; the drain is embedded in the
+        # constraint RHS.  Solve it and verify feasibility.
+        result = milp(
+            c=obj,
+            integrality=integrality,
+            bounds=bounds,
+            constraints=constraints,
+        )
+        assert result.success
+        # Extract variables and verify each SOC delta against charge, discharge,
+        # and expected drain loss.
+        x = result.x
+        charge_0 = x[0]
+        discharge_0 = x[1]
+        charge_1 = x[3]
+        discharge_1 = x[4]
+        soc_0 = x[3 * n + 0]  # soc[0]
+        soc_1 = x[3 * n + 1]  # soc[1]
+        drain_per_interval = drain_kw * QUARTER / 3600.0
+        eta_c = s.charge_efficiency
+        eta_d = s.discharge_efficiency
+        soc_init = s.soc_bound_kwh("init")
+        # Each SOC delta must equal charge*eta_c - discharge/eta_d - drain
+        expected_soc_0 = soc_init + charge_0 * eta_c - discharge_0 / eta_d - drain_per_interval
+        expected_soc_1 = soc_0 + charge_1 * eta_c - discharge_1 / eta_d - drain_per_interval
+        assert soc_0 == pytest.approx(expected_soc_0, abs=1e-6)
+        assert soc_1 == pytest.approx(expected_soc_1, abs=1e-6)
+        # In fixed mode, terminal SOC is pinned to initial (5.0 kWh).
+        assert soc_1 == pytest.approx(5.0, abs=1e-6)
+        # The first interval's SOC reflects the drain: even if the solver
+        # charges, the recurrence includes the drain term.
+        assert soc_0 > 5.0 - drain_per_interval  # solver charged to compensate

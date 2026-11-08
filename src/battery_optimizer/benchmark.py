@@ -755,7 +755,18 @@ def resolve_battery_assumptions(
             "site could actually draw"
         )
 
-    idle = getattr(battery, "idle_loss_kwh_per_hour", None)
+    idle_drain_w = getattr(battery, "idle_drain_w", None)
+    # Backward compatibility: also accept the old field name (kW directly).
+    idle_loss_kwh = getattr(battery, "idle_loss_kwh_per_hour", None)
+    if idle_drain_w is not None:
+        idle_loss = float(idle_drain_w) / 1000.0  # W → kW
+        idle_measured = True
+    elif idle_loss_kwh is not None:
+        idle_loss = float(idle_loss_kwh)
+        idle_measured = True
+    else:
+        idle_loss = 0.0
+        idle_measured = False
     return BatteryAssumptions(
         capacity_kwh=capacity,
         power_kw=power,
@@ -768,8 +779,8 @@ def resolve_battery_assumptions(
         efficiency_mapping=mapping,
         initial_soc_source=initial_source,
         import_limit_source=limit_source,
-        idle_loss_kwh_per_hour=float(idle) if idle is not None else 0.0,
-        idle_losses_measured=idle is not None,
+        idle_loss_kwh_per_hour=idle_loss,
+        idle_losses_measured=idle_measured,
     )
 
 

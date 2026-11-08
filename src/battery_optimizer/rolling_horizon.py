@@ -89,6 +89,7 @@ mistake planned multiplicity for curtailment.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -131,6 +132,8 @@ from .price_outlook import (
     resolve_price_outlook_params,
     run_price_outlook,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "LOAD_FORECAST_MODE_CAUSAL",
@@ -1764,7 +1767,13 @@ def run_rolling_horizon(
     soc_max_frac = spec.soc_max_frac
     init_kwh = spec.soc_bound_kwh("init")
     horizon_floor_kwh = spec.causal_floor_kwh()
-    frozen_by_seed = horizon_floor_kwh >= spec.soc_bound_kwh("max") - _SOC_NOISE_KWH
+    # Frozen-by-seed only applies when drain is 0: with nonzero drain, the battery
+    # can charge to offset drain even at ceiling (maintenance charging), so the
+    # shortcut is invalid.
+    _rh_drain_kwh = spec.idle_loss_kwh_per_hour * interval_seconds / 3600.0
+    frozen_by_seed = (
+        _rh_drain_kwh == 0.0 and horizon_floor_kwh >= spec.soc_bound_kwh("max") - _SOC_NOISE_KWH
+    )
 
     carried_kwh = init_kwh
     per_event: list[dict[str, Any]] = []
@@ -1778,6 +1787,7 @@ def run_rolling_horizon(
         "frozen_by_seed": 0,
         "clipped": 0,
         "solver_attempts": 0,
+        "floor_violations": 0,
     }
     clip_charge_total = 0.0
     clip_discharge_total = 0.0
@@ -1869,12 +1879,45 @@ def run_rolling_horizon(
         if not plan_usable.any():
             counters["skipped_no_usable"] += 1
             record["degradation"] = "skipped_no_usable"
+            # No flows, but drain still applies for the execution window.
+            drain_kwh = spec.idle_loss_kwh_per_hour * interval_seconds / 3600.0
+            carried_kwh -= drain_kwh * exec_m
+            # Check for substantive floor violation from drain
+            deficit = horizon_floor_kwh - carried_kwh
+            if deficit > 1e-6:
+                logger.warning(
+                    "rolling-horizon no-usable: SOC %.6f kWh fell %.6g kWh below floor %.6f kWh",
+                    carried_kwh,
+                    deficit,
+                    horizon_floor_kwh,
+                )
+                record["degradation"] = "floor_violation_drain"
+                record["note"] = f"SOC fell {deficit:.6g} kWh below floor due to idle drain"
+                counters["floor_violations"] += 1
+            record["soc_end_kwh"] = float(carried_kwh)
             per_event.append(record)
             continue
 
         if frozen_by_seed:
             counters["frozen_by_seed"] += 1
             record["degradation"] = "frozen_by_seed_at_ceiling"
+            # No flows, but drain still applies for the execution window.
+            drain_kwh = spec.idle_loss_kwh_per_hour * interval_seconds / 3600.0
+            carried_kwh -= drain_kwh * exec_m
+            # Check for substantive floor violation from drain
+            deficit = horizon_floor_kwh - carried_kwh
+            if deficit > 1e-6:
+                logger.warning(
+                    "rolling-horizon frozen-by-seed: SOC %.6f kWh fell %.6g kWh "
+                    "below floor %.6f kWh",
+                    carried_kwh,
+                    deficit,
+                    horizon_floor_kwh,
+                )
+                record["degradation"] = "floor_violation_drain"
+                record["note"] = f"SOC fell {deficit:.6g} kWh below floor due to idle drain"
+                counters["floor_violations"] += 1
+            record["soc_end_kwh"] = float(carried_kwh)
             per_event.append(record)
             continue
 
@@ -1927,7 +1970,24 @@ def run_rolling_horizon(
             plan_forecast = frozen_load[ev.start_idx : plan_end_idx]
 
         # Construct spec with carried SOC
-        carried_frac = min(max(carried_kwh / capacity, soc_min_frac), soc_max_frac)
+        # Detect substantive floor violations before clamping restores SOC silently.
+        raw_frac = carried_kwh / capacity
+        if raw_frac < soc_min_frac - 1e-9 / capacity:
+            deficit_kwh = (soc_min_frac - raw_frac) * capacity
+            logger.warning(
+                "rolling-horizon carried SOC %.6f kWh is %.6g kWh below floor "
+                "%.6f kWh before clamping; plan is degraded",
+                carried_kwh,
+                deficit_kwh,
+                soc_min_frac * capacity,
+            )
+            record["degradation"] = "floor_violation_drain"
+            record["note"] = (
+                f"carried SOC fell {deficit_kwh:.6g} kWh below floor due to idle drain; "
+                "clamped to floor but plan is degraded"
+            )
+            counters["floor_violations"] += 1
+        carried_frac = min(max(raw_frac, soc_min_frac), soc_max_frac)
         day_spec = replace(spec, initial_soc_frac=carried_frac, terminal_soc_frac=None)
 
         # Forecast horizon (for solving)
@@ -1975,6 +2035,23 @@ def run_rolling_horizon(
             record["degradation"] = f"{kind}_hold_soc"
             record["note"] = f"{type(exc).__name__}: {exc}"
             record["solver_status"] = "failed"
+            # Flows stay zero for this event's execution window, but drain still
+            # applies: the battery is physically present and losing energy.
+            drain_kwh = spec.idle_loss_kwh_per_hour * interval_seconds / 3600.0
+            carried_kwh -= drain_kwh * exec_m
+            # Check for substantive floor violation from drain
+            deficit = horizon_floor_kwh - carried_kwh
+            if deficit > 1e-6:
+                logger.warning(
+                    "rolling-horizon solver error: SOC %.6f kWh fell %.6g kWh below floor %.6f kWh",
+                    carried_kwh,
+                    deficit,
+                    horizon_floor_kwh,
+                )
+                record["degradation"] = "floor_violation_drain"
+                record["note"] += f"; SOC fell {deficit:.6g} kWh below floor due to idle drain"
+                counters["floor_violations"] += 1
+            record["soc_end_kwh"] = float(carried_kwh)
             per_event.append(record)
             continue
 
@@ -2012,10 +2089,12 @@ def run_rolling_horizon(
         # Compute actual SOC at execution end by walking the executed portion
         eta_c = spec.charge_efficiency
         eta_d = spec.discharge_efficiency
+        drain_kwh = spec.idle_loss_kwh_per_hour * interval_seconds / 3600.0
         soc = carried_kwh
         for t in range(exec_m):
             if plan_usable[t]:
                 soc += exec_charge[t] * eta_c - exec_discharge[t] / eta_d
+            soc -= drain_kwh
         carried_kwh = float(soc)
 
         record["soc_end_kwh"] = carried_kwh
@@ -2087,6 +2166,7 @@ def run_rolling_horizon(
         "events_with_clipping": counters["clipped"],
         "charge_clipped_kwh": float(clip_charge_total),
         "discharge_clipped_kwh": float(clip_discharge_total),
+        "floor_violations": counters["floor_violations"],
         # --- planned-versus-executed multiplicity -------------------------------
         # Each executed interval is also counted in every other plan whose horizon
         # covered it.  Executed multiplicity is exactly 1 by the coverage check above;

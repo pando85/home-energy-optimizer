@@ -68,8 +68,9 @@ data. Everything else in the block is a labelled assumption — most importantly
 which since 2026-10-24 ships **0.80**, the bottom of the community-measured 0.80–0.84 range, adopted on
 the reasoning that at 2.5 kW the unit operates mostly near its power rating where efficiency is
 typically worst. It supersedes the previous provisional 0.88 and is **still not a measurement of this
-household's unit**: the efficiency-versus-power curve is unmeasured, and idle draw is assumed zero and
-unmeasured. Because the block is mapped to one-way efficiencies by a symmetric square root, the kernel
+household's unit**: the efficiency-versus-power curve is unmeasured. Idle drain is now modelled at
+26 W (adopted 2026-11-08, see battery-model.md), applied unconditionally to every interval's SOC
+recurrence. Because the block is mapped to one-way efficiencies by a symmetric square root, the kernel
 now charges and discharges at `sqrt(0.80) = 0.89443` per direction, replacing `sqrt(0.88) = 0.93808`.
 Two consequences follow, and both are why the whole block is pinned by
 `tests/test_benchmark.py::TestResolveBatteryAssumptions::test_shipped_tariff_battery_assumptions_are_pinned`:

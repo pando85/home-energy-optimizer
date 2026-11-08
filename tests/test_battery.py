@@ -1066,3 +1066,95 @@ class TestFrozenArrays:
             sched.charge_kwh[0] = 5.0
         with pytest.raises(ValueError, match="read-only"):
             sched.discharge_kwh[0] = 5.0
+
+
+class TestIdleDrain:
+    """Idle drain: constant parasitic loss per interval in the SOC recurrence."""
+
+    def test_zero_drain_reproduces_historical_behaviour(self) -> None:
+        """idle_loss_kwh_per_hour=0 (the default) leaves the recurrence unchanged."""
+        spec = spec_10kwh()
+        charge = np.array([1.0, 0.0])
+        discharge = np.array([0.0, 0.5])
+        soc_no_drain = soc_trajectory_kwh(spec, charge, discharge)
+        spec_with_zero = spec_10kwh(idle_loss_kwh_per_hour=0.0)
+        soc_explicit_zero = soc_trajectory_kwh(
+            spec_with_zero, charge, discharge, interval_seconds=QUARTER
+        )
+        assert np.allclose(soc_no_drain, soc_explicit_zero)
+
+    def test_idle_drain_reduces_soc_every_interval(self) -> None:
+        """A positive drain subtracts a constant per-interval loss from SOC."""
+        drain_w = 26.0  # W
+        drain_kw = drain_w / 1000.0  # 0.026 kW
+        spec = spec_10kwh(idle_loss_kwh_per_hour=drain_kw, initial_soc_frac=0.5)
+        # All idle: no charge, no discharge
+        n = 4
+        charge = np.zeros(n)
+        discharge = np.zeros(n)
+        soc = soc_trajectory_kwh(spec, charge, discharge, interval_seconds=QUARTER)
+        drain_per_interval = drain_kw * QUARTER / 3600.0  # kWh
+        expected = 5.0 - np.cumsum(np.full(n, drain_per_interval))
+        assert np.allclose(soc, expected)
+
+    def test_drain_applies_during_charge_and_discharge_too(self) -> None:
+        """The drain is unconditional: it applies in every interval.
+
+        During charge/discharge the 26 W is negligible vs the power levels,
+        but the MILP and the simulator must agree on the recurrence.
+        """
+        drain_kw = 0.026
+        spec = spec_10kwh(
+            idle_loss_kwh_per_hour=drain_kw,
+            initial_soc_frac=0.5,
+            charge_efficiency=0.9,
+            discharge_efficiency=0.9,
+        )
+        charge = np.array([1.0, 0.0])
+        discharge = np.array([0.0, 0.5])
+        soc = soc_trajectory_kwh(spec, charge, discharge, interval_seconds=QUARTER)
+        drain_per_interval = drain_kw * QUARTER / 3600.0
+        # t=0: 5.0 + 1.0*0.9 - drain = 5.9 - drain
+        # t=1: (5.9 - drain) + 0 - 0.5/0.9 - drain
+        expected_0 = 5.0 + 1.0 * 0.9 - drain_per_interval
+        expected_1 = expected_0 - 0.5 / 0.9 - drain_per_interval
+        assert soc[0] == pytest.approx(expected_0)
+        assert soc[1] == pytest.approx(expected_1)
+
+    def test_validate_spec_rejects_negative_drain(self) -> None:
+        """Negative idle_loss_kwh_per_hour is physically meaningless."""
+        spec = spec_10kwh(idle_loss_kwh_per_hour=-0.001)
+        with pytest.raises(ValueError, match="idle_loss_kwh_per_hour"):
+            validate_spec(spec)
+
+    def test_simulate_includes_drain_in_soc(self) -> None:
+        """simulate() reports the trajectory with the drain applied."""
+        drain_kw = 0.026
+        spec = spec_10kwh(idle_loss_kwh_per_hour=drain_kw, initial_soc_frac=0.5)
+        n = 4
+        charge = np.zeros(n)
+        discharge = np.zeros(n)
+        h = Horizon(
+            interval_seconds=QUARTER,
+            prices=np.full(n, 0.2),
+            load_kwh=np.full(n, 0.5),
+            usable=np.ones(n, dtype=bool),
+        )
+        sched = simulate(spec, h, charge, discharge, enforce_terminal_soc=False)
+        expected = soc_trajectory_kwh(spec, charge, discharge, interval_seconds=QUARTER)
+        assert np.allclose(sched.soc_kwh, expected)
+
+    def test_drain_scales_with_interval_duration(self) -> None:
+        """The per-interval drain is proportional to interval_seconds."""
+        drain_kw = 0.026
+        spec = spec_10kwh(idle_loss_kwh_per_hour=drain_kw, initial_soc_frac=0.5)
+        charge = np.zeros(2)
+        discharge = np.zeros(2)
+        soc_15min = soc_trajectory_kwh(spec, charge, discharge, interval_seconds=900.0)
+        soc_60min = soc_trajectory_kwh(spec, charge, discharge, interval_seconds=3600.0)
+        drain_15 = drain_kw * 900.0 / 3600.0
+        drain_60 = drain_kw * 3600.0 / 3600.0
+        assert soc_15min[0] == pytest.approx(5.0 - drain_15)
+        assert soc_60min[0] == pytest.approx(5.0 - drain_60)
+        # 60-min drain is 4x the 15-min drain
+        assert drain_60 == pytest.approx(4 * drain_15)

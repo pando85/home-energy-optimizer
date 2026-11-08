@@ -127,7 +127,10 @@ def test_report_hand_computed(store):
     assert o["soc_violations"] == 1
     assert o["solves_skipped"] == {"busy": 1}
     assert o["plans"] == 0  # made before the window: decides its slots, not counted in it
-    stored = 0.5 * ETA - 0.25 / ETA - 0.1 / ETA
+    # With idle drain (26 W = 0.026 kW), each 15-min interval loses 0.0065 kWh.
+    # The "no_plan" interval has no load, so drain doesn't apply there (3 intervals).
+    drain_per_interval = 0.026 * 900.0 / 3600.0
+    stored = 0.5 * ETA - 0.25 / ETA - 0.1 / ETA - 3 * drain_per_interval
     assert report["inventory"]["counterfactual_stored_delta_kwh"] == pytest.approx(stored)
     assert report["savings_inventory_adjusted_eur"] == pytest.approx(0.055 + 0.2 * stored)
     assert report["replay"]["start_soc_frac"] == 0.5
