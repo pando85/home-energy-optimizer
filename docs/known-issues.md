@@ -422,6 +422,12 @@ Status: **open, proposed for the 7-day review (around 2026-11-11 to 11-14).** Li
   the gross load the forecaster learns).
 - Proposal: a fixed overhead plus a proportional efficiency, and the drain in the SOC dynamics (battery block of
   `config/tariff.yaml`, `battery.py`, `oracle.py`). Not applied: it re-mints every `dataset_id`.
+- **Implementation work (2026-11-08, not merged):** branch `feature/idle-drain-model` adds the 26 W idle drain to the
+  battery physics model with maintenance charging at the floor and floor violation detection. All tests pass (4231),
+  but advisory review identified edge cases requiring further design: fallback SOC clamping can mask real energy
+  deficits, clipping may remove valid ceiling maintenance charge, floor violation handling needs careful specification.
+  Not merged; the immediate problem (battery draining below 20%) is solved by the reserve protection deployed in v0.16.0.
+  Branch preserved for future reference.
 - Control side (code only, **not deployed**): while the measured SOC sits at or below the tariff's floor the actuator
   asks for a bounded recovery charge instead of the planned idle or discharge, because idling does not oppose the
   drain ([ADR-0007 amendment](adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection)). It reduces

@@ -59,6 +59,14 @@ model changes here: the drain and the clamp are handled on the control side by t
 Hardware validation still open: the backup-port DC current and the battery's internal standby loss are not measured
 (the installed HA entities for backup power and the native Omnibattery reserve were not available to read).
 
+**Idle drain modeling (2026-11-08, not merged).** Implementation work was done in branch `feature/idle-drain-model` to
+add the 26 W idle drain to the battery physics model. The implementation applies drain to SOC dynamics in `oracle.py`
+and `battery.py`, implements maintenance charging when drain would violate the floor, and adds floor violation detection.
+All tests pass (4231 tests), but advisory review identified edge cases requiring further design: fallback SOC clamping
+can mask real energy deficits, clipping may remove valid ceiling maintenance charge, and floor violation handling needs
+careful specification. The branch documents the implementation approach for future reference. The immediate problem
+(battery draining below 20%) is solved by the reserve protection deployed in v0.16.0.
+
 ## Assumptions
 
 | Parameter | Value | Basis |
