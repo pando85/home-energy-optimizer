@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="960" viewBox="0 0 1600 960" role="img" aria-labelledby="diagram-title diagram-desc">
+<title id="diagram-title">Home energy optimizer architecture</title>
+<desc id="diagram-desc">Home Assistant, Prometheus, published energy prices and weather, and configuration feed the shared data and feature layer. The battery path combines load forecast, price outlook, and battery model in a dispatch optimizer to produce a battery plan. In parallel, the climate path combines thermal and heat pump electricity models in a climate optimizer to produce an advisory climate plan. The two optimizers share data but currently have no direct planner-to-planner link.</desc>
+<defs>
+<linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#081728"/><stop offset="1" stop-color="#17293d"/></linearGradient>
+<linearGradient id="battery" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#173a56"/><stop offset="1" stop-color="#10283d"/></linearGradient>
+<linearGradient id="climate" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#1b463b"/><stop offset="1" stop-color="#122d30"/></linearGradient>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#8caabe"/></marker>
+<marker id="battery-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#58bceb"/></marker>
+<marker id="climate-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#6fdfad"/></marker>
+<style>
+text{font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif}
+.heading{font-size:38px;font-weight:800;fill:#f4f9ff;letter-spacing:.25px}
+.subtitle{font-size:19px;fill:#9cb3cb}
+.section{font-size:26px;font-weight:800;letter-spacing:1.5px}
+.title{font-size:23px;font-weight:800;fill:#f3f7ff}
+.detail{font-size:19px;fill:#afc3d5}
+.small{font-size:17px;fill:#9eb5c8}
+.center{text-anchor:middle}
+.path{stroke:#8caabe;stroke-width:3;fill:none;stroke-linejoin:round;stroke-linecap:round}
+.path-battery{stroke:#58bceb;stroke-width:3;fill:none;stroke-linejoin:round;stroke-linecap:round}
+.path-climate{stroke:#6fdfad;stroke-width:3;fill:none;stroke-linejoin:round;stroke-linecap:round}
+</style></defs>
+<rect width="1600" height="960" fill="url(#canvas)"/>
+<rect x="24" y="24" width="1552" height="912" rx="26" stroke="#2a435c" stroke-width="2" fill="none"/>
+<text x="66" y="88" class="heading">HOME ENERGY OPTIMIZER</text>
+<text x="67" y="119" class="subtitle">Shared telemetry · Two independent planning domains</text>
+<text x="68" y="162" class="small" letter-spacing="2.5" font-weight="800">DATA SOURCES</text>
+<rect x="67" y="177" width="335" height="94" rx="16" fill="#11293e" stroke="#334e67" stroke-width="2"/>
+<text x="89" y="218" class="title ">Home Assistant</text>
+<text x="89" y="252" class="detail ">House, battery &amp; HVAC states</text>
+<rect x="444" y="177" width="335" height="94" rx="16" fill="#11293e" stroke="#334e67" stroke-width="2"/>
+<text x="466" y="218" class="title ">Prometheus</text>
+<text x="466" y="252" class="detail ">Historical measurements</text>
+<rect x="821" y="177" width="335" height="94" rx="16" fill="#11293e" stroke="#334e67" stroke-width="2"/>
+<text x="843" y="218" class="title ">PVPC &amp; weather</text>
+<text x="843" y="252" class="detail ">Prices &amp; outdoor forecast</text>
+<rect x="1198" y="177" width="335" height="94" rx="16" fill="#11293e" stroke="#334e67" stroke-width="2"/>
+<text x="1220" y="218" class="title ">Configuration</text>
+<text x="1220" y="252" class="detail ">Limits &amp; comfort policy</text>
+<path d="M235 271 V303" class="path" />
+<path d="M612 271 V303" class="path" />
+<path d="M989 271 V303" class="path" />
+<path d="M1365 271 V303" class="path" />
+<path d="M235 303 H1365" class="path" />
+<path d="M800 303 V323" class="path" marker-end="url(#arrow)"/>
+<rect x="485" y="329" width="630" height="94" rx="16" fill="#233750" stroke="#4f6880" stroke-width="2"/>
+<rect x="485" y="341" width="6" height="70" rx="3" fill="#afc7eb"/>
+<text x="800" y="370" class="title center">Data &amp; Feature Layer</text>
+<text x="800" y="404" class="detail center">Acquire · validate · align · archive</text>
+<path d="M800 423 V444 H411 V535" class="path" marker-end="url(#arrow)"/>
+<path d="M800 444 H1190 V535" class="path" marker-end="url(#arrow)"/>
+<rect x="67" y="464" width="711" height="427" rx="22" stroke="#286285" stroke-width="2.5" fill="#0d263a" fill-opacity=".72"/>
+<rect x="822" y="464" width="711" height="427" rx="22" stroke="#2f735e" stroke-width="2.5" fill="#102e2d" fill-opacity=".72"/>
+<text x="92" y="501" class="section" fill="#66cdfa">BATTERY PLANNING</text>
+<text x="847" y="501" class="section" fill="#79e6b7">CLIMATE PLANNING</text>
+<rect x="89" y="541" width="207" height="107" rx="16" fill="#19354a" stroke="#3d718d" stroke-width="2"/>
+<rect x="89" y="553" width="6" height="83" rx="3" fill="#58bceb"/>
+<text x="111" y="582" class="title ">Load Forecast</text>
+<text x="111" y="616" class="detail ">House demand</text>
+<rect x="318" y="541" width="207" height="107" rx="16" fill="#19354a" stroke="#3d718d" stroke-width="2"/>
+<rect x="318" y="553" width="6" height="83" rx="3" fill="#58bceb"/>
+<text x="340" y="582" class="title ">Price Outlook</text>
+<text x="340" y="616" class="detail ">Published PVPC</text>
+<rect x="547" y="541" width="207" height="107" rx="16" fill="#19354a" stroke="#3d718d" stroke-width="2"/>
+<rect x="547" y="553" width="6" height="83" rx="3" fill="#58bceb"/>
+<text x="569" y="582" class="title ">Battery Model</text>
+<text x="569" y="616" class="detail ">SOC &amp; power</text>
+<rect x="845" y="541" width="320" height="107" rx="16" fill="#1b403b" stroke="#3a7f68" stroke-width="2"/>
+<rect x="845" y="553" width="6" height="83" rx="3" fill="#6fdfad"/>
+<text x="867" y="582" class="title ">Thermal Model</text>
+<text x="867" y="616" class="detail ">Room &amp; slab response</text>
+<rect x="1189" y="541" width="320" height="107" rx="16" fill="#1b403b" stroke="#3a7f68" stroke-width="2"/>
+<rect x="1189" y="553" width="6" height="83" rx="3" fill="#6fdfad"/>
+<text x="1211" y="582" class="title ">Heat Pump / COP</text>
+<text x="1211" y="616" class="detail ">Heat → electricity</text>
+<path d="M192 648 V669" class="path-battery" />
+<path d="M421 648 V669" class="path-battery" />
+<path d="M650 648 V669" class="path-battery" />
+<path d="M192 669 H650" class="path-battery" />
+<path d="M421 669 V689" class="path-battery" marker-end="url(#battery-arrow)"/>
+<path d="M1005 648 V669" class="path-climate" />
+<path d="M1349 648 V669" class="path-climate" />
+<path d="M1005 669 H1349" class="path-climate" />
+<path d="M1177 669 V689" class="path-climate" marker-end="url(#climate-arrow)"/>
+<rect x="220" y="700" width="408" height="105" rx="16" fill="url(#battery)" stroke="#58bceb" stroke-width="2"/>
+<rect x="220" y="712" width="6" height="81" rx="3" fill="#66cafa"/>
+<text x="424" y="741" class="title center">Dispatch Optimizer</text>
+<text x="424" y="775" class="detail center">When to charge / discharge</text>
+<rect x="975" y="700" width="408" height="105" rx="16" fill="url(#climate)" stroke="#6fdfad" stroke-width="2"/>
+<rect x="975" y="712" width="6" height="81" rx="3" fill="#7ae7b2"/>
+<text x="1179" y="741" class="title center">Climate Optimizer</text>
+<text x="1179" y="775" class="detail center">Comfort-focused heating MPC</text>
+<path d="M424 805 V830" class="path-battery" marker-end="url(#battery-arrow)"/>
+<path d="M1179 805 V830" class="path-climate" marker-end="url(#climate-arrow)"/>
+<rect x="220" y="835" width="408" height="42" rx="11" fill="#21475e" stroke="#58bceb" stroke-width="2"/>
+<text x="424" y="865" class="title center">Battery Dispatch Plan</text>
+<rect x="975" y="835" width="408" height="42" rx="11" fill="#285048" stroke="#6fdfad" stroke-width="2"/>
+<text x="1179" y="865" class="title center">Advisory Climate Plan</text>
+<circle cx="742" cy="486" r="6" fill="#58bceb"/><circle cx="1495" cy="486" r="6" fill="#6fdfad"/>
+<text x="800" y="924" class="small center">Shared inputs, separate models and optimizers · No direct climate-to-battery plan handoff today</text>
+</svg>

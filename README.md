@@ -4,83 +4,32 @@
 [![Images](https://github.com/pando85/home-energy-optimizer/actions/workflows/images.yml/badge.svg)](https://github.com/pando85/home-energy-optimizer/actions/workflows/images.yml)
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE.md)
 
-PVPC-aware home battery dispatch optimizer for Home Assistant. It ships an offline extraction, dataset
-and benchmark pipeline ([ADR-0003](docs/adr/0003-phase1-measurement-and-baseline.md)) plus a resident
-**shadow** service that runs the same MPC live against read-only Home Assistant and Prometheus data
-([docs/service.md](docs/service.md)). It is deployed in shadow mode: plans are recorded and compared with
-the native battery behaviour, and nothing is actuated. A `dry_run` and a `live` mode that drive the battery
-through Omnibattery's Home Assistant entities are built behind an explicit config switch and an owner kill
-switch ([ADR-0007](docs/adr/0007-live-battery-control.md), accepted 2026-11-03).
+
+Home energy optimization for Home Assistant, combining a PVPC-aware battery dispatch
+optimizer with a climate comfort optimizer. Both share the Home Assistant / Prometheus
+data foundation and the reproducible offline extraction, dataset and benchmark pipeline
+([ADR-0003](docs/adr/0003-phase1-measurement-and-baseline.md)). The resident service
+computes battery plans and can optionally evaluate the climate MPC on live data; battery
+actuation is separately gated ([service operations](docs/service.md) and
+[ADR-0007](docs/adr/0007-live-battery-control.md)).
 
 ## Architecture
 
-```text
-+------------------------------------------------------------------------+
-| INPUTS: HA (PVPC, grid, states), Prometheus (history), tariff config   |
-+-----------------------------------+------------------------------------+
-                                    |
-                                    v
-+------------------------------------------------------------------------+
-| SENSE: data acquisition and validation                                 |
-|   Offline CronJob: daily extracts/validation; periodic build -> PVC    |
-|   Shadow service: HA WebSocket/REST + Prometheus -> fresh snapshot      |
-+-----------------------------------+------------------------------------+
-                                    |
-                                    v
+<div align="center">
+  <img src="docs/assets/component-connections.svg" width="100%" alt="Two independent planning domains share Home Assistant, Prometheus, price, weather and configuration inputs through a common data layer. On the battery side, Load Forecast, Price Outlook and Battery Model feed the Dispatch Optimizer, which produces a battery dispatch plan. On the climate side, Thermal Model and Heat Pump/COP model feed the Climate Optimizer, which produces an advisory climate plan.">
+</div>
 
-                        DECIDE (planning components)
-+----------------------+  +----------------------+  +--------------------+
-| 1. LOAD FORECASTER   |  | 2. PRICE OUTLOOK     |  | 3. BATTERY MODEL   |
-| service/history.py   |  | service/pvpc.py      |  | battery.py         |
-| policies.py          |  | Published PVPC only  |  | SOC, limits, RTE   |
-| 28-day causal mean   |  | No price model yet   |  | 0.80 assumed RTE   |
-+----------+-----------+  +----------+-----------+  +---------+----------+
-           \                         |                        /
-            +------------------------+-----------------------+
-                                     |
-                                     v
-                  +-------------------------------------------+
-                  | 4. DISPATCH OPTIMIZER (MPC / HiGHS)       |
-                  | service/planner.py + oracle.py           |
-                  | Shared core with offline benchmarks      |
-                  +---------------------+---------------------+
-                                        |
-                                        v
-                  +-------------------------------------------+
-                  | DispatchPlan / DispatchIntent             |
-                  | Time-bounded economic decisions           |
-                  +---------------------+---------------------+
-                                        |
-                                        v
-+------------------------------------------------------------------------+
-| LEARN / OBSERVE (implemented, no actuation)                             |
-| ShadowSink + virtual battery + shadow-report; offline benchmarks       |
-| /metrics -> Prometheus, alerts, Grafana                                 |
-+------------------------------------------------------------------------+
+**Two planners, one data foundation.** The battery path optimizes charging and discharging
+using demand forecasts, published electricity prices and battery constraints. The climate
+path uses thermal and heat-pump models to optimize heating around comfort. They share
+telemetry and feature preparation, but have **no direct planner-to-planner handoff today**;
+the implemented climate MPC is price-blind.
 
-ACT (built, OFF: mode shadow): DispatchIntent -> safety guard -> ha_guard allowlist
-                               -> Omnibattery PD -> Marstek Venus E (ADR-0007)
-Current SOC source: simulated; real battery/Omnibattery HA entities absent.
-```
-
-**DECIDE** is decomposed into four *logical* components (not four services):
-**Load Forecaster**, **Price Outlook**, **Battery Model** and **Dispatch Optimizer**.
-The first three supply independent inputs to the optimizer. The battery model is
-shared with simulation and backtesting; it does **not** consume the forecasts.
-**Price Outlook** currently reads published PVPC prices, not predicted prices.
-The shadow service uses **simulated SOC** until the battery entities are available.
-The ACT line runs only with `mode: live` in the deployed `service.yaml` and the owner's kill switch on;
-`mode: dry_run` records the writes without sending them.
-
-See [planning component responsibilities](docs/architecture.md#planning-components) and the
-**individual component roadmaps** for scoped improvements and acceptance gates:
-[Load Forecaster](docs/planning/components/load-forecaster.md),
-[Price Outlook](docs/planning/components/price-outlook.md),
-[Battery Model](docs/planning/components/battery-model.md), and
-[Dispatch Optimizer](docs/planning/components/dispatch-optimizer.md).
-
-The modules, the pipeline stages and the shadow service are described in
-[docs/architecture.md](docs/architecture.md) and the [ADRs](docs/adr/).
+The named components are **logical modules of one Python application**, not separate
+services. Details: [battery planning components](docs/architecture.md#planning-components),
+[climate models and MPC](docs/architecture.md#climate-subpackage-climate),
+[component dependencies](docs/components/README.md#dependency-map) and
+[resident service](docs/service.md).
 
 ## Quick start
 

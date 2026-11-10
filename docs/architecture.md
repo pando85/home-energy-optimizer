@@ -15,7 +15,7 @@ Decisions are recorded in [`adr/`](adr/); the production architecture is
 
 ## Planning components
 
-The README [ASCII component diagram](../README.md#architecture) is a **logical architecture**:
+The README [component diagram](../README.md#architecture) is a **logical architecture**:
 the four named DECIDE components are responsibilities within one Python package, not four
 microservices, new runtime processes or existing four plugin interfaces. The offline tools and
 the resident shadow service reuse the same battery/optimization primitives, with intentionally
