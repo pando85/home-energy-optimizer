@@ -48,8 +48,8 @@ text{font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-seri
 <rect x="485" y="341" width="6" height="70" rx="3" fill="#afc7eb"/>
 <text x="800" y="370" class="title center">Data &amp; Feature Layer</text>
 <text x="800" y="404" class="detail center">Acquire · validate · align · archive</text>
-<path d="M800 423 V444 H411 V525" class="path" marker-end="url(#arrow)"/>
-<path d="M800 444 H1190 V525" class="path" marker-end="url(#arrow)"/>
+<path d="M800 423 V444 H411 V535" class="path" marker-end="url(#arrow)"/>
+<path d="M800 444 H1190 V535" class="path" marker-end="url(#arrow)"/>
 <rect x="67" y="464" width="711" height="427" rx="22" stroke="#286285" stroke-width="2.5" fill="#0d263a" fill-opacity=".72"/>
 <rect x="822" y="464" width="711" height="427" rx="22" stroke="#2f735e" stroke-width="2.5" fill="#102e2d" fill-opacity=".72"/>
 <text x="92" y="501" class="section" fill="#66cdfa">BATTERY PLANNING</text>
@@ -94,9 +94,9 @@ text{font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-seri
 <path d="M424 805 V830" class="path-battery" marker-end="url(#battery-arrow)"/>
 <path d="M1179 805 V830" class="path-climate" marker-end="url(#climate-arrow)"/>
 <rect x="220" y="835" width="408" height="42" rx="11" fill="#21475e" stroke="#58bceb" stroke-width="2"/>
-<text x="424" y="876" class="title center">Battery Dispatch Plan</text>
+<text x="424" y="865" class="title center">Battery Dispatch Plan</text>
 <rect x="975" y="835" width="408" height="42" rx="11" fill="#285048" stroke="#6fdfad" stroke-width="2"/>
-<text x="1179" y="876" class="title center">Advisory Climate Plan</text>
+<text x="1179" y="865" class="title center">Advisory Climate Plan</text>
 <circle cx="742" cy="486" r="6" fill="#58bceb"/><circle cx="1495" cy="486" r="6" fill="#6fdfad"/>
 <text x="800" y="924" class="small center">Shared inputs, separate models and optimizers · No direct climate-to-battery plan handoff today</text>
 </svg>
