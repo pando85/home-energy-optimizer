@@ -2591,9 +2591,9 @@ def test_the_soc_stays_clear_of_the_tariff_floor_with_hysteresis(caplog):
     assert "rule=storage_value storage_value=0 spread=0.29" in lines[0]
 
 
-def test_reserve_protection_still_wins_at_the_floor():
-    # at the floor the recovery charge replaces the discharge, whatever the spread
-    record, actuator, ha, _ = sv_tick(SV, RESERVE, sv_intent(value=0.0, price=0.30))
+def test_reserve_protection_still_wins_below_the_floor():
+    # below the floor the recovery charge replaces the discharge, whatever the spread
+    record, actuator, ha, _ = sv_tick(SV, RESERVE - 1, sv_intent(value=0.0, price=0.30))
     desired = record["desired"]
     assert desired["mode"] == "charge" and desired["reason"] == "below_soc_floor"
     assert "load_following" not in desired and caps(ha) == []
@@ -2926,9 +2926,9 @@ def test_the_service_plans_the_value_and_feeds_the_actuator(tmp_path, cleanup):
 # ---------------------------------------------------------------------------
 
 
-def test_idle_at_the_floor_becomes_a_bounded_recovery_charge():
+def test_idle_below_the_floor_becomes_a_bounded_recovery_charge():
     clock = FakeClock(NOW)
-    store = world(clock, soc=20.0, grid=400, ac=0)
+    store = world(clock, soc=19.0, grid=400, ac=0)
     actuator, ha, _ = make(clock, store)
     record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
     desired = record["desired"]
@@ -2973,8 +2973,8 @@ def test_recovery_uses_the_load_reconstructed_with_the_battery_sign():
     assert record["desired"]["pd_target_w"] == 1100.0
 
 
-@pytest.mark.parametrize("soc", [20.0, 19.9, 15.0, 0.0])
-def test_recovery_engages_at_or_below_the_floor(soc):
+@pytest.mark.parametrize("soc", [19.9, 19.0, 15.0, 0.0])
+def test_recovery_engages_below_the_floor(soc):
     clock = FakeClock(NOW)
     store = world(clock, soc=soc, grid=400, ac=0)
     actuator, _, _ = make(clock, store)
@@ -3085,9 +3085,26 @@ def test_a_missing_load_never_produces_a_recovery_charge():
     assert actuator.reserve_desired(context, readings).mode == "idle"
 
 
-def test_hysteresis_holds_until_the_floor_plus_one_point():
+def test_resting_exactly_at_the_floor_does_not_flap_into_recovery():
+    # 2026-11-11: the plan ended its discharge at the floor (20%), the integer SOC sensor read 20
+    # and 21 by turns, and engaging at the floor toggled recovery and idle every couple of minutes
+    # all night.  Resting at the floor is allowed; only a reading below it recovers.
     clock = FakeClock(NOW)
     store = world(clock, soc=20.0, grid=400, ac=0)
+    actuator, ha, _ = make(clock, store)
+    for soc in (20.0, 21.0, 20.0, 21.0, 20.0):
+        store.apply(entity_state(ENTS.battery_soc, soc, clock.now()))
+        store.apply(entity_state(GRID, 400, clock.now()))
+        record = tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
+        assert record["desired"]["reason"] == "intent"
+        assert actuator._floor_engaged is False
+        clock.advance(60)
+    assert ("switch.turn_on", "venus_battery_allow_charge", None) not in ha.writes()
+
+
+def test_hysteresis_holds_until_the_floor_plus_one_point():
+    clock = FakeClock(NOW)
+    store = world(clock, soc=19.0, grid=400, ac=0)
     actuator, ha, _ = make(clock, store)
     tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
     assert actuator._floor_engaged is True
@@ -3111,7 +3128,7 @@ def test_hysteresis_holds_until_the_floor_plus_one_point():
 def test_the_hysteresis_width_is_a_setting():
     clock = FakeClock(NOW)
     settings = replace(SETTINGS, soc_floor_hysteresis_pct=3.0)
-    store = world(clock, soc=20.0, grid=400, ac=0)
+    store = world(clock, soc=19.0, grid=400, ac=0)
     actuator, ha, _ = make(clock, store, settings=settings)
     tick(actuator, ctx(clock, intent("idle"), soc_floor_pct=20.0))
     clock.advance(60)

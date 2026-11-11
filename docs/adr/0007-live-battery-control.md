@@ -88,7 +88,7 @@ Two separate limits apply and both stay in force:
    limits **off**; with them on the bound is `[-system max discharge, +system max charge]`, which caps the charge
    at the system max charge − house load (see [Commissioning findings](#commissioning-findings-2026-11-03)).
 
-   **Amendment 2026-11-08:** while the **measured** SOC sits at or below the tariff's SOC floor, a slot the plan maps
+   **Amendment 2026-11-08:** while the **measured** SOC sits below the tariff's SOC floor, a slot the plan maps
    to `idle` or `discharge` goes through the `charge` row instead at `actuation.soc_floor_recovery_w`, and a planned
    charge below it is raised to it. While the import trip's hold is running the tick holds the idle mapping instead
    (no charge, and the planned discharge is refused too). The rows and their bounds are unchanged, and the energy is
@@ -475,7 +475,7 @@ battery measured 0.150** (`soc=0.200 soc_measured=0.150 soc_clamped=True`): the 
 telemetry was not hidden, and nothing in the plan could see or act on the shortfall.
 
 Forcing idle does not help — the tick that was already idle is where the drain happened. So the actuator now
-synthesizes a **bounded recovery charge** while the **measured** SOC sits at or below the tariff's floor
+synthesizes a **bounded recovery charge** while the **measured** SOC sits below the tariff's floor
 (`battery.soc_window_min`, 0.20 here): a tick the plan maps to idle or discharge becomes a charge of
 `actuation.soc_floor_recovery_w` (200 W) with `reason: below_soc_floor`. It uses the existing charge row, so the PD
 target is `house load + power` inside `min(import_cap_w, entity max)`, with the same write ordering, dwell and
@@ -489,7 +489,8 @@ as it is today).
 - **One floor, not two:** the floor comes from `config/tariff.yaml`, which the planner already uses, and is passed per
   tick as `ActuationContext.soc_floor_pct`. There is no second floor setting, and the planner's clamp stays (a plan
   must remain feasible); the protection reads the meter, not the plan's assumption.
-- **Hysteresis:** engages at the floor, releases at floor + `actuation.soc_floor_hysteresis_pct` (default 1.0 SOC
+- **Hysteresis:** engages below the floor (a SOC resting exactly at it is allowed, corrected in 0.18.2: engaging at
+  it flapped an integer SOC reading between floor and floor + 1 all night), releases at floor + `actuation.soc_floor_hysteresis_pct` (default 1.0 SOC
   point, `0 < value <= 10`), latched between ticks, released only by a fresh SOC above the release point (a guard
   failure or a bad read does not drop it) and starting released after a restart, so a service that comes back at 15%
   recovers at once.

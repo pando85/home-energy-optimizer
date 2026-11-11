@@ -1041,7 +1041,7 @@ perfect load forecast; the owner runs it live to measure the real value.
 ### Reserve protection
 
 [ADR-0007 amendment 2026-11-08](adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection): while the
-**measured** SOC sits at or below the tariff's floor, a tick the plan maps to idle or discharge asks for a bounded
+**measured** SOC sits below the tariff's floor, a tick the plan maps to idle or discharge asks for a bounded
 recovery charge instead (`reason: below_soc_floor`). Forcing idle was not enough: the measured residual drain
 (about 26 W on 2026-11-08) continues in idle, so only opposing it holds the floor.
 
@@ -1064,7 +1064,8 @@ recovery charge instead (`reason: below_soc_floor`). Forcing idle was not enough
   recovery sends no charge (a recovery charge is a charge, so it waits for the hold), and because the guard scopes that
   refusal to *charge* intents, the recovery also refuses a planned discharge: the tick holds the idle mapping with both
   directions off instead of draining the floor while no charge is allowed.
-- **Hysteresis:** engages at the floor, releases at floor + `actuation.soc_floor_hysteresis_pct` (default 1.0 SOC
+- **Hysteresis:** engages below the floor (a SOC resting exactly at it is allowed, corrected in 0.18.2: engaging at
+  it flapped an integer SOC reading between floor and floor + 1 all night), releases at floor + `actuation.soc_floor_hysteresis_pct` (default 1.0 SOC
   point, `0 < value <= 10`, validated at load), latched between ticks and starting released after a restart, so a
   service that comes back at 15% recovers immediately and a SOC hovering at the floor does not flap the setpoint.
 - **Enable semantics:** no separate flag. It is part of the actuator, so it applies automatically in `dry_run`

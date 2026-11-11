@@ -85,13 +85,13 @@ draining the floor while no charge is allowed.  Likewise, when the ceiling leave
 ``soc_floor_recovery_w`` above the house load it does not synthesize a charge: an idle or discharge
 tick holds the idle mapping, and a planned charge below the recovery power keeps its own row
 (``reason: intent``, clamped by that ceiling as usual) instead of being raised to a target the cap
-would only clamp away.  Hysteresis: it engages at the floor and releases at
-floor + ``actuation.soc_floor_hysteresis_pct`` (1.0 SOC point).  The floor is never configured
-twice: ``ActuationContext.soc_floor_pct`` comes from ``battery.soc_window_min``, which the planner
-also uses, and the planner's own clamp of a measured SOC into the window is left as it is (a plan
-must stay feasible); the protection reads the meter, not the plan's assumption.  It applies in
-``dry_run`` (recorded, nothing sent) and ``live``; ``shadow`` has no actuator, and nothing here
-makes a service live.
+would only clamp away.  Hysteresis: it engages below the floor (resting at it is allowed) and
+releases at floor + ``actuation.soc_floor_hysteresis_pct`` (1.0 SOC point).  The floor is never
+configured twice: ``ActuationContext.soc_floor_pct`` comes from ``battery.soc_window_min``, which
+the planner also uses, and the planner's own clamp of a measured SOC into the window is left as it
+is (a plan must stay feasible); the protection reads the meter, not the plan's assumption.  It
+applies in ``dry_run`` (recorded, nothing sent) and ``live``; ``shadow`` has no actuator, and
+nothing here makes a service live.
 
 Numeric targets are bounded by the entity's own ``min``/``max`` as well as ours: Omnibattery
 bounds the PD target by the batteries' summed charge limit (±2500 W here), so the effective
@@ -452,7 +452,7 @@ class Actuator:
         self._lf_prev: tuple[datetime, float, float | None, str, float | None] | None = None
         self._lf_extra_kwh: dict[str, float] = {"storage_value": 0.0, "plan_soc": 0.0}
         self._lf_extra_value_eur = 0.0
-        #: Reserve-protection hysteresis latch: SOC at/below the tariff floor.
+        #: Reserve-protection hysteresis latch: SOC below the tariff floor.
         self._floor_engaged = False
         #: The authoritative floor (%) the last tick came from the tariff; ``None`` if no floor.
         self._floor_pct: float | None = None
@@ -599,13 +599,17 @@ class Actuator:
         return reasons
 
     def _below_floor(self, ctx: ActuationContext, readings: Mapping[str, Any]) -> bool:
-        """Reserve protection: True while SOC is at/below the tariff floor (latched, hysteresis).
+        """Reserve protection: True while SOC is below the tariff floor (latched, hysteresis).
 
-        Engages when the measured SOC is at or below the floor, releases at floor plus
+        Engages when the measured SOC is strictly below the floor, releases at floor plus
         ``soc_floor_hysteresis_pct``, and holds in between, so a recovery that only just crosses
-        the floor does not re-engage on the next tick.  It uses the tick's fresh measured SOC,
-        never the planner's clamped SOC: the 2026-11-08 night the plan started from a clamped
-        0.200 while the battery read 0.150, so nothing in the plan could see the shortfall.
+        the floor does not re-engage on the next tick.  A SOC resting exactly at the floor is
+        allowed (the plan may end a discharge there): engaging at it made the integer SOC sensor
+        flap between floor and floor + 1 every couple of minutes all night (2026-11-11), since a
+        reading rounds up after a fraction of a point of recovery.  It uses the tick's fresh
+        measured SOC, never the planner's clamped SOC: the 2026-11-08 night the plan started from
+        a clamped 0.200 while the battery read 0.150, so nothing in the plan could see the
+        shortfall.
         A missing floor or a non-finite SOC leaves the latch as it is (the guard already holds
         safe idle on a stale SOC, and clearing the latch on a bad read would drop protection).
         """
@@ -615,9 +619,7 @@ class Actuator:
         if floor is None or soc is None or not math.isfinite(soc):
             return self._floor_engaged
         hysteresis = self.settings.soc_floor_hysteresis_pct
-        engaged = (
-            soc <= floor + 1e-9 if not self._floor_engaged else soc < floor + hysteresis - 1e-9
-        )
+        engaged = soc < floor - 1e-9 if not self._floor_engaged else soc < floor + hysteresis - 1e-9
         self._floor_engaged = engaged
         return engaged
 
@@ -1256,7 +1258,7 @@ class Actuator:
                     desired = self.idle_desired(readings, "settle_hold")
                 else:
                     # Reserve protection (ADR-0007 amendment 2026-11-08): a bounded recovery
-                    # charge while the measured SOC sits at or below the tariff floor.  The guard
+                    # charge while the measured SOC sits below the tariff floor.  The guard
                     # and the settle hold keep their priority; the recovery itself keeps no charge
                     # during the import trip's hold and refuses the planned discharge there too.
                     # The normal mapping runs when it does not apply, so a plan is only ever

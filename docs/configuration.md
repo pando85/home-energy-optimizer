@@ -182,7 +182,7 @@ actuation:
 `actuation.soc_floor_recovery_w` (default **200 W**) and `actuation.soc_floor_hysteresis_pct` (default **1.0** SOC
 point, `0 < value <= 10`) are the reserve protection of
 [ADR-0007](adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection): while the **measured** SOC sits
-at or below the tariff's floor, a tick the plan maps to idle or discharge asks for that bounded recovery charge
+below the tariff's floor, a tick the plan maps to idle or discharge asks for that bounded recovery charge
 instead, through the existing charge row (`min(import_cap_w, entity max)` ceiling) and the existing allowlist
 entries. The floor itself is not configured here: it is `battery.soc_window_min` of
 [`config/tariff.yaml`](../config/tariff.yaml), the value the planner clamps to, so it is never set twice.
