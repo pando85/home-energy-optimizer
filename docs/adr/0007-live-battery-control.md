@@ -545,7 +545,8 @@ robust (0 was slightly worse in a variant that allowed any slot, 0.02 the same).
    gives `null` and an unchanged, valid plan ([service](../service.md#storage-value-of-the-plan)).
 2. *Actuator: the floor.* With `floor: storage_value`, in a discharge intent the raised cap is engaged while
    `price - planning.throughput_cost_eur_per_kwh >= storage value + storage_value_margin_eur_per_kwh` (0.005), and the
-   planned cap stands otherwise, exactly as today. A plan without a value (or a price, or a tariff floor) uses the
+   `plan_soc` rule decides otherwise (follow the load down to the plan's end-of-slot SOC, as with the default floor;
+   corrected in 0.18.1: 0.18.0 held the planned cap, which followed the load less than the default rule). A plan without a value (or a price, or a tariff floor) uses the
    `plan_soc` rule. The SOC stays clear of the tariff's floor (engage at floor + `soc_floor_hysteresis_pct` +
    `soc_hysteresis_pct`, release below floor + `soc_floor_hysteresis_pct`), so it never trades places with the
    reserve protection. Price, wear and value are constants of a slot: the rule cannot flap inside it.

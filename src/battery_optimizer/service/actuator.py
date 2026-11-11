@@ -840,7 +840,9 @@ class Actuator:
         slot's price net of the wear cost, ``price - throughput cost``, says what discharging it
         now earns.  While ``spread = price - throughput cost - value`` is at least
         ``storage_value_margin_eur_per_kwh`` the raised cap is engaged, so the battery covers the
-        real load instead of the energy the forecast budgeted; otherwise the planned cap stands.
+        real load instead of the energy the forecast budgeted; otherwise the ``plan_soc`` rule
+        decides (``rule == "plan_soc"``), so a slot where keeping the energy pays as much never
+        follows the load less than the default rule would.
         Price, wear cost and value are constants of the slot, so the rule cannot flap inside it.
 
         The SOC is held away from the tariff's floor, because the plan's end-of-slot SOC no longer
@@ -873,7 +875,15 @@ class Actuator:
             and soc >= threshold - 1e-9
             and spread >= lf.storage_value_margin_eur_per_kwh - 1e-9
         )
-        return "storage_value", value, spread, release, engaged
+        if engaged:
+            return "storage_value", value, spread, release, True
+        # Keeping the energy pays as much: the plan-SOC rule still follows the load down to the
+        # plan's end-of-slot SOC, as with the default floor.
+        plan_threshold = (
+            plan_floor_pct if self._lf_engaged else plan_floor_pct + lf.soc_hysteresis_pct
+        )
+        plan_engaged = soc is not None and soc >= plan_threshold - 1e-9
+        return "plan_soc", value, spread, plan_floor_pct, plan_engaged
 
     def idle_desired(self, readings: Mapping[str, Any], reason: str) -> Desired:
         """Both directions off and the neutral PD target (the planned idle, or the settle hold)."""

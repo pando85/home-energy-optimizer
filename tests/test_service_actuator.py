@@ -2489,13 +2489,32 @@ def test_the_storage_value_floor_raises_the_cap_below_the_plan_soc_while_the_spr
 
 
 def test_the_storage_value_floor_releases_to_the_planned_cap_when_keeping_the_energy_pays_more():
-    # the energy is worth more kept: 0.12 - 0.01 - 0.11 = 0 < the 0.005 margin, even at 90% SOC
-    record, _, ha, _ = sv_tick(SV, 90, sv_intent(value=0.11, price=0.12))
+    # the energy is worth more kept: 0.12 - 0.01 - 0.11 = 0 < the 0.005 margin, and 45% is under
+    # the plan's 50% end-of-slot SOC, so the plan-SOC rule holds the cap too
+    record, _, ha, _ = sv_tick(SV, 45, sv_intent(value=0.11, price=0.12))
     assert caps(ha) == [1000.0]  # exactly the planned cap, as today
     desired = record["desired"]
     assert desired["load_following"] is False and desired["max_discharge_w"] == 1000.0
-    assert desired["load_following_rule"] == "storage_value"
+    assert desired["load_following_rule"] == "plan_soc"
+    assert desired["load_following_storage_value_eur_per_kwh"] == 0.11
     assert desired["load_following_spread_eur_per_kwh"] == pytest.approx(0.0, abs=1e-9)
+    assert desired["load_following_floor_pct"] == 50.0
+
+
+@pytest.mark.parametrize(
+    ("soc", "engaged"), [(49.0, False), (50.9, False), (51.0, True), (90, True)]
+)
+def test_when_keeping_pays_as_much_the_plan_soc_rule_still_follows_the_load(soc, engaged):
+    # spread 0 < margin: never less load-following than the default floor, which engages at plan
+    # SOC + 1 point (the 0.18.0 behaviour held the planned cap here)
+    the_intent = sv_intent(value=0.11, price=0.12)
+    record, _, ha, _ = sv_tick(SV, soc, the_intent)
+    desired = record["desired"]
+    assert desired["load_following"] is engaged and caps(ha) == [2500.0 if engaged else 1000.0]
+    assert desired["load_following_rule"] == "plan_soc"
+    assert desired["load_following_floor_pct"] == 50.0
+    _, _, ha_default, _ = sv_tick(LF, soc, the_intent)
+    assert caps(ha_default) == caps(ha)
 
 
 @pytest.mark.parametrize(
@@ -2504,7 +2523,8 @@ def test_the_storage_value_floor_releases_to_the_planned_cap_when_keeping_the_en
 )
 def test_the_margin_is_inclusive(price, engaged):
     # spread = price - 0.01 - 0.11; the margin is 0.005
-    record, _, _, _ = sv_tick(SV, 80, sv_intent(value=0.11, price=price))
+    # 45% is under the plan's 50% SOC, so only the value rule can engage
+    record, _, _, _ = sv_tick(SV, 45, sv_intent(value=0.11, price=price))
     assert record["desired"]["load_following"] is engaged
 
 
@@ -2671,10 +2691,10 @@ def sv_snapshot(actuator):
     return out
 
 
-def feed_power(store, clock, ac, seconds=30):
+def feed_power(store, clock, ac, seconds=30, soc=60):
     clock.advance(seconds)
     store.apply(entity_state(GRID, 1500, clock.now()))
-    store.apply(entity_state(ENTS.battery_soc, 60, clock.now()))
+    store.apply(entity_state(ENTS.battery_soc, soc, clock.now()))
     store.apply(entity_state(ENTS.battery_ac_power, ac, clock.now()))
 
 
@@ -2711,18 +2731,23 @@ def test_the_energy_above_the_planned_cap_is_counted_while_engaged_and_valued():
 
 def test_discharge_at_or_below_the_planned_cap_and_released_ticks_add_nothing():
     clock = FakeClock(NOW)
-    store = world(clock, grid=1500, ac=0, soc=60)
+    # 45% is under the plan's 50% SOC: once the value rule lets go, the plan-SOC rule holds too
+    store = world(clock, grid=1500, ac=0, soc=45)
     actuator, _, _ = make(clock, store, settings=SV)
     engaged = sv_intent(value=0.10, price=0.20, power=1000.0)
     tick(actuator, sv_ctx(clock, engaged))
-    feed_power(store, clock, -900)  # under the planned cap: nothing above it
+    feed_power(store, clock, -900, soc=45)  # under the planned cap: nothing above it
     tick(actuator, sv_ctx(clock, engaged))
     held = sv_intent(value=0.30, price=0.20, power=1000.0)  # keeping it pays: released
-    feed_power(store, clock, -900)  # the last engaged interval ended at 900 W: still nothing
+    feed_power(
+        store, clock, -900, soc=45
+    )  # the last engaged interval ended at 900 W: still nothing
     tick(actuator, sv_ctx(clock, held))
-    feed_power(store, clock, -1800)  # released ticks book nothing, whatever the battery does
+    feed_power(
+        store, clock, -1800, soc=45
+    )  # released ticks book nothing, whatever the battery does
     tick(actuator, sv_ctx(clock, held))
-    feed_power(store, clock, -1800)
+    feed_power(store, clock, -1800, soc=45)
     tick(actuator, sv_ctx(clock, held))
     fams = sv_snapshot(actuator)
     assert sum(fams["battery_optimizer_actuator_load_following_extra_kwh"].values()) == 0.0
