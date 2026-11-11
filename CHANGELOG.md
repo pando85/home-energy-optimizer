@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.18.2](https://github.com/pando85/home-energy-optimizer/tree/v0.18.2) - 2026-11-11
+
+### Fixed
+
+- actuator: Engage reserve protection only below the SOC floor ([6d1cd9c](https://github.com/pando85/home-energy-optimizer/commit/6d1cd9ce02feff024f241016ef783bd1f0e36648))
+
 ## [v0.18.1](https://github.com/pando85/home-energy-optimizer/tree/v0.18.1) - 2026-11-11
 
 ### Fixed
