@@ -361,6 +361,12 @@ configuration or the [live preconditions](#live-preconditions-2026-11-03).
   procedure (back to 50 W once a release with #723 is installed, then `integration_status` must return to
   `balanced` within 5 minutes with a backup-port load in Bypass) in
   [known issues](../known-issues.md#omnibattery-can-stay-in-backup_mode-after-the-grid-returns).
+  **Note 2026-11-11:** resolved. Omnibattery v1.6.0 (installed by the owner on 2026-11-10) contains #723; the
+  owner set the threshold back to 50 W on 2026-11-11 at 23:17 local. A passive check in Bypass with 237 to
+  251 W on the backup port kept `integration_status` at `balanced` for 20 minutes (it latched within 5 minutes
+  before the fix), so the two side effects above no longer apply. The supervised grid-loss test is pending
+  (deferred by the owner); the rollback is 500 W plus reopening the upstream issue. The paragraph above is
+  kept as the record of the 2026-11-03 to 2026-11-11 state.
 - **Measured SOC.** `planning.soc_source: entity`, required by `live` (decision 1), aged the SOC against
   `freshness_s.battery_soc` (900 s); an idle battery's SOC looked stale (decision 6), so planning would stop.
   Resolved: the planner now checks the SOC as the actuator does, availability only by default

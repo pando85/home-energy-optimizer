@@ -312,39 +312,40 @@ not depend on HA. See ADR-0007.
 
 ### Omnibattery can stay in `backup_mode` after the grid returns
 
-After a grid return the inverter goes back to Bypass, but Omnibattery v1.5.0 can stay in its `backup_mode`
+Status: **fixed upstream and installed (Omnibattery v1.6.0, 2026-11-10); workaround removed 2026-11-11; the
+supervised grid-loss test is pending (deferred by the owner).**
+
+After a grid return the inverter goes back to Bypass, but Omnibattery v1.5.0 could stay in its `backup_mode`
 cooldown: an upstream race (in `coordinator.py` the key-update timestamps are set mid-poll, the data is
-published later) skips the Bypass zeroing, and a backup-port load above `number.venus_backup_offgrid_threshold`
-(default 50 W; 57 to 85 W observed) keeps refreshing the 5-minute cooldown. While it lasts
-`integration_status` is `backup_mode`, so the actuator holds safe idle (`integration_unhealthy`), possibly
+published later) skipped the Bypass zeroing, and a backup-port load above `number.venus_backup_offgrid_threshold`
+(default 50 W; 57 to 85 W observed) kept refreshing the 5-minute cooldown. While it lasted
+`integration_status` was `backup_mode`, so the actuator held safe idle (`integration_unhealthy`), possibly
 indefinitely. Upstream: issue ffunes/Omnibattery#660, fixed by ffunes/Omnibattery#723 (stage
-`_key_update_times` together with `data.update`; targets `release/v1.5.1`).
+`_key_update_times` together with `data.update`).
 
-**Workaround in place:** `number.venus_backup_offgrid_threshold` = **500 W** (Omnibattery default 50 W). A
-threshold of 200 W cleared the state within 5 minutes in the test; the owner set 500 W the same evening. It
-must stay above the backup-port load: the servers moved there on 2026-11-03 and draw about 225 to 255 W
-(`sensor.venus_ac_offgrid_power`), below the 500 W threshold.
+**Resolution.**
 
-Side effects while the high threshold is in place:
+- 2026-11-10: the owner upgraded Omnibattery (HACS) from v1.5.1b1 to **v1.6.0**, which contains #723 and keeps
+  the grid-target bound of #597/#598 (identical code).
+- 2026-11-11 23:17 local: the owner set `number.venus_backup_offgrid_threshold` back from the 500 W
+  workaround (in place since the commissioning evening, 2026-11-03; 200 W had cleared the state within 5
+  minutes in the test) to **50 W**, the Omnibattery default.
+- Passive check passed: in Bypass with 237 to 251 W on the backup port (the servers),
+  `sensor.omnibattery_integration_status` stayed `balanced` and the optimizer's guard passed for 20 minutes
+  (23:17 to 23:37). Before the fix this latched within 5 minutes.
+- With 50 W the side effects of the high threshold are gone (small-load outages are detected as backup again,
+  the 5-minute post-backup cooldown is back, and the shutdown standby is skipped while the battery feeds the
+  servers), to be confirmed in practice by the grid-loss test.
 
-- During a real outage with a backup-port load **below** the threshold, Omnibattery does not treat it as
-  genuine off-grid demand: it keeps the battery in its PD loop and goes on commanding the islanded battery
-  against a grid meter that no longer sees it. `integration_status` then need not be `backup_mode`, so the
-  actuator's guard may pass and the actuator may keep writing as well.
-- When the grid returns there is no 5-minute settle: below the threshold the cooldown never starts, so
-  Omnibattery (and the actuator) resume control at once instead of waiting for the inverter to settle in
-  Bypass.
+**Still to do (pending, owner's choice of date):** a short supervised grid-loss test (as in the commissioning
+test) that confirms Backup Mode on loss and the return to `balanced` after the grid comes back. Until it is
+done the 50 W setting is verified only by the passive check above.
 
-**Removal procedure** (once an Omnibattery release containing ffunes/Omnibattery#723 is installed):
-
-1. Check the installed Omnibattery version against the release notes for #723.
-2. Set `number.venus_backup_offgrid_threshold` back to **50 W**.
-3. With a load on the backup port and the inverter in Bypass (grid present), verify that
-   `sensor.omnibattery_integration_status` returns to `balanced` within 5 minutes and stays there (no
-   `backup_mode` latch). A short supervised grid-loss test (as in the commissioning test) then confirms
-   Backup Mode on loss and the return to `balanced` after the grid comes back.
-4. If it latches again, put 500 W back and reopen the upstream issue. Otherwise record the change in the
-   [regime log](components/regime-log.md) and delete this workaround here and in ADR-0007.
+**Rollback:** if `integration_status` ever latches at `backup_mode` with the grid present, put
+`number.venus_backup_offgrid_threshold` back to **500 W** (it must stay above the servers' backup-port load of
+about 225 to 255 W; the side effects of the high threshold then apply again: a backup load below it is not
+treated as off-grid demand and there is no 5-minute settle after the grid returns) and reopen the upstream
+issue. The change and its checks are in the [regime log](components/regime-log.md).
 
 ## Planned discharge is not delivered (planner bound enabled since 0.14.0, monitoring)
 
