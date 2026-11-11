@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.18.0](https://github.com/pando85/home-energy-optimizer/tree/v0.18.0) - 2026-11-11
+
+### Added
+
+- actuator: Measure the grid-power distribution while discharging ([64f1dc9](https://github.com/pando85/home-energy-optimizer/commit/64f1dc914471a4bd28a981578cc06414ddcaf7ac))
+- service: Value-based load-following from the plan's storage value ([7b44530](https://github.com/pando85/home-energy-optimizer/commit/7b445308956895fa37ec516679dd70e433cbd50c))
+
 ## [v0.17.0](https://github.com/pando85/home-energy-optimizer/tree/v0.17.0) - 2026-11-11
 
 ### Added
