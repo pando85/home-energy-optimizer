@@ -135,7 +135,7 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
   `actuator_load_following_extra_value_eur_total`. The plan, `inputs_hash`, `content_hash` and `config_hash` are
   unchanged.
 - **Reserve protection (code default 200 W, not deployed, 2026-11-08).** With the actuator running (`dry_run` or
-  `live`), while the **measured** SOC sits at or below the tariff's floor (`battery.soc_window_min`, the same value
+  `live`), while the **measured** SOC sits below the tariff's floor (`battery.soc_window_min`, the same value
   the planner clamps to) a tick the plan maps to idle or discharge becomes a bounded recovery charge
   (`actuation.soc_floor_recovery_w`) through the existing charge row; a planned charge at or above it is untouched and
   a weaker one is raised to it ([ADR-0007 amendment](../adr/0007-live-battery-control.md#amendment-2026-11-08-reserve-protection),
@@ -266,7 +266,7 @@ reasons above; [battery-thermal](battery-thermal.md) re-reads the discharge gain
 model the rule.
 
 Reserve protection (2026-11-08, code only, **not deployed**, [regime log](regime-log.md)): an actuator layer that
-synthesizes a bounded recovery charge while the measured SOC sits at or below the tariff's floor. The plan,
+synthesizes a bounded recovery charge while the measured SOC sits below the tariff's floor. The plan,
 `inputs_hash` and `config_hash` are untouched and the committed config keeps the defaults, so merging changes nothing
 observable; it takes effect only on a deployment in `dry_run` or `live` (`shadow` has no actuator) and needs no new
 enable flag. The status stays **stale** for the reasons above. After such a deploy, re-read how many ticks engage

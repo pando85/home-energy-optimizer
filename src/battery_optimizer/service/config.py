@@ -487,7 +487,7 @@ class ActuationSettings:
     battery_ac_power_max_age_s: float | None = None
     load_following: LoadFollowingSettings = field(default_factory=LoadFollowingSettings)
     #: Reserve protection (ADR-0007 amendment 2026-11-08): the AC charge power (W) the actuator
-    #: requests when the *measured* SOC is at or below the tariff's floor and the plan does not
+    #: requests when the *measured* SOC is below the tariff's floor and the plan does not
     #: already ask for more.  Modest and bounded, never above ``import_cap_w``; a control setting,
     #: not an energy-model claim about the standby drain's cause.
     soc_floor_recovery_w: float = 200.0
