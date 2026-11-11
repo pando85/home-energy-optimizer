@@ -4,8 +4,15 @@
 # Entity IDs are configuration, not data: committing them is fine, committing their
 # values or history is not.  Endpoints and the token never live here — they come from
 # BATTERY_OPTIMIZER_HA_URL, BATTERY_OPTIMIZER_HA_TOKEN (or ..._HA_TOKEN_FILE) and
-# BATTERY_OPTIMIZER_PROMETHEUS_URL.  Override this whole file with
-# BATTERY_OPTIMIZER_SERVICE_CONFIG.
+# BATTERY_OPTIMIZER_PROMETHEUS_URL.  This file ships in the image (/app/config/service.yaml) as the
+# BASE; a deployment never copies it.  Site values go in a sparse overrides file named by
+# BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES: it is deep-merged over this file (mappings merge,
+# scalars, lists and null replace, false/0/"" included), every key path in it must exist here (a key
+# renamed or removed by a release fails the load instead of silently dropping a value), and
+# battery-optimizer service-config --overrides PATH checks it.  Relative paths below
+# (climate_shadow.climate_config, mpc_config) are relative to this file's directory.  Renaming or
+# removing a key here is a breaking change for every deployed overrides file.  Override the base
+# itself only with BATTERY_OPTIMIZER_SERVICE_CONFIG.
 #
 # mode: shadow (default) has no actuation path.  Its Home Assistant adapter refuses
 # every WebSocket message type outside a read-only allowlist and every REST method but

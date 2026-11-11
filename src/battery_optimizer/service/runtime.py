@@ -386,6 +386,8 @@ class ShadowService:
             soc_source=config.planning.soc_source,
             mode=config.mode,
         ).set(1)
+        for override in config.overrides:
+            self.metrics.config_override_info.labels(path=override.path).set(1)
 
         ha = config.home_assistant
         self.ha: HAWebSocketClient | None = None
@@ -2738,6 +2740,7 @@ class ShadowService:
             **({"battery_health": self._health_status(now)} if self.health is not None else {}),
             **({"thermal": self._thermal_view(now)} if self.thermal is not None else {}),
             "config_hash": self.config.config_hash(),
+            "config_overrides": self.config.override_values(),
             **({"actuator": self.actuator.view()} if self.actuator is not None else {}),
             **(
                 {"full_charge": self._full_charge_status(now)}

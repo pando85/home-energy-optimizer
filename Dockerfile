@@ -42,6 +42,12 @@ LABEL org.opencontainers.image.title="battery-optimizer" \
 # Only the virtualenv is copied: no uv, no build tools, no git, no sources, no data.
 COPY --from=builder /opt/venv /opt/venv
 
+# The base configuration (entity ids, tariff, climate configs; no secrets, no data). The default
+# lookups (config/service.yaml, config/tariff.yaml relative to the working directory) find it;
+# site-specific values go in a sparse BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES file.
+WORKDIR /app
+COPY config ./config
+
 # PYTHONDONTWRITEBYTECODE: the root filesystem may be read-only (bytecode was compiled at build time).
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \

@@ -14,11 +14,48 @@ flags are in the [CLI reference](cli.md); the service-specific settings (`config
 | `BATTERY_OPTIMIZER_HA_TOKEN` | Home Assistant bearer token of a non-admin user; required for HA extraction, `ha-states` and `serve`. Only `serve` in `mode: live` ever writes, and only the allowlisted Omnibattery entities ([ADR-0007](adr/0007-live-battery-control.md)) | unset |
 | `BATTERY_OPTIMIZER_HA_TOKEN_FILE` | File holding the token (e.g. a mounted secret); used by `serve` when the variable above is unset | unset |
 | `BATTERY_OPTIMIZER_SERVICE_CONFIG` | Shadow service configuration (`serve`, `shadow-report`); `build`, `extract` and the `serve` load history also read its battery counters and `battery.commissioned_at` (a missing file named here is an error) | `config/service.yaml` relative to the working directory |
+| `BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES` | Sparse site overrides layered over the service config (see [Service config overrides](#service-config-overrides)); read by `serve`, `shadow-report`, `climate-shadow-report`, `service-config` and, for the battery counters and `battery.commissioned_at`, `build` and `extract` (a missing file named here is an error) | unset |
 | `BATTERY_OPTIMIZER_PORT` | HTTP port of `serve` | `8080` |
 | `BATTERY_OPTIMIZER_PROMETHEUS_URL` | Prometheus base URL | built-in default |
 | `BATTERY_OPTIMIZER_GIT_SHA` | Build-time commit identity (40-hex, optional `-dirty`) used when git is unavailable | unset (set by the image build) |
 
 `.envrc.example` shows a [direnv](https://direnv.net/) setup without any secret in it.
+
+## Service config overrides
+
+The image ships the base configuration (`config/` of the repository: `service.yaml`, `tariff.yaml`,
+`climate.yaml`, `climate-mpc.yaml`) at `/app/config/`, the working directory, so the defaults need no
+variable. Site-specific values go in a **sparse overrides file** named by
+`BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES` (or `--service-config-overrides` of `serve`, `shadow-report`,
+`climate-shadow-report` and `service-config`). The base is resolved as before (`--service-config` >
+`BATTERY_OPTIMIZER_SERVICE_CONFIG` > `config/service.yaml`), then the overrides are deep-merged over it:
+
+- Mappings merge recursively; every other value (scalars, lists, `null`, and `false`, `0`, `""`)
+  **replaces** the base value. A list is replaced as a whole, never merged.
+- **Every key path must exist in the base file**, otherwise loading fails naming the path (a typo, or a key
+  that a new version renamed or removed, must not silently drop a production value). A mapping can only be
+  overridden key by key: a mapping against a non-mapping value (or the reverse, for example `null` over a
+  mapping) is an error, as is an overrides file that is not a mapping or is empty.
+- The merge happens before parsing, so validation applies to the effective values, and `config_hash` and the
+  plan `inputs_hash` are computed from them: the same effective config hashes identically whether a value came
+  from the base or the overrides. Without an overrides file nothing changes.
+- Relative `climate_shadow.climate_config` / `mpc_config` stay relative to the directory of the **base** file.
+- `serve` logs one INFO line per override (`config override <path>: <base> -> <value>`), `/status` carries
+  `config_overrides: {path: value}` and the metric `battery_optimizer_config_override_info{path}` is 1 for each
+  (paths containing `token`, `secret`, `password` or `key` show `<redacted>`). `build` and `extract` read the
+  same overrides for `battery.commissioned_at` and the battery counters.
+- `battery-optimizer service-config [--service-config PATH] --overrides PATH` loads and validates both,
+  prints the applied overrides and the effective `config_hash`, and exits 1 on any error. Run it with the new
+  image before a rollout:
+  `docker run --rm -v ./overrides.yaml:/o.yaml:ro ghcr.io/pando85/battery-optimizer:<tag> service-config --overrides /o.yaml`.
+
+### Deploying a new version
+
+The homelab keeps **only** a sparse overrides file with the site-specific values (`mode`, `climate_shadow.*`,
+`planning.discharge_margin_bound`, `actuation.load_following`, `planning.thermal.mode`, `full_charge.enabled`,
+the dwell and soft-cap costs, ...) and mounts it with `BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES`. A version
+bump changes **only the image tag**; never vendor a copy of `service.yaml`. Check the overrides against the new
+image with `service-config` first: it fails on a key the new version removed or renamed.
 
 ## Development and production locations
 

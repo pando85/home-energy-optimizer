@@ -238,7 +238,8 @@ planning entities are also refreshed by REST GET every `poll_interval_s` (60 s).
 
 ## Configuration
 
-`config/service.yaml` (override with `--service-config` or `BATTERY_OPTIMIZER_SERVICE_CONFIG`) maps
+`config/service.yaml` (override with `--service-config` or `BATTERY_OPTIMIZER_SERVICE_CONFIG`; site values
+belong in a sparse [overrides file](configuration.md#service-config-overrides) merged over it) maps
 roles to entity IDs and holds freshness, planning and observation settings; the file documents every
 key. Entity IDs verified against the live registry on 2026-10-25 with the read-only token; the battery
 roles mapped at commissioning on 2026-11-03:
@@ -294,11 +295,14 @@ The variables the service reads (the complete table for every command is in
 | `BATTERY_OPTIMIZER_DATA_DIR` | Store root (`/data` on a PVC); must be outside a git tree | `~/data/energy-baseline` |
 | `BATTERY_OPTIMIZER_CONFIG` | `tariff.yaml` | `config/tariff.yaml` |
 | `BATTERY_OPTIMIZER_SERVICE_CONFIG` | `service.yaml` | `config/service.yaml` |
+| `BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES` | Sparse site overrides merged over `service.yaml` ([semantics](configuration.md#service-config-overrides)) | unset |
 | `BATTERY_OPTIMIZER_PORT` | HTTP port | `8080` |
 | `BATTERY_OPTIMIZER_GIT_SHA` | Build-time code identity (set by the image) | — |
 
-The image contains neither config file: mount them (a ConfigMap at `/config`) and point the two
-config variables at them. The process writes only under the data directory, so it runs with a
+The image ships the base configuration in `/app/config/` (the working directory), so both config variables
+can stay unset; a site mounts only a sparse overrides file (a ConfigMap) and points
+`BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES` at it. The applied overrides are listed in `/status` as
+`config_overrides` and logged at start. The process writes only under the data directory, so it runs with a
 read-only root filesystem and needs no `/tmp`.
 
 ## HTTP endpoints
@@ -328,6 +332,7 @@ ID, price, timestamp or household reading is a label.
 | Metric | Type | Labels |
 |---|---|---|
 | `build_info` | gauge (1) | `code_version`, `version`, `soc_source`, `mode` |
+| `config_override_info` | gauge (1) | `path` (one series per key of the site overrides file) |
 | `ready`, `inputs_ready` | gauge 0/1 | — |
 | `not_ready_reason` | gauge 0/1 | `reason` |
 | `ha_connected`, `ha_synced` | gauge 0/1 | — |
@@ -1153,7 +1158,7 @@ use. Configuration to enable it: [Enabling](#enabling-the-periodic-full-charge).
 
 #### Enabling the periodic full charge
 
-Only the keys that differ from the committed defaults go into the deployed `service.yaml` (homelab); the
+Only the keys that differ from the committed defaults go into the deployed overrides file (homelab); the
 committed `config/service.yaml` names the installation's entities and `planning.soc_source: entity` is already the
 deployed one.
 

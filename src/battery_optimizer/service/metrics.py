@@ -741,6 +741,12 @@ class ServiceMetrics:
             ["code_version", "version", "soc_source", "mode"],
             registry=r,
         )
+        self.config_override_info = Gauge(
+            f"{PREFIX}_config_override_info",
+            "Config paths set by the site overrides file (value is always 1)",
+            ["path"],
+            registry=r,
+        )
         self.solve_duration = Histogram(
             f"{PREFIX}_solve_duration_seconds",
             "Wall time of planner solves (successful ones)",

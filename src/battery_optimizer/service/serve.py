@@ -10,7 +10,12 @@ from battery_optimizer.config import TariffConfig, load_config, resolve_config_p
 from battery_optimizer.paths import _ensure_private_dir, resolve_data_dir
 
 from .clock import SystemClock
-from .config import ServiceConfig, load_service_config, resolve_service_config_path
+from .config import (
+    ServiceConfig,
+    load_service_config,
+    resolve_overrides_path,
+    resolve_service_config_path,
+)
 from .history import PrometheusHistory
 from .runtime import ShadowService
 
@@ -33,8 +38,14 @@ def build_service(
     service_config: str | None = None,
     tariff_config: str | None = None,
     data_dir: str | None = None,
+    service_config_overrides: str | None = None,
 ) -> tuple[ShadowService, ServiceConfig]:
-    config = load_service_config(resolve_service_config_path(service_config))
+    config = load_service_config(
+        resolve_service_config_path(service_config),
+        resolve_overrides_path(service_config_overrides),
+    )
+    for override in config.overrides:
+        log.info("config override %s (from %s)", override.describe(), config.overrides_path)
     tariff, tariff_error = _load_tariff(tariff_config)
     resolved_data_dir = resolve_data_dir(data_dir)
     store_root = resolved_data_dir / "service" / "v1"
@@ -55,7 +66,9 @@ def build_service(
             price_entity=config.entities.get("price"),
             battery_charge_energy_entity=config.entities.get("battery_charge_energy"),
             battery_discharge_energy_entity=config.entities.get("battery_discharge_energy"),
-            battery_commissioned_at=load_battery_telemetry(config.source_path).commissioned_at,
+            battery_commissioned_at=load_battery_telemetry(
+                config.source_path, config.overrides_path
+            ).commissioned_at,
             interval_seconds=config.planning.interval_seconds,
         ).fetch
 
