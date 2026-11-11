@@ -1005,8 +1005,10 @@ spread = slot price - planning.throughput_cost_eur_per_kwh - storage value   >= 
 
 where the slot price is the intent's `expected_buy_price_eur_per_kwh` and the storage value is the plan's
 [value of stored energy](#storage-value-of-the-plan) at the end of that slot (EUR per AC kWh), so a kWh is
-discharged now when discharging it beats keeping it, wear included. Otherwise the planned cap stands, exactly as
-today. In a one-week replay of real loads and prices this closed most of the gap between the plan-SOC rule and a
+discharged now when discharging it beats keeping it, wear included. Otherwise the `plan_soc` rule decides, exactly
+as with the default floor (follow the load down to the plan's end-of-slot SOC; recorded as
+`load_following_rule: plan_soc`, with the value and spread still recorded), so the value floor never follows the load
+less than the default one. In a one-week replay of real loads and prices this closed most of the gap between the plan-SOC rule and a
 perfect load forecast; the owner runs it live to measure the real value.
 
 - **Constants of the slot:** price, wear cost and value do not change inside a slot, so the rule cannot flap; it
