@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.17.0](https://github.com/pando85/home-energy-optimizer/tree/v0.17.0) - 2026-11-11
+
+### Added
+
+- config: Layer a site overrides file over the shipped service config ([b95a020](https://github.com/pando85/home-energy-optimizer/commit/b95a020d8804155ba67fa786e2e5b41539a59575))
+
+### Documentation
+
+- readme: Map battery and climate optimizer components ([7c0819a](https://github.com/pando85/home-energy-optimizer/commit/7c0819a1829966d221e21e89ab2c744db2df0409))
+- Reference idle drain modeling work in feature/idle-drain-model branch ([0a1ce51](https://github.com/pando85/home-energy-optimizer/commit/0a1ce516a8472cb324cc79c7c86525a7d5d0826d))
+
+### Chore
+
+- renovate: Monthly schedule for pre-commit hooks group ([1210b48](https://github.com/pando85/home-energy-optimizer/commit/1210b48c19a8f368c01f6b4afb295c4d31157c6d))
+
 ## [v0.16.0](https://github.com/pando85/home-energy-optimizer/tree/v0.16.0) - 2026-11-08
 
 ### Added
