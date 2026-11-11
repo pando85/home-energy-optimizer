@@ -44,7 +44,7 @@ wheels = [
 
 [[package]]
 name = "battery-optimizer"
-version = "0.18.1"
+version = "0.18.2"
 source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
