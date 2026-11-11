@@ -22,6 +22,18 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _add_overrides_option(p: argparse.ArgumentParser, *flags: str) -> None:
+    """The site overrides file layered over the service config."""
+    p.add_argument(
+        "--service-config-overrides",
+        *flags,
+        dest="service_config_overrides",
+        default=None,
+        help="Site overrides YAML merged over the service config; every key must exist in it "
+        "(default: $BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES, none)",
+    )
+
+
 def _add_common(p: argparse.ArgumentParser) -> None:
     """Add common options shared by data subcommands."""
     p.add_argument(
@@ -649,6 +661,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Service YAML (default: $BATTERY_OPTIMIZER_SERVICE_CONFIG or config/service.yaml)",
     )
+    _add_overrides_option(p_serve)
     p_serve.add_argument("--host", default="0.0.0.0", help="Bind address (default 0.0.0.0)")
     p_serve.add_argument(
         "--port",
@@ -656,6 +669,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="HTTP port (default: $BATTERY_OPTIMIZER_PORT or 8080)",
     )
+
+    # -- service-config (deploy check) ---------------------------------------
+    p_sc = subs.add_parser(
+        "service-config",
+        help="Load and validate the service config with the site overrides; print what applies",
+    )
+    p_sc.add_argument(
+        "--service-config",
+        default=None,
+        help="Base service YAML (default: $BATTERY_OPTIMIZER_SERVICE_CONFIG, config/service.yaml)",
+    )
+    _add_overrides_option(p_sc, "--overrides")
 
     # -- shadow-report -----------------------------------------------------
     p_shadow = subs.add_parser(
@@ -668,6 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Service YAML, for the timezone and slot length (default as for serve)",
     )
+    _add_overrides_option(p_shadow)
     p_shadow.add_argument(
         "--since",
         default=None,
@@ -691,6 +717,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Service YAML: go_live, the prior and the MPC config (default as for serve)",
     )
+    _add_overrides_option(p_cshadow)
     p_cshadow.add_argument(
         "--prior", default=None, help="Prior id or prefix (default: climate_shadow.prior)"
     )
@@ -1636,6 +1663,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     service, _config = build_service(
         service_config=args.service_config,
+        service_config_overrides=args.service_config_overrides,
         tariff_config=args.config,
         data_dir=args.data_dir,
     )
@@ -1643,18 +1671,46 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_service_config(args: argparse.Namespace) -> int:
+    """Validate base + overrides as ``serve`` would load them; exit 1 (via main) on any error."""
+    from battery_optimizer.service.config import (
+        load_service_config,
+        resolve_overrides_path,
+        resolve_service_config_path,
+    )
+
+    config = load_service_config(
+        resolve_service_config_path(args.service_config),
+        resolve_overrides_path(args.service_config_overrides),
+    )
+    print(
+        f"service-config: OK base={config.source_path} overrides={config.overrides_path or 'none'}"
+    )
+    print(f"service-config: mode={config.mode} config_hash={config.config_hash()}")
+    for override in config.overrides:
+        print(f"service-config: override {override.describe()}")
+    return 0
+
+
 def cmd_shadow_report(args: argparse.Namespace) -> int:
     """Shadow-vs-native comparison from the recorded store."""
     from battery_optimizer.config import load_config, resolve_config_path
     from battery_optimizer.paths import resolve_data_dir
-    from battery_optimizer.service.config import load_service_config, resolve_service_config_path
+    from battery_optimizer.service.config import (
+        load_service_config,
+        resolve_overrides_path,
+        resolve_service_config_path,
+    )
     from battery_optimizer.service.shadow_report import (
         build_shadow_report,
         parse_window,
         render_markdown,
     )
 
-    config = load_service_config(resolve_service_config_path(args.service_config))
+    config = load_service_config(
+        resolve_service_config_path(args.service_config),
+        resolve_overrides_path(args.service_config_overrides),
+    )
     tariff = load_config(resolve_config_path(args.config))
     tz = config.tz
     since, until = parse_window(args.since, args.until, tz, datetime.now(UTC))
@@ -1679,9 +1735,16 @@ def cmd_climate_shadow_report(args: argparse.Namespace) -> int:
     from battery_optimizer.climate.shadow_gates import SEASON_END, evaluate, render_markdown
     from battery_optimizer.paths import resolve_data_dir
     from battery_optimizer.service.climate_shadow import RECORDS_SINCE, config_paths, read_records
-    from battery_optimizer.service.config import load_service_config, resolve_service_config_path
+    from battery_optimizer.service.config import (
+        load_service_config,
+        resolve_overrides_path,
+        resolve_service_config_path,
+    )
 
-    config = load_service_config(resolve_service_config_path(args.service_config))
+    config = load_service_config(
+        resolve_service_config_path(args.service_config),
+        resolve_overrides_path(args.service_config_overrides),
+    )
     root = resolve_data_dir(args.data_dir)
     since = datetime.combine(RECORDS_SINCE, datetime.min.time(), tzinfo=UTC)
     season_end = datetime.combine(SEASON_END, datetime.min.time(), tzinfo=UTC)
@@ -1744,6 +1807,7 @@ _HANDLERS = {
     "inspect-sql": cmd_inspect_sql,
     "ha-states": cmd_ha_states,
     "serve": cmd_serve,
+    "service-config": cmd_service_config,
     "shadow-report": cmd_shadow_report,
     "climate-shadow-report": cmd_climate_shadow_report,
     "mirror": cmd_mirror,

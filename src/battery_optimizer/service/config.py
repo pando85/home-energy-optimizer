@@ -683,6 +683,34 @@ class FullChargeSettings:
     entities: FullChargeEntities = field(default_factory=FullChargeEntities)
 
 
+_SECRET_PATH = re.compile(r"token|secret|password|key", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ConfigOverride:
+    """One leaf value of the overrides file that replaced (or pinned) a base value."""
+
+    path: str
+    base: Any
+    value: Any
+
+    @property
+    def shown_value(self) -> Any:
+        return "<redacted>" if _SECRET_PATH.search(self.path) else self.value
+
+    @property
+    def shown_base(self) -> Any:
+        return "<redacted>" if _SECRET_PATH.search(self.path) else self.base
+
+    def describe(self) -> str:
+        return f"{self.path}: {_short(self.shown_base)} -> {_short(self.shown_value)}"
+
+
+def _short(value: Any, limit: int = 120) -> str:
+    text = repr(value)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
 @dataclass(frozen=True)
 class ServiceConfig:
     """Fully resolved service configuration."""
@@ -703,6 +731,14 @@ class ServiceConfig:
     timezone: str = "Europe/Madrid"
     mode: str = "shadow"
     source_path: str | None = None
+    #: The site overrides layered over the base file (see :func:`merge_service_overrides`).
+    #: Observability only: the hashes are computed from the effective, parsed values.
+    overrides: tuple[ConfigOverride, ...] = ()
+    overrides_path: str | None = None
+
+    def override_values(self) -> dict[str, Any]:
+        """``{dotted path: override value}`` for ``/status`` (secret-looking paths redacted)."""
+        return {o.path: o.shown_value for o in self.overrides}
 
     @property
     def tz(self) -> ZoneInfo:
@@ -816,6 +852,75 @@ def resolve_service_config_path(cli_arg: str | None = None) -> Path:
     if env:
         return Path(env).expanduser().resolve()
     return (Path.cwd() / "config" / "service.yaml").resolve()
+
+
+def resolve_overrides_path(cli_arg: str | None = None) -> Path | None:
+    """``--service-config-overrides`` > ``BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES`` > none."""
+    if cli_arg:
+        return Path(cli_arg).expanduser().resolve()
+    env = get_env("BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES")
+    if env:
+        return Path(env).expanduser().resolve()
+    return None
+
+
+def load_overrides_file(path: Path) -> Mapping[str, Any]:
+    """The YAML mapping at *path*; a missing, unreadable, empty or non-mapping file is an error."""
+    if not path.is_file():
+        raise ValueError(f"service config overrides not found: {path}")
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"service config overrides {path} are unreadable: {exc}") from exc
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            f"service config overrides {path} must be a mapping, got "
+            f"{'an empty document' if raw is None else type(raw).__name__}"
+        )
+    return raw
+
+
+def merge_service_overrides(
+    base: Mapping[str, Any], overrides: Mapping[str, Any], *, where: str = "overrides"
+) -> tuple[dict[str, Any], tuple[ConfigOverride, ...]]:
+    """Deep-merge *overrides* over *base*; fail closed on any path the base does not have.
+
+    Mappings merge recursively.  Every other value (scalar, list, explicit ``null``, ``false``,
+    ``0``, ``""``) REPLACES the base value.  Every key path of *overrides* must exist in *base*
+    (a typo, or a key a release renamed or removed, must not silently drop a production value),
+    and a mapping may only be overridden key by key: a mapping against a non-mapping, or the
+    reverse, is an error.  Returns the merged mapping and one :class:`ConfigOverride` per leaf.
+    """
+    applied: list[ConfigOverride] = []
+
+    def merge(b: Mapping[str, Any], o: Mapping[str, Any], prefix: str) -> dict[str, Any]:
+        out = dict(b)
+        for key, value in o.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if key not in b:
+                raise ValueError(
+                    f"service config {where}: {path!r} does not exist in the base config "
+                    "(a typo, or a key renamed or removed by this version)"
+                )
+            current = b[key]
+            if isinstance(value, Mapping):
+                if not isinstance(current, Mapping):
+                    raise ValueError(
+                        f"service config {where}: {path!r} is a mapping but the base value is "
+                        f"{type(current).__name__}"
+                    )
+                out[key] = merge(current, value, path)
+            else:
+                if isinstance(current, Mapping):
+                    raise ValueError(
+                        f"service config {where}: {path!r} is a mapping in the base config; "
+                        "override its keys individually"
+                    )
+                out[key] = value
+                applied.append(ConfigOverride(path=path, base=current, value=value))
+        return out
+
+    return merge(base, overrides, ""), tuple(applied)
 
 
 def _section(raw: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -1655,9 +1760,18 @@ def _parse_entities(raw: Mapping[str, Any]) -> EntityMap:
     return EntityMap(roles=roles, observed=tuple(observed_raw))
 
 
-def load_service_config(path: Path | None = None) -> ServiceConfig:
-    """Load the YAML at *path* (or the resolved default) and apply env overrides."""
+def load_service_config(
+    path: Path | None = None, overrides_path: Path | None = None
+) -> ServiceConfig:
+    """Load the YAML at *path* (or the resolved default), layer the site overrides over it and
+    apply the environment settings.
+
+    *overrides_path* defaults to ``BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES`` (see
+    :func:`merge_service_overrides` for the semantics).  Relative ``climate_shadow`` paths stay
+    relative to the directory of the base file.
+    """
     path = path or resolve_service_config_path()
+    overrides_path = overrides_path or resolve_overrides_path()
     if not path.is_file():
         raise ValueError(
             f"service config not found: {path} (set BATTERY_OPTIMIZER_SERVICE_CONFIG or run "
@@ -1666,6 +1780,11 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
     raw = yaml.safe_load(path.read_text())
     if not isinstance(raw, Mapping):
         raise ValueError(f"service config must be a mapping, got {type(raw).__name__}")
+    overrides: tuple[ConfigOverride, ...] = ()
+    if overrides_path is not None:
+        raw, overrides = merge_service_overrides(
+            raw, load_overrides_file(overrides_path), where=f"overrides {overrides_path}"
+        )
     mode = raw.get("mode", "shadow")
     if mode not in SERVICE_MODES:
         raise ValueError(f"service config: mode={mode!r} is not one of {SERVICE_MODES}")
@@ -1844,6 +1963,8 @@ def load_service_config(path: Path | None = None) -> ServiceConfig:
         timezone=timezone,
         mode=mode,
         source_path=str(path),
+        overrides=overrides,
+        overrides_path=str(overrides_path) if overrides_path else None,
     )
 
 

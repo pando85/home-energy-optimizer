@@ -113,7 +113,9 @@ def _entity(raw: Mapping[str, Any], role: str) -> str | None:
     return value
 
 
-def load_battery_telemetry(path: str | Path | None = None) -> BatteryTelemetry:
+def load_battery_telemetry(
+    path: str | Path | None = None, overrides_path: str | Path | None = None
+) -> BatteryTelemetry:
     """Read the battery counters and commissioning instant from the service config.
 
     *path* defaults to the service config resolution (``BATTERY_OPTIMIZER_SERVICE_CONFIG``,
@@ -121,6 +123,10 @@ def load_battery_telemetry(path: str | Path | None = None) -> BatteryTelemetry:
     means "nothing configured", the behaviour before this module existed; an explicitly
     given path, or one named by ``BATTERY_OPTIMIZER_SERVICE_CONFIG``, that does not exist is
     an error (a typo must not silently switch the commissioning guard off).
+
+    The site overrides file (*overrides_path*, else ``BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES``)
+    is layered over the file first, as ``load_service_config`` does, so the offline commands see
+    the same effective values as the service.
 
     Raises:
         ValueError: an unreadable or malformed file, a counter given without its pair, an
@@ -145,6 +151,17 @@ def load_battery_telemetry(path: str | Path | None = None) -> BatteryTelemetry:
         raw = {}
     if not isinstance(raw, Mapping):
         raise ValueError(f"battery telemetry config {resolved} must be a mapping")
+    from battery_optimizer.service.config import (
+        load_overrides_file,
+        merge_service_overrides,
+        resolve_overrides_path,
+    )
+
+    overrides = resolve_overrides_path(str(overrides_path) if overrides_path else None)
+    if overrides is not None:
+        raw, _applied = merge_service_overrides(
+            raw, load_overrides_file(overrides), where=f"overrides {overrides}"
+        )
     entities = raw.get("entities") or {}
     battery = raw.get("battery") or {}
     if not isinstance(entities, Mapping) or not isinstance(battery, Mapping):

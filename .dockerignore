@@ -2,6 +2,7 @@
 # data and local env files can never leak into an image.
 *
 !src/
+!config/
 !pyproject.toml
 !uv.lock
 !README.md

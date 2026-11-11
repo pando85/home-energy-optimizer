@@ -47,6 +47,16 @@ git log "$(git describe --tags --abbrev=0)..HEAD" --oneline
 
 While the project is `0.x`, breaking changes may bump MINOR; say so in the PR description.
 
+## Config keys and deployed overrides
+
+The homelab deploys a sparse overrides file (`BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES`, in
+`apps/battery-optimizer/files/` of the homelab repo) over the `config/service.yaml` shipped in the image, and the
+load fails on a key path the base no longer has. When a release renames or removes a `config/service.yaml` key
+(`git diff "$(git describe --tags --abbrev=0)..HEAD" -- config/service.yaml`), check it against the deployed
+overrides and say so in the release notes and the PR description, so the overrides are updated in the same
+homelab change that bumps the image tag. Verify before the rollout with
+`docker run --rm -v <overrides>:/o.yaml:ro ghcr.io/pando85/battery-optimizer:<tag> service-config --overrides /o.yaml`.
+
 ## Steps
 
 ```bash

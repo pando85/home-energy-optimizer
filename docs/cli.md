@@ -208,7 +208,8 @@ reconstruct gross load; without it the build refuses.
 
 **Battery commissioning:** `battery.commissioned_at` and the two AC energy counters
 (`entities.battery_charge_energy`, `entities.battery_discharge_energy`) live in
-`config/service.yaml` (override with `BATTERY_OPTIMIZER_SERVICE_CONFIG`; deliberately not in
+`config/service.yaml` (override with `BATTERY_OPTIMIZER_SERVICE_CONFIG`, site values with
+`BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES`; deliberately not in
 `tariff.yaml`, whose hash is part of every dataset id). A window that ends at or before that instant
 (or with none recorded) is built exactly as before. A window that reaches it reads the counters, and
 every interval ending after that instant (one that merely touches it counts) gets
@@ -522,6 +523,20 @@ recorder keeps them for about ten days, so the Parquet store is the only survivi
 benchmark reads it. No appliance modelling, NILM or forecasting was built on it: it closes the long-deferred
 "there is no reader" gap and nothing more, and ADR-0002 Phase 3 remains the place where consumption would
 start.
+
+## `service-config`
+
+Deploy check: loads the base service config and the site overrides exactly as `serve` does, validates both and
+prints the applied overrides (`path: base -> value`) and the effective `config_hash`. Exit 1, with one line on
+stderr, on any error: a missing or non-mapping file, a key path absent from the base, an invalid effective value.
+
+```bash
+battery-optimizer service-config [--service-config <yaml>] [--overrides <yaml>]
+```
+
+`--overrides` is also spelled `--service-config-overrides` (default `$BATTERY_OPTIMIZER_SERVICE_CONFIG_OVERRIDES`).
+Semantics: [Service config overrides](configuration.md#service-config-overrides). `serve`, `shadow-report` and
+`climate-shadow-report` take `--service-config-overrides` too.
 
 ## `climate-shadow-report`
 
