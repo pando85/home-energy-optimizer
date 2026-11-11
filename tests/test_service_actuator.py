@@ -1099,6 +1099,50 @@ def test_actuator_wakes_on_kill_switch_changes_and_debounced_over_cap_import(tmp
     assert wake.is_set()
 
 
+def test_grid_power_updates_feed_the_discharge_metrics_only_while_acting(tmp_path, cleanup):
+    from battery_optimizer.service.actuator import Desired
+
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, mode="dry_run")
+    cleanup(service)
+    _live_world(service, clock)
+    clock.advance(1)
+    service.store.apply(entity_state(ENTS.battery_ac_power, -700, clock.now()))
+    registry = service.metrics.registry
+    hist = "battery_optimizer_actuator_discharge_grid_watts"
+    export = "battery_optimizer_actuator_export_seconds_total"
+    band = {"power_band": "500_1000"}
+
+    def grid(value):
+        clock.advance(2)
+        service.store.apply(entity_state(GRID, value, clock.now()))
+
+    grid(-40)  # no tick yet: not in control
+    assert registry.get_sample_value(f"{hist}_count", band) == 0.0
+    # What a discharge tick leaves behind.
+    service.actuator.in_control = True
+    service.actuator.last_tick_at = clock.now()
+    service.actuator.desired = Desired(mode="discharge", reason="intent", allow_discharge=True)
+    grid(-40)
+    grid(-30)
+    assert registry.get_sample_value(f"{hist}_count", band) == 2.0
+    assert registry.get_sample_value(export) == pytest.approx(2.0)
+    # Another entity's update is not a grid-power sample.
+    service.store.apply(entity_state(ENTS.battery_soc, 49, clock.now()))
+    assert registry.get_sample_value(f"{hist}_count", band) == 2.0
+
+
+def test_shadow_service_exposes_no_discharge_metrics_and_ignores_grid_updates(tmp_path, cleanup):
+    clock = FakeClock(NOW)
+    service = make_service(tmp_path, clock, mode="shadow")
+    cleanup(service)
+    assert service.actuator is None
+    service.store.apply(entity_state(GRID, -40, clock.now()))
+    text = service.metrics.render().decode()
+    assert "actuator_discharge_grid" not in text and "actuator_export_seconds" not in text
+    assert "actuator_discharge_margin" not in text
+
+
 def test_restart_needs_a_plan_solved_by_this_process(tmp_path, cleanup):
     clock = FakeClock(NOW)
     service = make_service(tmp_path, clock)

@@ -400,6 +400,9 @@ ID, price, timestamp or household reading is a label.
 | `actuator_desired_pd_target_watts`, `actuator_desired_allow_charge`, `actuator_desired_allow_discharge`, `actuator_desired_max_discharge_watts` | gauge (requested) | — |
 | `actuator_observed_pd_target_watts`, `actuator_observed_battery_power_watts` (+ charge), `actuator_observed_grid_power_watts`, `actuator_house_load_watts` | gauge (observed; absent when stale) | — |
 | `actuator_clamped_watts` | gauge (W of planned battery power the last tick could not request; 0 = none cut) | — |
+| `actuator_discharge_margin_watts` | gauge (the configured `actuation.discharge_margin_w`) | — |
+| `actuator_discharge_grid_watts` | histogram (measured grid power, + import, at every new grid-power update while the actuator is in control, guard ok and in discharge mode; buckets -500, -200, -100, -50, -25, 0, 25, 50, 75, 100, 125, 150, 200, 300, 500, +Inf W; [discharge margin tuning](planning/discharge-margin-tuning.md)) | `power_band` (the measured battery discharge power: `lt500`, `500_1000`, `ge1000` W) |
+| `actuator_export_seconds_total` | counter (seconds with grid power below 0 W in those conditions, integrated only between two fresh consecutive grid-power updates no further apart than `actuation.grid_power_max_age_s`; an HA outage or a stale gap counts nothing) | — |
 | `actuator_load_following_engaged`, `actuator_load_following_raise_watts` | gauge (only with `actuation.load_following.enabled`: 1 while [load-following discharge](#load-following-discharge) is engaged, and how far it raised the discharge cap above the planned cap; 0 otherwise) | — |
 | `actuator_reserve_engaged` | gauge (1 while [reserve protection](#reserve-protection) holds: the measured SOC is at or below the tariff's SOC floor) | — |
 | `actuator_writes_total` | counter | `role` (`allow_charge`, `allow_discharge`, `max_discharge_power`, `power_limits`, `pd_target`, `heartbeat`, `full_charge_day`, `full_charge_enable`), `result` (`ok`, `failed`, `dry_run`) |
@@ -853,6 +856,18 @@ bound each slot's discharge the same way (`max(0, forecast load - discharge_marg
 energy the actuator cannot deliver. It reads this one margin, joins `inputs_hash` and `config_hash` only when on,
 and applies to the day-ahead and the final plan alike (one solve); see
 [known issues](known-issues.md#planned-discharge-is-not-delivered-planner-bound-enabled-since-0140-monitoring).
+
+**Discharge-time grid distribution** (observability only, [plan](planning/discharge-margin-tuning.md); no effect on the
+plan, the plan hash or any write). The runtime hands every grid-power `state_changed` (about every 2 s; Prometheus
+scrapes HA only once a minute) to the actuator, which feeds `actuator_discharge_grid_watts` and
+`actuator_export_seconds_total` only while its last tick (at most three tick intervals old) is in control, guard ok and
+in `discharge` mode, so charge, idle, safe idle, a kill switch off and `ha_not_synced` count nothing. A reading counts
+when HA vouched for it within `grid_power_max_age_s` and the battery AC power is known (it gives the `power_band`).
+The histogram takes each new value once; a value HA merely re-confirms (the 60 s REST refresh) is not a new sample but
+keeps the export integration continuous. Export seconds add the time between two consecutive fresh samples (source
+time, no more than `grid_power_max_age_s` apart) when the earlier reading was below 0 W; a stale reading or a longer
+gap restarts the chain, so an outage is never counted as export. A mode change is classified by the last tick, so up
+to one tick interval around a charge/discharge edge can be misclassified.
 
 **Guard** (any failure → safe idle, recorded with the reason): `import_over_cap` (measured import above
 `import_cap_w + import_guard_margin_w` while charge is on: charge off at once, and charge refused for

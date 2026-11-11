@@ -1,8 +1,9 @@
 # Data-driven tuning of the discharge margin
 
-- **Status:** Proposed. The owner approved the design on 2026-11-05; implementation has not started. Merging this plan
-  authorises nothing on the installation: Step 1 is an observability PR reviewed on its own, Step 2 needs a separate,
-  explicit owner OK.
+- **Status:** Step 1 (observability) implemented 2026-11-11: the three service metrics in this repository, and in
+  homelab the `BatteryMarginCanBeLowered` rule and the dashboard panel; the rule can only fire once the metrics are
+  deployed and seven clean days have passed. Step 2 (automatic margin) is not started and needs a separate, explicit
+  owner OK. The owner approved the design on 2026-11-05; merging this plan authorises nothing on the installation.
 - **Date:** 2026-11-05
 - **Decisions:** [ADR-0007](../adr/0007-live-battery-control.md) (live control; Step 2 would need a note or amendment).
 - **Related:** [known issue](../known-issues.md#the-pd-loop-oscillates-the-discharge-margin-was-too-small), [planned
@@ -43,7 +44,7 @@ of discharge in low-load hours. Omnibattery's `pd_controller_deadband` is 40 W, 
 utility meter's hourly export data (Datadis or the distributor portal), checked by hand once a week after each margin
 change.
 
-## 2. Step 1 (to build): measure and suggest
+## 2. Step 1 (implemented): measure and suggest
 
 Observability only: no change to the plan, the plan hash or the actuation, no new write, `ha_guard.py` untouched.
 
@@ -66,6 +67,13 @@ scrapes HA once a minute, so the distribution is measured in the service. Names 
 - The gauge is a scrape-time family like the other actuator gauges; the histogram and the counter are event instruments
   (like `actuator_writes_total`), updated from the grid-power state path. The integration of `export_seconds_total`
   adds the interval to the previous update only when both samples are fresh, so an HA outage does not count as export.
+- As built: the runtime passes every grid-power state to `Actuator.observe_grid_power`; "fresh" is HA's own timestamp
+  (`max(last_updated, last_reported)`) within `actuation.grid_power_max_age_s` (30 s) of the service clock, and two
+  samples are chained only when they are no further apart than that. "Live, in control, guard ok and in discharge mode"
+  is the last tick's state (`in_control`, no guard reason, `desired.mode == discharge`), valid for three tick
+  intervals. The histogram takes each new value once (a REST re-confirmation of an unchanged value is not a sample but
+  keeps the chain going); a sample without a measured battery power is dropped, since it has no band. Details in
+  [service](../service.md#live-control-dry_run-and-live).
 
 ### 2.2 Suggestion rule `BatteryMarginCanBeLowered`
 
@@ -182,5 +190,7 @@ are the only path.
 
 - Histogram bucket choice (resolution near 0 to 100 W against series count).
 - Whether to exclude the first minutes after a mode change (charge to discharge) from the histogram and the counter.
+  Step 1 classifies by the last tick (up to one tick interval of misclassification at an edge) and excludes nothing
+  more; revisit with the first week of data.
 - Cadence of the manual utility-meter cross-check (weekly after a change, then monthly?).
 - Whether the quantile condition should be evaluated per `power_band`.
