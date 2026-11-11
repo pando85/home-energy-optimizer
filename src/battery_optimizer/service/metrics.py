@@ -170,6 +170,12 @@ class _RuntimeCollector(Collector):
             snap.get("terminal_value"),
         )
         yield gauge(
+            "planner_storage_value_eur_per_kwh",
+            "Latest plan's marginal value of stored energy at the end of its first slot, EUR per "
+            "AC kWh discharged (absent when the extra solve found none)",
+            snap.get("storage_value"),
+        )
+        yield gauge(
             "virtual_battery_soc_ratio",
             "SOC of the open-loop virtual (counterfactual) battery",
             snap.get("virtual_soc"),
@@ -508,6 +514,35 @@ def _actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
             "How far load-following raised the system discharge cap above the planned cap",
             lf.get("raise_w"),
         )
+        if "extra_kwh" in lf:  # only with actuation.load_following.floor: storage_value
+            yield gauge(
+                "load_following_storage_value_eur_per_kwh",
+                "The plan's value of stored energy the last tick's load-following decision used, "
+                "EUR per AC kWh (absent without one)",
+                lf.get("storage_value_eur_per_kwh"),
+            )
+            yield gauge(
+                "load_following_value_rule",
+                "1 when the storage-value rule decided the last discharge tick, 0 when the plan "
+                "had no value and the plan-SOC rule did (absent outside a discharge intent)",
+                lf.get("value_rule"),
+            )
+            extra = CounterMetricFamily(
+                f"{name}_load_following_extra_kwh",
+                "AC kWh discharged above the planned cap while load-following was engaged, by the "
+                "rule that decided",
+                labels=["rule"],
+            )
+            for rule, kwh in sorted(lf["extra_kwh"].items()):
+                extra.add_metric([rule], float(kwh))
+            yield extra
+            value = CounterMetricFamily(
+                f"{name}_load_following_extra_value_eur",
+                "EUR the storage-value rule's extra discharge earned over keeping the energy: "
+                "(price - throughput cost - storage value) times the extra kWh",
+            )
+            value.add_metric([], float(lf["extra_value_eur"]))
+            yield value
 
 
 #: Values of the ``status`` label of the gate state set.

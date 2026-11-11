@@ -2437,6 +2437,463 @@ def test_invalid_load_following_config_is_refused(tmp_path, override, message):
 
 
 # ---------------------------------------------------------------------------
+# Load-following with the storage-value floor (ADR-0007 amendment 2026-11-11): the raised cap is
+# held by what one kWh kept is worth to the plan, not by the plan's end-of-slot SOC.
+# ---------------------------------------------------------------------------
+
+SV = replace(
+    SETTINGS,
+    load_following=LoadFollowingSettings(enabled=True, max_w=2500.0, floor="storage_value"),
+)
+RESERVE = 20.0  # the tariff's SOC floor (%) in these tests
+WEAR = 0.01
+
+
+def sv_intent(value=0.10, price=0.20, soc_target=0.5, power=1000.0, **kw) -> ShadowIntent:
+    return replace(
+        lf_intent(power=power, soc_target=soc_target, **kw),
+        storage_value_eur_per_kwh=value,
+        expected_buy_price_eur_per_kwh=price,
+    )
+
+
+def sv_ctx(clock, the_intent, **kw) -> ActuationContext:
+    values = {"soc_floor_pct": RESERVE, "throughput_cost_eur_per_kwh": WEAR}
+    values.update(kw)
+    return ctx(clock, the_intent, **values)
+
+
+def sv_tick(settings, soc, the_intent, **kw):
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=soc)
+    actuator, ha, metrics = make(clock, store, settings=settings)
+    record = tick(actuator, sv_ctx(clock, the_intent, **kw))
+    return record, actuator, ha, metrics
+
+
+def test_the_storage_value_floor_raises_the_cap_below_the_plan_soc_while_the_spread_pays():
+    # 45% is under the plan's 50% end-of-slot SOC: the plan-SOC rule would hold the planned cap
+    record, actuator, ha, _ = sv_tick(SV, 45, sv_intent(value=0.10, price=0.20))
+    assert caps(ha) == [2500.0]
+    desired = record["desired"]
+    assert desired["load_following"] is True and desired["max_discharge_w"] == 2500.0
+    assert desired["planned_max_discharge_w"] == 1000.0
+    assert desired["load_following_rule"] == "storage_value"
+    assert desired["load_following_storage_value_eur_per_kwh"] == 0.10
+    assert desired["load_following_spread_eur_per_kwh"] == pytest.approx(0.09)  # 0.20 - 0.01 - 0.10
+    assert desired["load_following_floor_pct"] == 21.0  # the tariff floor + its release band
+    assert desired["pd_target_w"] == 50.0  # the margin is untouched: never export
+    # the same plan under the default rule holds the cap
+    _, _, ha_plan, _ = sv_tick(LF, 45, sv_intent(value=0.10, price=0.20))
+    assert caps(ha_plan) == [1000.0]
+
+
+def test_the_storage_value_floor_releases_to_the_planned_cap_when_keeping_the_energy_pays_more():
+    # the energy is worth more kept: 0.12 - 0.01 - 0.11 = 0 < the 0.005 margin, even at 90% SOC
+    record, _, ha, _ = sv_tick(SV, 90, sv_intent(value=0.11, price=0.12))
+    assert caps(ha) == [1000.0]  # exactly the planned cap, as today
+    desired = record["desired"]
+    assert desired["load_following"] is False and desired["max_discharge_w"] == 1000.0
+    assert desired["load_following_rule"] == "storage_value"
+    assert desired["load_following_spread_eur_per_kwh"] == pytest.approx(0.0, abs=1e-9)
+
+
+@pytest.mark.parametrize(
+    ("price", "engaged"),
+    [(0.1251, True), (0.1250, True), (0.1249, False), (0.1, False)],
+)
+def test_the_margin_is_inclusive(price, engaged):
+    # spread = price - 0.01 - 0.11; the margin is 0.005
+    record, _, _, _ = sv_tick(SV, 80, sv_intent(value=0.11, price=price))
+    assert record["desired"]["load_following"] is engaged
+
+
+def test_a_negative_value_engages_it_too():
+    # idle energy that costs dwell is worth less than nothing: discharging it is a gain
+    record, _, ha, _ = sv_tick(SV, 80, sv_intent(value=-0.05, price=0.01))
+    assert caps(ha) == [2500.0] and record["desired"]["load_following"] is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        {"the_intent": sv_intent(value=None)},
+        {"the_intent": replace(sv_intent(), expected_buy_price_eur_per_kwh=None)},
+        {"the_intent": sv_intent(), "soc_floor_pct": None},
+        {"the_intent": sv_intent(value=float("nan"))},
+    ],
+    ids=["no_value", "no_price", "no_tariff_floor", "nan_value"],
+)
+@pytest.mark.parametrize(("soc", "engaged"), [(49.0, False), (50.9, False), (51.0, True)])
+def test_without_a_usable_value_the_plan_soc_rule_decides(case, soc, engaged):
+    case = dict(case)
+    record, _, ha, _ = sv_tick(SV, soc, case.pop("the_intent"), **case)
+    desired = record["desired"]
+    assert desired["load_following"] is engaged and caps(ha) == [2500.0 if engaged else 1000.0]
+    assert desired["load_following_rule"] == "plan_soc"
+    assert desired["load_following_storage_value_eur_per_kwh"] is None
+    assert desired["load_following_spread_eur_per_kwh"] is None
+    assert desired["load_following_floor_pct"] == 50.0  # the plan's SOC, as today
+
+
+def test_the_fallback_keeps_the_plan_soc_hysteresis(caplog):
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=50.5)
+    actuator, ha, _ = make(clock, store, settings=SV)
+    the_intent = sv_intent(value=None)
+    states = []
+    for soc in (50.5, 51.0, 50.0, 49.9, 51.0):
+        set_soc(store, clock, soc, seconds=10)
+        states.append(tick(actuator, sv_ctx(clock, the_intent))["desired"]["load_following"])
+    assert states == [False, True, True, False, True]
+
+
+def test_the_soc_stays_clear_of_the_tariff_floor_with_hysteresis(caplog):
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=21.5)
+    actuator, ha, _ = make(clock, store, settings=SV)
+    the_intent = sv_intent(value=0.0, price=0.30)  # a huge spread: only the SOC can hold it back
+    states = []
+    with caplog.at_level("INFO", logger="battery_optimizer.service.actuator"):
+        for soc in (21.5, 21.9, 22.0, 21.5, 21.0, 20.9, 21.5, 21.9, 22.0):
+            set_soc(store, clock, soc, seconds=10)
+            record = tick(actuator, sv_ctx(clock, the_intent))
+            states.append(record["desired"]["load_following"])
+    # engages at floor + 1 (reserve release band) + 1 (hysteresis), holds down to floor + 1
+    assert states == [False, False, True, True, True, False, False, False, True]
+    assert caps(ha) == [1000.0, 2500.0, 1000.0, 2500.0]  # one write per edge, no flapping
+    lines = [r.getMessage() for r in caplog.records if "load_following=" in r.getMessage()]
+    assert [line.split()[1] for line in lines] == [
+        "load_following=on",
+        "load_following=off",
+        "load_following=on",
+    ]
+    assert "rule=storage_value storage_value=0 spread=0.29" in lines[0]
+
+
+def test_reserve_protection_still_wins_at_the_floor():
+    # at the floor the recovery charge replaces the discharge, whatever the spread
+    record, actuator, ha, _ = sv_tick(SV, RESERVE, sv_intent(value=0.0, price=0.30))
+    desired = record["desired"]
+    assert desired["mode"] == "charge" and desired["reason"] == "below_soc_floor"
+    assert "load_following" not in desired and caps(ha) == []
+    assert actuator._floor_engaged is True
+
+
+@pytest.mark.parametrize("mode", ["charge", "idle"])
+def test_the_storage_value_floor_never_discharges_in_charge_or_idle_slots(mode):
+    runs = []
+    for settings in (SETTINGS, SV):
+        clock = FakeClock(NOW)
+        store = world(clock, grid=400, ac=0, soc=90, discharge="on", limits="on", cap=800)
+        actuator, ha, _ = make(clock, store, settings=settings)
+        record = tick(actuator, sv_ctx(clock, replace(sv_intent(), mode=mode, signed_power_w=0.0)))
+        runs.append((ha.writes(), record["desired"]))
+    assert runs[0] == runs[1]
+    assert "load_following" not in runs[1][1] and "load_following_rule" not in runs[1][1]
+    assert CAP not in [e for _, e, _ in runs[1][0]]
+
+
+@pytest.mark.parametrize(
+    ("max_w", "entity_max", "power", "cap"),
+    [
+        (2500.0, 2000, 1000.0, 2000.0),  # the entity's own max
+        (1500.0, 2500, 2400.0, 2400.0),  # never below the planned cap
+        (1800.0, 2500, 30.0, 1800.0),  # a tiny plan has the 100 W floor beneath
+    ],
+)
+def test_the_storage_value_floor_keeps_every_cap_bound(max_w, entity_max, power, cap):
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=80)
+    clock.advance(1)
+    store.apply(
+        entity_state(
+            ENTS.max_discharge_power,
+            0,
+            clock.now(),
+            attributes={"min": 0, "max": entity_max, "step": 1},
+        )
+    )
+    settings = replace(
+        SETTINGS,
+        load_following=LoadFollowingSettings(enabled=True, max_w=max_w, floor="storage_value"),
+    )
+    actuator, ha, _ = make(clock, store, settings=settings)
+    tick(actuator, sv_ctx(clock, sv_intent(power=power)))
+    assert caps(ha) == [cap]
+    assert 100.0 <= cap <= 2500.0
+
+
+def test_the_default_floor_is_bit_identical_whatever_the_plan_says_about_value():
+    """``plan_soc`` ignores the value: same writes, records and metrics as before the feature."""
+    runs = []
+    for the_intent in (lf_intent(), sv_intent(value=0.0, price=0.40), sv_intent(value=None)):
+        clock = FakeClock(NOW)
+        store = world(clock, grid=1500, ac=0, soc=60)
+        records: list = []
+        actuator, ha, _ = make(clock, store, settings=LF, records=records)
+        record = tick(actuator, sv_ctx(clock, the_intent))
+        set_soc(store, clock, 49)
+        released = tick(actuator, sv_ctx(clock, the_intent))
+        runs.append((ha.writes(), record["desired"], released["desired"], lf_snapshot(actuator)))
+    assert runs[0] == runs[1] == runs[2]
+    desired = runs[0][1]
+    assert not [k for k in desired if "value" in k or "rule" in k or "spread" in k]
+    assert set(runs[0][3]) == {
+        "battery_optimizer_actuator_load_following_engaged",
+        "battery_optimizer_actuator_load_following_raise_watts",
+    }
+    assert runs[0][1]["load_following"] is True and runs[0][2]["load_following"] is False
+
+
+def test_the_default_floor_does_not_book_extra_energy():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=60)
+    actuator, _, _ = make(clock, store, settings=LF)
+    tick(actuator, sv_ctx(clock, sv_intent()))
+    set_soc(store, clock, 60)
+    store.apply(entity_state(ENTS.battery_ac_power, -1800, clock.now()))
+    tick(actuator, sv_ctx(clock, sv_intent()))
+    assert "extra_kwh" not in actuator.snapshot()["load_following"]
+
+
+def sv_snapshot(actuator):
+    from battery_optimizer.service.metrics import _actuator_families
+
+    out = {}
+    for family in _actuator_families(actuator.snapshot()):
+        if "load_following" in family.name:
+            out[family.name] = {
+                tuple(sorted(s.labels.items())): s.value
+                for s in family.samples
+                if not s.name.endswith("_created")
+            }
+    return out
+
+
+def feed_power(store, clock, ac, seconds=30):
+    clock.advance(seconds)
+    store.apply(entity_state(GRID, 1500, clock.now()))
+    store.apply(entity_state(ENTS.battery_soc, 60, clock.now()))
+    store.apply(entity_state(ENTS.battery_ac_power, ac, clock.now()))
+
+
+def test_the_energy_above_the_planned_cap_is_counted_while_engaged_and_valued():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=60)
+    actuator, _, _ = make(clock, store, settings=SV)
+    the_intent = sv_intent(value=0.10, price=0.20, power=1000.0)  # planned cap 1000 W, spread 0.09
+    tick(actuator, sv_ctx(clock, the_intent))
+    fams = sv_snapshot(actuator)
+    assert fams["battery_optimizer_actuator_load_following_extra_kwh"] == {
+        (("rule", "plan_soc"),): 0.0,
+        (("rule", "storage_value"),): 0.0,
+    }
+    # 30 s later the battery delivers 1800 W; before it was at 0 W: trapezoid (0 + 800) / 2 W
+    feed_power(store, clock, -1800)
+    tick(actuator, sv_ctx(clock, the_intent))
+    # another 30 s at 1800 W: (800 + 800) / 2 W
+    feed_power(store, clock, -1800)
+    tick(actuator, sv_ctx(clock, the_intent))
+    # (the simulated HA latency adds a fraction of a second to each interval: loose tolerance)
+    expected = (400.0 * 30 + 800.0 * 30) / 3_600_000.0
+    fams = sv_snapshot(actuator)
+    kwh = fams["battery_optimizer_actuator_load_following_extra_kwh"]
+    assert kwh[(("rule", "storage_value"),)] == pytest.approx(expected, rel=0.02)
+    assert kwh[(("rule", "plan_soc"),)] == 0.0
+    value = fams["battery_optimizer_actuator_load_following_extra_value_eur"]
+    assert value[()] == pytest.approx(
+        expected * 0.09, rel=0.02
+    )  # (price - wear - storage value) x kWh
+    assert fams["battery_optimizer_actuator_load_following_storage_value_eur_per_kwh"][()] == 0.1
+    assert fams["battery_optimizer_actuator_load_following_value_rule"][()] == 1.0
+
+
+def test_discharge_at_or_below_the_planned_cap_and_released_ticks_add_nothing():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=60)
+    actuator, _, _ = make(clock, store, settings=SV)
+    engaged = sv_intent(value=0.10, price=0.20, power=1000.0)
+    tick(actuator, sv_ctx(clock, engaged))
+    feed_power(store, clock, -900)  # under the planned cap: nothing above it
+    tick(actuator, sv_ctx(clock, engaged))
+    held = sv_intent(value=0.30, price=0.20, power=1000.0)  # keeping it pays: released
+    feed_power(store, clock, -900)  # the last engaged interval ended at 900 W: still nothing
+    tick(actuator, sv_ctx(clock, held))
+    feed_power(store, clock, -1800)  # released ticks book nothing, whatever the battery does
+    tick(actuator, sv_ctx(clock, held))
+    feed_power(store, clock, -1800)
+    tick(actuator, sv_ctx(clock, held))
+    fams = sv_snapshot(actuator)
+    assert sum(fams["battery_optimizer_actuator_load_following_extra_kwh"].values()) == 0.0
+    assert fams["battery_optimizer_actuator_load_following_extra_value_eur"][()] == 0.0
+
+
+def test_the_fallback_rule_counts_its_energy_apart_and_without_a_value():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=60)
+    actuator, _, _ = make(clock, store, settings=SV)
+    no_value = sv_intent(value=None)
+    tick(actuator, sv_ctx(clock, no_value))
+    feed_power(store, clock, -2000)
+    tick(actuator, sv_ctx(clock, no_value))
+    fams = sv_snapshot(actuator)
+    kwh = fams["battery_optimizer_actuator_load_following_extra_kwh"]
+    assert kwh[(("rule", "plan_soc"),)] == pytest.approx((500.0 * 30) / 3_600_000.0, rel=0.02)
+    assert kwh[(("rule", "storage_value"),)] == 0.0
+    assert fams["battery_optimizer_actuator_load_following_extra_value_eur"][()] == 0.0
+    assert fams["battery_optimizer_actuator_load_following_value_rule"][()] == 0.0
+    assert "battery_optimizer_actuator_load_following_storage_value_eur_per_kwh" in fams
+    assert not fams["battery_optimizer_actuator_load_following_storage_value_eur_per_kwh"]
+
+
+def test_a_missed_tick_does_not_book_more_than_two_tick_intervals():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=60)
+    actuator, _, _ = make(clock, store, settings=SV)
+    the_intent = sv_intent(value=0.10, price=0.20, power=1000.0)
+    tick(actuator, sv_ctx(clock, the_intent))
+    feed_power(store, clock, -1800, seconds=600)  # ten minutes without a tick
+    tick(actuator, sv_ctx(clock, the_intent))
+    fams = sv_snapshot(actuator)
+    kwh = fams["battery_optimizer_actuator_load_following_extra_kwh"][(("rule", "storage_value"),)]
+    assert kwh == pytest.approx(400.0 * 60 / 3_600_000.0)  # capped at 2 x tick_interval_s
+
+
+def test_a_guard_failure_drops_the_engaged_interval():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=60)
+    actuator, _, _ = make(clock, store, settings=SV)
+    the_intent = sv_intent(value=0.10, price=0.20, power=1000.0)
+    tick(actuator, sv_ctx(clock, the_intent))
+    feed_power(store, clock, -1800)
+    tick(actuator, sv_ctx(clock, the_intent, price_fresh=False))  # safe idle ends the interval
+    feed_power(store, clock, -1800)
+    tick(actuator, sv_ctx(clock, the_intent))
+    kwh = sv_snapshot(actuator)["battery_optimizer_actuator_load_following_extra_kwh"]
+    assert sum(kwh.values()) == pytest.approx(400.0 * 30 / 3_600_000.0, rel=0.02)  # first only
+
+
+def test_the_storage_value_floor_in_dry_run_records_the_rule_and_sends_nothing():
+    clock = FakeClock(NOW)
+    store = world(clock, grid=1500, ac=0, soc=60)
+    records: list = []
+    actuator, ha, _ = make(clock, store, mode="dry_run", settings=SV, records=records)
+    record = tick(actuator, sv_ctx(clock, sv_intent()))
+    assert ha.calls == [] and record["sent"] is False
+    assert record["desired"]["load_following_rule"] == "storage_value"
+    assert [w["value"] for w in record["writes"] if w["role"] == "max_discharge_power"] == [2500.0]
+    assert records == [record]
+
+
+def test_the_storage_value_floor_config_defaults_and_parsing(tmp_path):
+    committed = load_service_config(REPO / "config" / "service.yaml")
+    defaults = committed.actuation.load_following
+    assert defaults.floor == "plan_soc" and defaults.storage_value_margin_eur_per_kwh == 0.005
+    assert LoadFollowingSettings().floor == "plan_soc" and not LoadFollowingSettings().enabled
+    on = load_service_config(
+        write_service_config(
+            tmp_path,
+            **{
+                "actuation.load_following": {
+                    "enabled": True,
+                    "floor": "storage_value",
+                    "storage_value_margin_eur_per_kwh": 0.02,
+                }
+            },
+        )
+    )
+    assert on.actuation.load_following.floor == "storage_value"
+    assert on.actuation.load_following.storage_value_margin_eur_per_kwh == 0.02
+    assert on.config_hash() == committed.config_hash()  # a control setting, not a plan input
+    zero = load_service_config(
+        write_service_config(
+            tmp_path, **{"actuation.load_following.storage_value_margin_eur_per_kwh": 0}
+        )
+    )
+    assert zero.actuation.load_following.storage_value_margin_eur_per_kwh == 0.0
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"actuation.load_following.floor": "soc"}, "floor must be one of plan_soc, storage_value"),
+        ({"actuation.load_following.floor": None}, "floor must be one of"),
+        ({"actuation.load_following.storage_value_margin_eur_per_kwh": -0.001}, "must be >= 0"),
+        ({"actuation.load_following.storage_value_margin_eur_per_kwh": 0.2}, "must be <= 0.1"),
+        ({"actuation.load_following.storage_value_margin_eur_per_kwh": True}, "must be a number"),
+        (
+            {"actuation.load_following.storage_value_margin_eur_per_kwh": float("nan")},
+            "must be >= 0",
+        ),
+    ],
+)
+def test_invalid_storage_value_floor_config_is_refused(tmp_path, override, message):
+    with pytest.raises(ValueError, match=message):
+        load_service_config(write_service_config(tmp_path, **override))
+
+
+def test_the_storage_value_floor_adds_nothing_to_the_guard_allowlist(tmp_path):
+    from battery_optimizer.service.ha_guard import actuation_allowlist
+
+    plain = load_service_config(
+        write_service_config(tmp_path, **{**LIVE, "actuation.load_following.enabled": True})
+    )
+    sv = load_service_config(
+        write_service_config(
+            tmp_path,
+            **{
+                **LIVE,
+                "actuation.load_following.enabled": True,
+                "actuation.load_following.floor": "storage_value",
+            },
+        )
+    )
+    a, b = actuation_allowlist(plain), actuation_allowlist(sv)
+    assert a is not None and b is not None and a == b
+    assert b.numbers[ENTS.max_discharge_power] == (100.0, 2500.0)
+
+
+def test_the_service_plans_the_value_and_feeds_the_actuator(tmp_path, cleanup):
+    clock = FakeClock(NOW)
+    config = service_config(
+        tmp_path,
+        **{
+            **LIVE,
+            "mode": "dry_run",
+            "actuation.load_following": {"enabled": True, "floor": "storage_value"},
+        },
+    )
+    service = ShadowService(
+        config=config,
+        tariff=TARIFF,
+        data_dir=tmp_path / "data",
+        clock=clock,
+        code_version="test-sha",
+        ws_transport=FakeHAServer(),
+    )
+    cleanup(service)
+    service.ha.stats.connected = True
+    service.ha.stats.synced = True
+    service.rest = None
+    feed(service, NOW)
+    _live_world(service, clock)
+    assert asyncio.run(service.request_solve("test")) == "ok"
+    plan = service.plans[-1]
+    value = plan.storage_value
+    assert value is not None and value.status == "ok" and value.eur_per_kwh is not None
+    first = plan.intents[0]
+    assert first.storage_value_eur_per_kwh == value.eur_per_kwh
+    assert all(i.storage_value_eur_per_kwh is None for i in plan.intents[1:])
+    text = service.metrics.render().decode()
+    line = [x for x in text.splitlines() if x.startswith("battery_optimizer_planner_storage_value")]
+    assert line and float(line[-1].split()[-1]) == pytest.approx(value.eur_per_kwh)
+    context = service.actuation_context(clock.now())
+    assert context.throughput_cost_eur_per_kwh == config.planning.throughput_cost_eur_per_kwh
+    assert "storage_value" in service.plans[-1].to_record()
+
+
+# ---------------------------------------------------------------------------
 # Reserve protection (ADR-0007 amendment 2026-11-08): a bounded recovery charge
 # while the measured SOC sits at or below the tariff's floor.  Forcing idle would
 # not stop the measured residual drain (2026-11-08: idle slots, 18% to 15% in 6 h),

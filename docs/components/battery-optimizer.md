@@ -121,6 +121,19 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
   [service](../service.md#load-following-discharge)). The planner is unchanged: it still prices the forecast load, and
   the 15-minute replan from the measured SOC absorbs the difference. Delivered discharge per slot can then exceed the
   plan's, so planned-against-actual KPIs read differently from the day it is enabled.
+- **Storage value and value-based load-following (2026-11-11, code default `floor: plan_soc`).** After each regular
+  solve the planner prices one more stored kWh at the end of the plan's first slot with that slot's decision held
+  fixed (two tail solves, a finite difference of 0.25 kWh DC clipped at the SOC floor, in the objective's units, per
+  AC kWh discharged) and records it on the plan, the first intent and `planner_storage_value_eur_per_kwh`; it is an
+  output, in neither hash, and `null` if the extra solve fails. With `actuation.load_following.floor: storage_value`
+  the actuator raises the discharge cap while the slot's price less the wear cost is at least that value plus 0.005
+  EUR/kWh, instead of while the SOC is at or above the plan's end-of-slot SOC; a plan without a value falls back to
+  the plan-SOC rule, and the SOC stays clear of the tariff floor
+  ([ADR-0007 amendment](../adr/0007-live-battery-control.md#amendment-2026-11-11-value-based-load-following),
+  [service](../service.md#storage-value-floor)). In a one-week replay it closed most of the gap between the plan-SOC
+  rule and a perfect load forecast; the real value is measured live with
+  `actuator_load_following_extra_value_eur_total`. The plan, `inputs_hash`, `content_hash` and `config_hash` are
+  unchanged.
 - **Reserve protection (code default 200 W, not deployed, 2026-11-08).** With the actuator running (`dry_run` or
   `live`), while the **measured** SOC sits at or below the tariff's floor (`battery.soc_window_min`, the same value
   the planner clamps to) a tick the plan maps to idle or discharge becomes a bounded recovery charge
@@ -136,7 +149,9 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
 
 - Any [battery-model](battery-model.md) parameter changes, or the wear cost, the high-SOC dwell cost, the thermal
   charge soft cap or the discharge margin bound is changed (or `actuation.discharge_margin_w` while the bound is on),
-  or load-following discharge is enabled or its ceiling changed.
+  or load-following discharge is enabled or its ceiling changed, or its floor rule or margin
+  (`actuation.load_following.floor`, `storage_value_margin_eur_per_kwh`) changes, or the storage value's step or
+  solver settings (`planner.STORAGE_VALUE_*`) change.
 - The SOC floor the reserve protection holds changes (`tariff.yaml battery.soc_window_min`), or
   `actuation.soc_floor_recovery_w` or `soc_floor_hysteresis_pct` changes: re-read how often and how long it engages
   and the off-plan recovery kWh.
@@ -176,6 +191,7 @@ first plan that covered it, the *final plan* the plan of record at the slot open
 | Planned against actual battery energy | `increase(shadow_day_ahead_energy_kwh_total{direction}[1d])`, `shadow_planned_energy_kwh_total` (final), `shadow_actual_battery_energy_kwh_total` (actual) |
 | Power and SOC target, day-ahead against final | `slot_battery_power_watts{plan}`, `slot_soc_target_ratio{plan}` |
 | Load-following discharge: when it raised the discharge cap and by how much (only with the feature on) | `actuator_load_following_engaged`, `actuator_load_following_raise_watts`; the `actuation/` rows (`load_following`, `planned_max_discharge_w`) |
+| Value-based load-following (only with `floor: storage_value`): the plan's value of stored energy, the energy discharged above the planned cap while engaged and the value it earned over keeping it | `planner_storage_value_eur_per_kwh`; `actuator_load_following_storage_value_eur_per_kwh`, `actuator_load_following_value_rule`; `increase(actuator_load_following_extra_kwh_total{rule="storage_value"}[1d])`, `increase(actuator_load_following_extra_value_eur_total[1d])`; the plan files' `storage_value` block and the intents' `storage_value_eur_per_kwh` |
 | Reserve protection: ticks held below the SOC floor (only where the actuator runs) | `actuator_reserve_engaged`; the `actuation/` rows (`desired.reason == below_soc_floor`) and `GET /status` `reserve` |
 
 Offline: `uv run python hack/day_ahead_kpis.py --from <day> --to <day>`.
@@ -237,6 +253,17 @@ control change, recorded in the regime log: the status stays **stale** for the r
 evening discharge, end-of-evening SOC and realised-against-perfect-foresight saving are re-read on the first 7 days
 (the figures of 2026-11-04 to 11-07 are in the ADR amendment), and [battery-thermal](battery-thermal.md) re-reads the
 discharge gain.
+
+Value-based load-following (2026-11-11, code, `actuation.load_following.floor: plan_soc` by default,
+[regime log](regime-log.md)): a planner output (the marginal value of stored energy at the end of the first slot, two
+extra tail solves per plan) and an actuator floor rule on top of load-following. The plan, `inputs_hash`,
+`content_hash` and `config_hash` are untouched; with the default floor the actuator's writes, records and metrics are as
+before, so merging changes nothing observable. The owner runs the `storage_value` floor live from its release (the
+override is a homelab change, regime log) to measure the real value: re-read, over the first 7 days, the extra kWh and
+`extra_value_eur` counters, the evening discharge delivered against the plan's, the end-of-evening SOC and the export
+alerts, against the figures of the plan-SOC rule (2026-11-07 to 2026-11-11). The status stays **stale** for the
+reasons above; [battery-thermal](battery-thermal.md) re-reads the discharge gain and the replay benchmark does not
+model the rule.
 
 Reserve protection (2026-11-08, code only, **not deployed**, [regime log](regime-log.md)): an actuator layer that
 synthesizes a bounded recovery charge while the measured SOC sits at or below the tariff's floor. The plan,

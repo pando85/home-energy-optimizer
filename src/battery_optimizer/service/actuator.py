@@ -19,7 +19,12 @@ load up to that ceiling instead of the forecast one; the PD target stays the dis
 the battery still never exports.  Hysteresis: it engages at ``plan SOC + soc_hysteresis_pct`` and
 releases below the plan SOC; the latch carries over between consecutive discharge intents and
 resets on anything else (charge, idle, safe idle, kill switch).  Same entity, same bounds, same
-write ordering as the planned cap.
+write ordering as the planned cap.  With ``load_following.floor: storage_value`` (amendment
+2026-11-11) the plan's SOC is not the floor: the cap is raised while the slot's price less the wear
+cost is at least the plan's marginal value of stored energy plus a margin (the SOC stays clear of
+the tariff floor, and a plan without that value uses the plan-SOC rule), and the energy discharged
+above the planned cap while engaged is counted.  The default floor is ``plan_soc``: records,
+metrics and writes are then exactly as before.
 
 House load = grid power - battery AC power (charge positive), from fresh readings.
 
@@ -215,6 +220,9 @@ class ActuationContext:
     full_charge: FullChargeDirective | None = None
     #: The tariff's SOC floor (%); ``None`` disables reserve protection.
     soc_floor_pct: float | None = None
+    #: ``planning.throughput_cost_eur_per_kwh``: the wear cost the ``storage_value`` load-following
+    #: rule nets off the slot price (EUR per AC kWh), as the planner does.
+    throughput_cost_eur_per_kwh: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -260,6 +268,13 @@ class Desired:
     load_following: bool | None = None
     planned_max_discharge_w: float | None = None
     load_following_floor_pct: float | None = None
+    #: Only with ``load_following.floor: storage_value`` (``None`` otherwise, and not recorded):
+    #: the rule that decided (``storage_value``, or ``plan_soc`` when the plan had no value to
+    #: use), the plan's value of stored energy it used (EUR per AC kWh) and the spread it
+    #: compared, ``price - throughput cost - value``.
+    load_following_rule: str | None = None
+    load_following_storage_value_eur_per_kwh: float | None = None
+    load_following_spread_eur_per_kwh: float | None = None
 
     @property
     def load_following_raise_w(self) -> float:
@@ -276,6 +291,9 @@ class Desired:
         if self.load_following is None:
             del out["load_following"], out["planned_max_discharge_w"]
             del out["load_following_floor_pct"]
+        if self.load_following_rule is None:
+            del out["load_following_rule"], out["load_following_storage_value_eur_per_kwh"]
+            del out["load_following_spread_eur_per_kwh"]
         return out
 
 
@@ -428,6 +446,12 @@ class Actuator:
         self._signature: Any = None
         #: Load-following hysteresis latch: the last applied discharge intent had it engaged.
         self._lf_engaged = False
+        #: ``storage_value`` floor only: the previous tick while it was engaged, as ``(at, planned
+        #: cap W, discharge W, rule, spread)``, and the energy discharged above the planned cap
+        #: since start (kWh, per deciding rule) and its value against the storage value (EUR).
+        self._lf_prev: tuple[datetime, float, float | None, str, float | None] | None = None
+        self._lf_extra_kwh: dict[str, float] = {"storage_value": 0.0, "plan_soc": 0.0}
+        self._lf_extra_value_eur = 0.0
         #: Reserve-protection hysteresis latch: SOC at/below the tariff floor.
         self._floor_engaged = False
         #: The authoritative floor (%) the last tick came from the tariff; ``None`` if no floor.
@@ -695,7 +719,9 @@ class Actuator:
             return False, None, refusal
         return True, directive.weekday, None
 
-    def desired_for(self, intent: ShadowIntent, readings: Mapping[str, Any]) -> Desired:
+    def desired_for(
+        self, intent: ShadowIntent, readings: Mapping[str, Any], ctx: ActuationContext | None = None
+    ) -> Desired:
         """The mapping table of the module docstring (call only after a passing guard)."""
         s, e = self.settings, self.settings.entities
         load = readings.get("house_load_w")
@@ -721,7 +747,7 @@ class Actuator:
                 clamped=cut > 0,
                 clamped_w=round(min(cut, power), 3),
             )
-            return self._load_following(desired, intent, readings)
+            return self._load_following(desired, intent, readings, ctx)
         return self.idle_desired(readings, "intent")
 
     def _charge_desired(self, power: float, readings: Mapping[str, Any], reason: str) -> Desired:
@@ -750,25 +776,36 @@ class Actuator:
         )
 
     def _load_following(
-        self, desired: Desired, intent: ShadowIntent, readings: Mapping[str, Any]
+        self,
+        desired: Desired,
+        intent: ShadowIntent,
+        readings: Mapping[str, Any],
+        ctx: ActuationContext | None = None,
     ) -> Desired:
-        """Raise the planned discharge cap to the load-following ceiling while SOC allows.
+        """Raise the planned discharge cap to the load-following ceiling while the floor allows.
 
-        Engages when the measured SOC is at least the plan's end-of-slot SOC plus
-        ``soc_hysteresis_pct``, stays engaged while it is at or above the plan's end-of-slot SOC,
-        and releases below it (the planned cap again).  The latch carries over between consecutive
-        discharge intents (each judged against its own SOC) and resets on anything else.  The
-        raised cap is bounded like every cap write (``[min, max]_discharge_cap_w`` and the
-        entity's own max) and never falls below the planned cap.
+        ``floor: plan_soc`` (the default): engages when the measured SOC is at least the plan's
+        end-of-slot SOC plus ``soc_hysteresis_pct``, stays engaged while it is at or above the
+        plan's end-of-slot SOC, and releases below it (the planned cap again).  The latch carries
+        over between consecutive discharge intents (each judged against its own SOC) and resets on
+        anything else.  The raised cap is bounded like every cap write
+        (``[min, max]_discharge_cap_w`` and the entity's own max) and never falls below the
+        planned cap.
+
+        ``floor: storage_value`` (ADR-0007 amendment 2026-11-11): see :meth:`_storage_value_floor`.
         """
         s, lf = self.settings, self.settings.load_following
         if not lf.enabled:
             return desired
         assert desired.max_discharge_w is not None
-        floor = 100.0 * intent.soc_target_frac
         soc = readings.get("battery_soc_pct")
-        threshold = floor if self._lf_engaged else floor + lf.soc_hysteresis_pct
-        engaged = soc is not None and soc >= threshold - 1e-9
+        floor = 100.0 * intent.soc_target_frac
+        rule = value = spread = None
+        if lf.floor == "storage_value":
+            rule, value, spread, floor, engaged = self._storage_value_floor(intent, soc, ctx, floor)
+        else:
+            threshold = floor if self._lf_engaged else floor + lf.soc_hysteresis_pct
+            engaged = soc is not None and soc >= threshold - 1e-9
         cap = desired.max_discharge_w
         if engaged:
             raised, _ = self._number_target(
@@ -784,7 +821,59 @@ class Actuator:
             load_following=engaged,
             planned_max_discharge_w=desired.max_discharge_w,
             load_following_floor_pct=round(floor, 3),
+            load_following_rule=rule,
+            load_following_storage_value_eur_per_kwh=value,
+            load_following_spread_eur_per_kwh=None if spread is None else round(spread, 6),
         )
+
+    def _storage_value_floor(
+        self,
+        intent: ShadowIntent,
+        soc: float | None,
+        ctx: ActuationContext | None,
+        plan_floor_pct: float,
+    ) -> tuple[str, float | None, float | None, float, bool]:
+        """``(rule, value, spread, floor %, engaged)`` of the ``storage_value`` floor.
+
+        The plan's marginal value of stored energy (``intent.storage_value_eur_per_kwh``, EUR per
+        AC kWh discharged, wear and terminal value included) says what one kWh kept is worth; the
+        slot's price net of the wear cost, ``price - throughput cost``, says what discharging it
+        now earns.  While ``spread = price - throughput cost - value`` is at least
+        ``storage_value_margin_eur_per_kwh`` the raised cap is engaged, so the battery covers the
+        real load instead of the energy the forecast budgeted; otherwise the planned cap stands.
+        Price, wear cost and value are constants of the slot, so the rule cannot flap inside it.
+
+        The SOC is held away from the tariff's floor, because the plan's end-of-slot SOC no longer
+        is the floor: it engages at ``floor + soc_floor_hysteresis_pct + soc_hysteresis_pct`` and
+        releases below ``floor + soc_floor_hysteresis_pct``, the point at which reserve
+        protection would release again, so the two never trade places.  With no value in the plan,
+        no price, or no tariff floor the ``plan_soc`` rule decides (``rule == "plan_soc"``).
+        """
+        s, lf = self.settings, self.settings.load_following
+        value = intent.storage_value_eur_per_kwh
+        price = intent.expected_buy_price_eur_per_kwh
+        reserve = ctx.soc_floor_pct if ctx is not None else None
+        wear = ctx.throughput_cost_eur_per_kwh if ctx is not None else 0.0
+        if (
+            value is None
+            or price is None
+            or reserve is None
+            or not all(math.isfinite(x) for x in (value, price, reserve, wear))
+        ):
+            plan_threshold = (
+                plan_floor_pct if self._lf_engaged else plan_floor_pct + lf.soc_hysteresis_pct
+            )
+            engaged = soc is not None and soc >= plan_threshold - 1e-9
+            return "plan_soc", None, None, plan_floor_pct, engaged
+        spread = price - wear - value
+        release = reserve + s.soc_floor_hysteresis_pct
+        threshold = release if self._lf_engaged else release + lf.soc_hysteresis_pct
+        engaged = (
+            soc is not None
+            and soc >= threshold - 1e-9
+            and spread >= lf.storage_value_margin_eur_per_kwh - 1e-9
+        )
+        return "storage_value", value, spread, release, engaged
 
     def idle_desired(self, readings: Mapping[str, Any], reason: str) -> Desired:
         """Both directions off and the neutral PD target (the planned idle, or the settle hold)."""
@@ -1123,6 +1212,7 @@ class Actuator:
         )
         readings = self._read(now)
         self.readings = readings
+        self._accrue_extra_discharge(now, readings)
         before = (self.kill_switch, self.in_control, self.reasons, self.desired, self.alert)
         self.kill_switch = self._kill_switch_on()
         self._fc_driven = self._fc_driven or (self._fc is not None and ctx.full_charge is not None)
@@ -1163,7 +1253,9 @@ class Actuator:
                     # overridden near the floor.
                     recovery = self.reserve_desired(ctx, readings)
                     desired = (
-                        recovery if recovery is not None else self.desired_for(ctx.intent, readings)
+                        recovery
+                        if recovery is not None
+                        else self.desired_for(ctx.intent, readings, ctx)
                     )
             if fc_armed is False or (fc_armed and desired.mode != "safe_idle"):
                 # A safe idle never arms; it disarms only when the directive says so.
@@ -1205,10 +1297,58 @@ class Actuator:
         self.reasons = tuple(reasons)
         self.desired = desired
         self._lf_engaged = desired is not None and desired.load_following is True
+        self._note_engaged_tick(now, readings, desired)
         self._log_transitions(*before, readings)
         record = self._tick_record(ctx, readings, desired, writes, heartbeat)
         await self._maybe_record(now, record, bool(writes))
         return record
+
+    def _note_engaged_tick(
+        self, now: datetime, readings: Mapping[str, Any], desired: Desired | None
+    ) -> None:
+        """Remember an engaged ``storage_value``-floor tick so the next one can book its energy."""
+        self._lf_prev = None
+        if (
+            self.settings.load_following.floor != "storage_value"
+            or desired is None
+            or not desired.load_following
+            or desired.load_following_rule is None
+        ):
+            return
+        assert desired.planned_max_discharge_w is not None
+        ac = readings.get("battery_ac_power_w")
+        self._lf_prev = (
+            now,
+            desired.planned_max_discharge_w,
+            None if ac is None else max(0.0, -ac),
+            desired.load_following_rule,
+            desired.load_following_spread_eur_per_kwh,
+        )
+
+    def _accrue_extra_discharge(self, now: datetime, readings: Mapping[str, Any]) -> None:
+        """Book the energy discharged above the planned cap since the previous engaged tick.
+
+        Only with ``load_following.floor: storage_value``.  Over the interval the previous tick
+        had load-following engaged, the battery could deliver the planned cap without it, so what
+        it delivered above that cap is the raise's doing.  Trapezoid of the two measured discharge
+        powers (kWh); a gap longer than twice ``tick_interval_s`` (a missed tick) is capped.  The
+        value is ``spread`` (price - wear - storage value, EUR per kWh) times that energy, booked
+        only when the ``storage_value`` rule decided.
+        """
+        prev, self._lf_prev = self._lf_prev, None
+        if prev is None:
+            return
+        at, cap_w, before_w, rule, spread = prev
+        ac = readings.get("battery_ac_power_w")
+        dt = (now - at).total_seconds()
+        if ac is None or before_w is None or dt <= 0.0:
+            return
+        dt = min(dt, 2.0 * self.settings.tick_interval_s)
+        extra_w = (max(0.0, before_w - cap_w) + max(0.0, -ac - cap_w)) / 2.0
+        kwh = extra_w * dt / 3_600_000.0
+        self._lf_extra_kwh[rule] += kwh
+        if rule == "storage_value" and spread is not None:
+            self._lf_extra_value_eur += kwh * spread
 
     def _log_transitions(
         self,
@@ -1261,14 +1401,23 @@ class Actuator:
             def num(value: float | None) -> str:
                 return "-" if value is None else f"{value:g}"
 
+            rule = new.load_following_rule if new is not None else None
+            extra = ""
+            if new is not None and rule is not None:
+                stored = num(new.load_following_storage_value_eur_per_kwh)
+                extra = (
+                    f" rule={rule} storage_value={stored}"
+                    f" spread={num(new.load_following_spread_eur_per_kwh)}"
+                )
             log.info(
                 "actuator load_following=%s max_discharge_w=%s planned_max_discharge_w=%s "
-                "soc_pct=%s floor_pct=%s",
+                "soc_pct=%s floor_pct=%s%s",
                 "on" if engaged else "off",
                 num(new.max_discharge_w if new is not None else None),
                 num(new.planned_max_discharge_w if new is not None else None),
                 num(readings.get("battery_soc_pct")),
                 num(new.load_following_floor_pct if new is not None else None),
+                extra,
             )
         if self.alert != alert:
             if self.alert is None:
@@ -1290,6 +1439,7 @@ class Actuator:
                 self.in_control = not ok
                 self.desired = desired
                 self._lf_engaged = False
+                self._lf_prev = None
                 self._count("actuator_safe_idles", reason="shutdown")
                 log.log(
                     logging.INFO if ok else logging.ERROR,
@@ -1429,16 +1579,34 @@ class Actuator:
             ),
         }
 
-    def _load_following_snapshot(self) -> dict[str, float | None]:
+    def _load_following_snapshot(self) -> dict[str, Any]:
         """Engaged (1/0) and the cap raise (W) of the last tick; ``None`` before the first."""
         desired = self.desired
         if self.last_tick_at is None:
             return {"engaged": None, "raise_w": None}
         engaged = desired is not None and desired.load_following is True
-        return {
+        out: dict[str, Any] = {
             "engaged": 1.0 if engaged else 0.0,
             "raise_w": desired.load_following_raise_w if desired is not None else 0.0,
         }
+        if self.settings.load_following.floor == "storage_value":
+            rule = desired.load_following_rule if desired is not None else None
+            out.update(
+                {
+                    "storage_value_eur_per_kwh": (
+                        desired.load_following_storage_value_eur_per_kwh if desired else None
+                    ),
+                    "spread_eur_per_kwh": (
+                        desired.load_following_spread_eur_per_kwh if desired else None
+                    ),
+                    "value_rule": None
+                    if rule is None
+                    else (1.0 if rule == "storage_value" else 0.0),
+                    "extra_kwh": dict(self._lf_extra_kwh),
+                    "extra_value_eur": self._lf_extra_value_eur,
+                }
+            )
+        return out
 
     def _full_charge_snapshot(self) -> dict[str, Any]:
         r = self.readings

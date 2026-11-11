@@ -388,6 +388,16 @@ every evening at 40 to 49% SOC. `actuation.load_following` raises the cap to 250
 measured SOC is at or above the plan's end-of-slot SOC ([service](service.md#load-following-discharge)); off in the
 code default, enabled in the deployed config with release 0.15.0 on 2026-11-07 (owner decision, regime log).
 
+**Third fix (2026-11-11, code default off): value-based floor.** The plan-SOC floor of the rule above still limits
+each slot to the energy the plan budgeted from the load forecast (frozen at local midnight and wrong by slot, too low
+at 18:00 local and too high at 19:00), so energy was held back when the house needed it at peak prices and used
+later at lower prices. `actuation.load_following.floor: storage_value` raises the cap while the slot's price less
+the wear cost is at least the plan's marginal value of stored energy plus a margin
+([service](service.md#storage-value-floor), [ADR-0007 amendment](adr/0007-live-battery-control.md#amendment-2026-11-11-value-based-load-following));
+in a one-week replay it closed most of the gap to a perfect load forecast. The owner runs it live directly to measure
+the real value: `increase(actuator_load_following_extra_value_eur_total)` and the extra kWh counter give it, and the
+review of the criteria below reads it next to the plan-SOC rule's period. It does not touch the load-forecast bias.
+
 **Decision criteria, after about 7 days of live data** (live days only, excluding the pre-live artefact):
 
 - daily planned against actual discharge;

@@ -216,7 +216,8 @@ def _log_plan(result: PlanResult, trigger: str, elapsed: float) -> None:
     first = result.intent_for_slot(snap.first_slot)
     log.info(
         "plan generated plan_id=%s trigger=%s status=%s solve_s=%.2f slots=%d first_slot=%s "
-        "first_mode=%s first_power_w=%s soc=%s soc_measured=%s soc_clamped=%s soc_source=%s",
+        "first_mode=%s first_power_w=%s soc=%s soc_measured=%s soc_clamped=%s soc_source=%s "
+        "storage_value=%s",
         result.plan_id,
         trigger,
         result.solver.get("status"),
@@ -229,6 +230,7 @@ def _log_plan(result: PlanResult, trigger: str, elapsed: float) -> None:
         _fmt(snap.soc_measured_frac, 3),
         snap.soc_clamped,
         snap.soc_source,
+        _fmt(result.storage_value_eur_per_kwh, 4),
     )
 
 
@@ -2558,6 +2560,7 @@ class ShadowService:
             price_fresh=price_fresh,
             full_charge=self._fc_directive,
             soc_floor_pct=soc_floor_pct,
+            throughput_cost_eur_per_kwh=self.config.planning.throughput_cost_eur_per_kwh,
         )
 
     async def _send_actuation(
@@ -2669,6 +2672,7 @@ class ShadowService:
             if self.history
             else None,
             "terminal_value": plan.snapshot.terminal_value_eur_per_kwh if plan else None,
+            "storage_value": plan.storage_value_eur_per_kwh if plan else None,
             "virtual_soc": self.virtual_soc,
             "late_samples": self.observer.late_samples,
             "climate_shadow": self._climate_view(),

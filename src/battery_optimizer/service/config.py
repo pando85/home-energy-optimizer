@@ -437,11 +437,19 @@ class LoadFollowingSettings:
     actuation's ``max_discharge_cap_w``), so the battery covers the real load and not only the
     forecast one; the PD grid target (the discharge margin) still prevents export.  It engages at
     ``plan SOC + soc_hysteresis_pct`` and releases below the plan SOC.
+
+    ``floor`` chooses what holds the raised cap back.  ``plan_soc`` (the default) is the rule above.
+    ``storage_value`` (ADR-0007 amendment 2026-11-11) raises it while the slot's price less the
+    wear cost is at least the plan's marginal value of stored energy plus
+    ``storage_value_margin_eur_per_kwh``, and the measured SOC is clear of the tariff's SOC floor;
+    a plan without that value uses the ``plan_soc`` rule.
     """
 
     enabled: bool = False
     max_w: float | None = None
     soc_hysteresis_pct: float = 1.0
+    floor: str = "plan_soc"
+    storage_value_margin_eur_per_kwh: float = 0.005
 
 
 @dataclass(frozen=True)
@@ -1161,6 +1169,10 @@ _ACTUATION_KEYS = (
 )
 #: Widest ``actuation.load_following.soc_hysteresis_pct`` (SOC points).
 MAX_LOAD_FOLLOWING_HYSTERESIS_PCT = 10.0
+#: The ``actuation.load_following.floor`` rules.
+LOAD_FOLLOWING_FLOORS = ("plan_soc", "storage_value")
+#: Widest ``actuation.load_following.storage_value_margin_eur_per_kwh`` (EUR per kWh).
+MAX_STORAGE_VALUE_MARGIN_EUR_PER_KWH = 0.1
 #: Widest ``actuation.soc_floor_hysteresis_pct`` (SOC points): reserve-protection release band.
 MAX_SOC_FLOOR_HYSTERESIS_PCT = 10.0
 
@@ -1319,7 +1331,11 @@ def _parse_actuation(raw: Mapping[str, Any], mode: str) -> ActuationSettings:
 
 def _parse_load_following(raw: Mapping[str, Any], prefix: str) -> LoadFollowingSettings:
     name = f"{prefix}load_following"
-    _keys(raw, name, ("enabled", "max_w", "soc_hysteresis_pct"))
+    _keys(
+        raw,
+        name,
+        ("enabled", "max_w", "soc_hysteresis_pct", "floor", "storage_value_margin_eur_per_kwh"),
+    )
     defaults = LoadFollowingSettings()
     max_w = raw.get("max_w", defaults.max_w)
     hysteresis = _positive(
@@ -1330,10 +1346,28 @@ def _parse_load_following(raw: Mapping[str, Any], prefix: str) -> LoadFollowingS
             f"service config: {name}.soc_hysteresis_pct must be <= "
             f"{MAX_LOAD_FOLLOWING_HYSTERESIS_PCT:g}"
         )
+    floor = raw.get("floor", defaults.floor)
+    if floor not in LOAD_FOLLOWING_FLOORS:
+        raise ValueError(
+            f"service config: {name}.floor must be one of {', '.join(LOAD_FOLLOWING_FLOORS)}, "
+            f"got {floor!r}"
+        )
+    margin = _positive(
+        raw.get("storage_value_margin_eur_per_kwh", defaults.storage_value_margin_eur_per_kwh),
+        f"{name}.storage_value_margin_eur_per_kwh",
+        allow_zero=True,
+    )
+    if margin > MAX_STORAGE_VALUE_MARGIN_EUR_PER_KWH:
+        raise ValueError(
+            f"service config: {name}.storage_value_margin_eur_per_kwh must be <= "
+            f"{MAX_STORAGE_VALUE_MARGIN_EUR_PER_KWH:g}"
+        )
     return LoadFollowingSettings(
         enabled=_bool(raw.get("enabled", defaults.enabled), f"{name}.enabled"),
         max_w=None if max_w is None else _positive(max_w, f"{name}.max_w"),
         soc_hysteresis_pct=hysteresis,
+        floor=floor,
+        storage_value_margin_eur_per_kwh=margin,
     )
 
 

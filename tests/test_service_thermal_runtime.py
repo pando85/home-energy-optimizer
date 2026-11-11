@@ -189,6 +189,7 @@ def test_the_plan_record_only_gains_a_thermal_key(tmp_path, cleanup):
         feed(service, NOW)
         assert run(service.request_solve("test")) == "ok"
         records[name] = json.loads(plan_files(tmp_path / name)[0].read_text())
+        records[name]["storage_value"].pop("seconds")  # wall-clock time of the extra solves
     assert set(records["shadow"]) - set(records["off"]) == {"thermal"}
     volatile = {"thermal", "solve_seconds"}
     assert {k: v for k, v in records["shadow"].items() if k not in volatile} == {

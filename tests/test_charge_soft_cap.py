@@ -377,7 +377,7 @@ class TestPlanner:
             snapshot = self._snapshot(cost, full_charge=make_spec("evaluate", 24, 90))
             result = run_planner(snapshot)
             assert result.full_charge is not None and "full_charge_error" not in result.solver
-            assert len(seen) == 3
+            assert len(seen) == 3 + 2  # three plan solves and the two tail solves of the value
             assert all(call == expected for call in seen)
 
     def test_commit_mode_plans_the_target_with_the_cap(self):
