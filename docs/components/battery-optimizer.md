@@ -159,7 +159,8 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
 - The load forecast changes regime (comfort schedule, boost): re-check floor-hit share and clipping.
 - At go-live: measured SOC replaces simulated SOC; the charge adapter caps the grid target below the
   import limit; a second price-reactive writer appears.
-- Omnibattery is upgraded beyond 1.5.1b1 (the weekly full-charge contract the day relies on), the SOC window of
+- Omnibattery is upgraded beyond 1.6.0 (the weekly full-charge contract the day relies on; contracts re-verified
+  against 1.6.0 on 2026-11-11), the SOC window of
   `tariff.yaml` changes, or the charge-delay configuration differs from the one the plan assumes.
 - The heater facts change (hot-water target above about 51 degC, sterilization schedule, a power-limit input
   fitted), or the contracted power or the meter's trip behaviour changes, or a meter cut-off happens with the battery
