@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "battery-optimizer"
-version = "0.16.0"
+version = "0.17.0"
 description = "Battery optimisation toolkit: Prometheus/Home Assistant extraction, dataset build and battery MPC benchmarks"
 readme = "README.md"
 license = "GPL-3.0-only"
