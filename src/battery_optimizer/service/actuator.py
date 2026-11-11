@@ -119,8 +119,9 @@ from typing import TYPE_CHECKING, Any
 
 from .clock import Clock
 from .config import ActuationSettings, FullChargeSettings
-from .entity_store import EntityState, EntityStore, parse_ha_state
+from .entity_store import EntityState, EntityStore, UpdateResult, parse_ha_state
 from .ha_guard import WEEKDAY_OPTIONS, ForbiddenHACallError
+from .metrics import power_band
 
 if TYPE_CHECKING:
     from .planner import ShadowIntent
@@ -189,6 +190,8 @@ LIVENESS_OK_STATE = "None"
 _READBACK_POLL_S = 0.25
 _READBACK_REFRESH_EVERY = 8  # polls: one REST GET of the entity every 2 s while waiting
 _RETRY_PAUSE_S = 1.0
+#: A tick older than this many tick intervals no longer vouches for the mode (stalled loop).
+_TICK_FRESH_FACTOR = 3.0
 
 Sender = Callable[[str, str, str, Mapping[str, Any] | None], Awaitable[None]]
 Refresher = Callable[[tuple[str, ...]], Awaitable[None]]
@@ -429,6 +432,9 @@ class Actuator:
         self._floor_engaged = False
         #: The authoritative floor (%) the last tick came from the tariff; ``None`` if no floor.
         self._floor_pct: float | None = None
+        #: The previous fresh grid-power update: ``(observed_at, grid W, discharging)``; ``None``
+        #: after a stale or unusable one, so an outage or a gap never counts as export.
+        self._grid_prev: tuple[datetime, float, bool] | None = None
 
     # ------------------------------------------------------------------ inputs
 
@@ -1036,6 +1042,63 @@ class Actuator:
         self._count("actuator_heartbeats", result="ok")
         return "ok"
 
+    # ------------------------------------------------------------------ discharge-time grid
+
+    def _discharging_in_control(self, now: datetime) -> bool:
+        """The last tick holds control, found the guard ok and wants discharge (and is recent)."""
+        desired = self.desired
+        return (
+            self.in_control
+            and not self.reasons
+            and desired is not None
+            and desired.mode == "discharge"
+            and self.last_tick_at is not None
+            and (now - self.last_tick_at).total_seconds() <= _TICK_FRESH_FACTOR * self._tick_s()
+        )
+
+    def _tick_s(self) -> float:
+        return max(float(self.settings.tick_interval_s), 1.0)
+
+    def observe_grid_power(self, state: EntityState, result: UpdateResult) -> None:
+        """Feed ``actuator_discharge_grid_watts`` and ``actuator_export_seconds_total``.
+
+        Called by the runtime for every accepted or re-confirmed grid-power state.  A sample
+        counts only while the last tick was in control, guard ok and in discharge mode, the
+        reading is fresh (``grid_power_max_age_s``) and the battery power is known (it gives the
+        ``power_band``).  The histogram takes new values only (``ACCEPTED``); a re-confirmed
+        value (``REFRESHED``) just keeps the export integration continuous.  Export seconds are
+        the time between two consecutive fresh discharge-time samples, no further apart than
+        ``grid_power_max_age_s`` (source time), when the earlier reading was below 0 W; a stale
+        reading or a longer gap (an HA outage) resets the chain and counts nothing.
+        """
+        if self._metrics is None or result not in (UpdateResult.ACCEPTED, UpdateResult.REFRESHED):
+            return
+        now = self._clock.now()
+        max_age = self.settings.grid_power_max_age_s
+        value = state.numeric()
+        fresh = value is not None and (now - state.observed_at).total_seconds() <= max_age
+        discharging = fresh and self._discharging_in_control(now)
+        previous = self._grid_prev
+        self._grid_prev = (
+            (state.observed_at, value, True) if discharging and value is not None else None
+        )
+        if not discharging or value is None:
+            return
+        if previous is not None and previous[1] < 0.0:
+            gap = (state.observed_at - previous[0]).total_seconds()
+            if 0.0 < gap <= max_age:
+                self._metrics.actuator_export_seconds.inc(gap)
+        if result is not UpdateResult.ACCEPTED:
+            return
+        e = self.settings.entities
+        ac_raw = self._fresh(e.battery_ac_power, self.settings.battery_ac_power_max_age_s, now)
+        if ac_raw is None:
+            return  # no measured discharge power, no band
+        discharge_w = max(0.0, -float(self.settings.battery_ac_power_sign or 1) * ac_raw)
+        self._metrics.actuator_discharge_grid.labels(power_band=power_band(discharge_w)).observe(
+            value
+        )
+
     # ------------------------------------------------------------------ the tick
 
     async def tick(self, ctx: ActuationContext) -> dict[str, Any]:
@@ -1357,6 +1420,7 @@ class Actuator:
             "house_load_w": self.readings.get("house_load_w"),
             "observed_pd_target_w": self.readings.get("pd_target_w"),
             "reserve_engaged": 1.0 if self._floor_engaged else 0.0,
+            "discharge_margin_w": self.settings.discharge_margin_w,
             **({"full_charge": self._full_charge_snapshot()} if self._fc is not None else {}),
             **(
                 {"load_following": self._load_following_snapshot()}

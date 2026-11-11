@@ -616,7 +616,7 @@ class ShadowService:
             self.thermal.observe(thermal_role, state.state, self.clock.now())
         role = self.config.entities.role_of(state.entity_id)
         if self.actuator is not None:
-            self._actuation_wake_on(state, role)
+            self._actuation_wake_on(state, role, result)
         if (
             role == "price"
             and result is UpdateResult.ACCEPTED
@@ -2505,8 +2505,12 @@ class ShadowService:
         if self.actuator is not None:
             self._actuator_wake.set()
 
-    def _actuation_wake_on(self, state: EntityState, role: str | None) -> None:
+    def _actuation_wake_on(
+        self, state: EntityState, role: str | None, result: UpdateResult
+    ) -> None:
         """Wake the actuator on a kill-switch change, and on over-cap import while charging.
+
+        Every grid-power update also feeds the actuator's discharge-time grid metrics.
 
         The over-cap wake fires at most once per tick interval, so a long high load does not
         turn into a tick (and its REST refreshes) every 2 s.
@@ -2518,6 +2522,7 @@ class ShadowService:
             return
         if role != "grid_power":
             return
+        self.actuator.observe_grid_power(state, result)
         value = state.numeric()
         if value is None or value <= act.import_cap_w + act.import_guard_margin_w:
             return

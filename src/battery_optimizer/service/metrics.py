@@ -393,6 +393,22 @@ def _health_families(h: dict[str, Any]) -> Iterable[Metric]:
     )
 
 
+#: Upper bounds (W) of ``actuator_discharge_grid_watts``; ``+Inf`` is added by the client.
+DISCHARGE_GRID_BUCKETS_W = (
+    *(-500.0, -200.0, -100.0, -50.0, -25.0, 0.0, 25.0, 50.0),
+    *(75.0, 100.0, 125.0, 150.0, 200.0, 300.0, 500.0),
+)
+#: Values of its ``power_band`` label: the measured battery discharge power (W).
+POWER_BANDS = ("lt500", "500_1000", "ge1000")
+
+
+def power_band(discharge_w: float) -> str:
+    """The ``power_band`` label of a measured battery discharge power (W, >= 0)."""
+    if discharge_w < 500.0:
+        return "lt500"
+    return "500_1000" if discharge_w < 1000.0 else "ge1000"
+
+
 def _actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
     """The actuator's scrape-time gauges (prefix ``battery_optimizer_actuator_``; ADR-0007)."""
     from .actuator import ACTUATOR_MODES, GUARD_REASONS
@@ -463,6 +479,12 @@ def _actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
             "clamped_w",
             "Planned battery power the last tick could not request: the PD target or discharge "
             "cap was cut by the import cap or the entity's max (0 = none cut)",
+        ),
+        (
+            "discharge_margin_watts",
+            "discharge_margin_w",
+            "The configured actuation.discharge_margin_w: the grid import (PD target) kept "
+            "while discharging",
         ),
     ):
         yield gauge(suffix, doc, a.get(key))
@@ -981,6 +1003,23 @@ class ServiceMetrics:
             ["result"],
             registry=r,
         )
+        # Discharge-time grid distribution (docs/planning/discharge-margin-tuning.md, step 1).
+        self.actuator_discharge_grid = Histogram(
+            f"{PREFIX}_actuator_discharge_grid_watts",
+            "Measured grid power (+ import) at every grid-power update while the actuator is in "
+            "control, guard ok and discharging, by measured battery discharge power band",
+            ["power_band"],
+            buckets=DISCHARGE_GRID_BUCKETS_W,
+            registry=r,
+        )
+        self.actuator_export_seconds = Counter(
+            f"{PREFIX}_actuator_export_seconds",
+            "Seconds with grid power below 0 W while discharging, integrated only between two "
+            "fresh consecutive grid-power updates",
+            registry=r,
+        )
+        for band in POWER_BANDS:
+            self.actuator_discharge_grid.labels(power_band=band)
         # 0 until the first write confirmed by readback.
         self.actuator_last_write = Gauge(
             f"{PREFIX}_actuator_last_successful_write_timestamp_seconds",
