@@ -70,6 +70,8 @@ mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 * **Optimizer:** `oracle.solve_oracle(terminal_mode="free", terminal_value, floor_kwh, throughput_cost, high_soc_cost, charge_soft_cap, discharge_margin_kw)`
   — the call `rolling_horizon.run_rolling_horizon` makes per event — then
   `dispatch.intents_from_schedule`, which re-checks the plan against the battery kernel.
+* **Storage value:** after the solve, two more `solve_oracle` calls on the plan's tail price one more stored
+  kWh at the end of the first slot (see [Storage value of the plan](#storage-value-of-the-plan)).
 * **Battery parameters:** `benchmark.resolve_battery_assumptions` on `tariff.yaml` (`sqrt(RTE)` per
   leg, SOC window, import ceiling).
 * **Forecast:** the registered load forecaster `planning.load_forecaster` (default `trailing_mean`,
@@ -149,7 +151,34 @@ Each plan yields one intent per slot with `plan_id`, `plan_sequence`, `valid_fro
 `inputs_hash` (SHA-256 of the frozen snapshot) and `code_version`; every record carries
 `shadow: true`. A plan expires `plan_ttl_slots` (2) slots after its first slot, so intents beyond the
 expiry are recorded as forecast only (`actionable: false`) and an old plan can never be "current".
-A restart never resumes a persisted plan.
+A restart never resumes a persisted plan. The first slot's intent also carries `storage_value_eur_per_kwh`
+(the other intents `null`), see [Storage value of the plan](#storage-value-of-the-plan).
+
+### Storage value of the plan
+
+[ADR-0007 amendment 2026-11-11](adr/0007-live-battery-control.md#amendment-2026-11-11-value-based-load-following).
+After every regular solve the planner prices what one more kWh in the battery is worth at the **end of the
+plan's first slot**, with that slot's decision held fixed: the *tail* problem (slots 1 to the end, same prices,
+forecast load, limits and objective as the plan) is solved from the planned SOC `s1` and from `s1 - delta`, and
+`value_dc = (J(s1 - delta) - J(s1)) / delta` in the solver's own objective units (energy bill, throughput
+cost on charge and discharge, the terminal value, and the dwell and soft-cap costs when on; not the load
+term). `value_ac = value_dc / discharge_efficiency` is EUR per AC kWh discharged: discharging 1 AC kWh uses
+`1 / efficiency` DC kWh, exactly as the planner's SOC row says, so it is directly comparable with a slot price.
+
+- **delta:** 0.25 kWh DC, clipped so `s1 - delta` stays at the SOC floor; a step below 0.05 kWh is not used
+  (`status: at_floor`, no value). The tail solves use `mip_rel_gap` 1e-6 and a 5 s limit each (never above
+  `planning.solver_time_limit_s`). Across steps of 0.1 to 1.0 kWh and gaps of 1e-6 to 1e-4 the value moved by
+  about 1e-4 EUR/kWh on 192-slot plans, far below the 0.005 margin that uses it. The two solves take 0.01 to
+  0.2 s on 24 to 192 slots.
+- **Failure:** if either extra solve raises, hits its time limit or gives a non-finite number, the value is
+  `null` (`status` `solver_error` or `time_limit`) and the plan is exactly the plan it would have been. A one-slot
+  plan has no tail (`no_tail`); a full-charge commit plan is a different model (`full_charge_commit`). The
+  evaluate-mode plan is the regular plan and gets a value.
+- **Where it is:** the plan file's `storage_value` block (`eur_per_kwh`, `eur_per_dc_kwh`, `status`, `delta_kwh`,
+  `soc_kwh`, the two tail objectives, `seconds`, `error`), the first slot's intent (`storage_value_eur_per_kwh`,
+  hence also the `intent` of the slot record and `GET /plan`), the `plan generated` log line
+  (`storage_value=`) and the gauge `planner_storage_value_eur_per_kwh`. It is an **output**: it is in neither
+  `inputs_hash` nor the plan's `content_hash`, and it never changes a plan.
 
 ### Day-ahead and final plan
 
@@ -354,6 +383,7 @@ ID, price, timestamp or household reading is a label.
 | `load_forecast_scored_slots_total`, `load_forecast_kwh_total`, `load_actual_kwh_total`, `load_forecast_abs_error_kwh_total` | counter, at slot close, over the slots with a forecast of that plan and a measured gross load | `plan` |
 | `history_refresh_total` | counter | `result` |
 | `history_usable_slots`, `history_age_seconds`, `terminal_value_eur_per_kwh` | gauge | — |
+| `planner_storage_value_eur_per_kwh` | gauge: the latest plan's [marginal value of stored energy](#storage-value-of-the-plan) at the end of its first slot, EUR per AC kWh discharged (absent when the extra solve found none) | — |
 | `shadow_slots_total` | counter | `decision` (`intent`, `late_intent`, `no_plan`, `plan_expired`, `not_ready`, `not_observed`) |
 | `shadow_planned_energy_kwh_total`, `shadow_actual_battery_energy_kwh_total` | counter | `direction` |
 | `shadow_native_cost_eur`, `shadow_counterfactual_cost_eur` | gauge (since start; PVPC can be negative) | — |
@@ -401,6 +431,9 @@ ID, price, timestamp or household reading is a label.
 | `actuator_observed_pd_target_watts`, `actuator_observed_battery_power_watts` (+ charge), `actuator_observed_grid_power_watts`, `actuator_house_load_watts` | gauge (observed; absent when stale) | — |
 | `actuator_clamped_watts` | gauge (W of planned battery power the last tick could not request; 0 = none cut) | — |
 | `actuator_load_following_engaged`, `actuator_load_following_raise_watts` | gauge (only with `actuation.load_following.enabled`: 1 while [load-following discharge](#load-following-discharge) is engaged, and how far it raised the discharge cap above the planned cap; 0 otherwise) | — |
+| `actuator_load_following_storage_value_eur_per_kwh`, `actuator_load_following_value_rule` | gauge (only with `load_following.floor: storage_value`: the plan's value of stored energy the last tick used, absent without one; 1 when the storage-value rule decided the last discharge tick, 0 when the plan-SOC fallback did) | — |
+| `actuator_load_following_extra_kwh_total` | counter (only with `load_following.floor: storage_value`: AC kWh discharged above the planned cap while load-following was engaged) | `rule` (`storage_value`, `plan_soc`) |
+| `actuator_load_following_extra_value_eur_total` | counter (only with `load_following.floor: storage_value`: `(price - throughput cost - storage value)` times the extra kWh of the `storage_value` rule) | — |
 | `actuator_reserve_engaged` | gauge (1 while [reserve protection](#reserve-protection) holds: the measured SOC is at or below the tariff's SOC floor) | — |
 | `actuator_writes_total` | counter | `role` (`allow_charge`, `allow_discharge`, `max_discharge_power`, `power_limits`, `pd_target`, `heartbeat`, `full_charge_day`, `full_charge_enable`), `result` (`ok`, `failed`, `dry_run`) |
 | `full_charge_mode` | gauge 0/1 (one-hot; only with `full_charge.enabled`, like every `full_charge_*`) | `mode` (`shadow`, `live`) |
@@ -452,7 +485,8 @@ per actuator tick; `-v`/`--verbose` adds DEBUG. Tokens never appear in it. At IN
 
 - startup: `serving mode=live soc_source=entity version=... code_version=<sha> on 0.0.0.0:8080 (store ...)`;
 - planner: `plan generated plan_id=... trigger=scheduled status=optimal solve_s=0.41 slots=52 first_slot=...
-  first_mode=charge first_power_w=1500 soc=0.432 soc_measured=0.432 soc_clamped=False soc_source=entity`;
+  first_mode=charge first_power_w=1500 soc=0.432 soc_measured=0.432 soc_clamped=False soc_source=entity
+  storage_value=0.0871` (EUR per AC kWh, `-` when none);
   `solve skipped trigger=... reason=... detail=...` the first time a reason occurs (repeats are DEBUG);
   timeouts and discarded plans at WARNING, solver errors at ERROR; `prices published`;
 - slots: `slot opened start=... decision=intent mode=charge power_w=1500 plan_id=... not_ready=-` (or
@@ -486,7 +520,7 @@ files `0600`, directories `0700`:
 
 | Path | Content |
 |---|---|
-| `plans/date=YYYY-MM-DD/<plan_id>.json` | One immutable file per plan (atomic, no-clobber): snapshot summary and inputs, solver result, intents |
+| `plans/date=YYYY-MM-DD/<plan_id>.json` | One immutable file per plan (atomic, no-clobber): snapshot summary and inputs, solver result, intents, and the `storage_value` block (the first intent carries `storage_value_eur_per_kwh`) |
 | `slots/date=YYYY-MM-DD/slots.jsonl` | One row per closed slot: decision, measurements, price, virtual-battery step, costs (see below) |
 | `events/date=YYYY-MM-DD/events.jsonl` | Start/stop, HA sync/disconnect, solve skipped/error/timeout/discarded, history refresh, price publication |
 | `state/virtual_battery.json` | Virtual SOC (restored after a restart if younger than 6 h) |
@@ -903,11 +937,13 @@ outside shadow; -1 committed, measured 2026-11-03: `sensor.venus_ac_power` is ne
 `readback_timeout_s` (10), `shutdown_timeout_s` (15), `freshness_s.grid_power` (30),
 `freshness_s.battery_soc` (null = availability only), `freshness_s.battery_ac_power` (null; a number of
 seconds enables an age test), `load_following.enabled` (false), `load_following.max_w` (null =
-`max_discharge_cap_w`), `load_following.soc_hysteresis_pct` (1), `soc_floor_recovery_w` (200),
+`max_discharge_cap_w`), `load_following.soc_hysteresis_pct` (1), `load_following.floor` (`plan_soc`; or
+`storage_value`), `load_following.storage_value_margin_eur_per_kwh` (0.005), `soc_floor_recovery_w` (200),
 `soc_floor_hysteresis_pct` (1). Validation: `import_cap_w + import_guard_margin_w` < 5000 (the contract),
 `discharge_margin_w` > 0, `tick_interval_s` ≤ 120, `0 < min_discharge_cap_w ≤ max_discharge_cap_w ≤ 2500`,
 `load_following.max_w` within `[min_discharge_cap_w, max_discharge_cap_w]`,
-`0 < load_following.soc_hysteresis_pct ≤ 10`, `soc_floor_recovery_w` > 0 and ≤ `import_cap_w`,
+`0 < load_following.soc_hysteresis_pct ≤ 10`, `load_following.floor` one of `plan_soc`, `storage_value`,
+`0 ≤ load_following.storage_value_margin_eur_per_kwh ≤ 0.1`, `soc_floor_recovery_w` > 0 and ≤ `import_cap_w`,
 `0 < soc_floor_hysteresis_pct ≤ 10`. `mode: live` also requires
 `planning.soc_source: entity`. The section is excluded from the plan's config hash.
 
@@ -939,6 +975,51 @@ apply below the system cap.
   `load_following_floor_pct` (the plan SOC); a row is written at every engage or release, with the log line
   `actuator load_following=on|off`. Metrics: `actuator_load_following_engaged`,
   `actuator_load_following_raise_watts`. With the feature off the records, metrics and writes are as before.
+
+#### Storage-value floor
+
+[ADR-0007 amendment 2026-11-11](adr/0007-live-battery-control.md#amendment-2026-11-11-value-based-load-following):
+`actuation.load_following.floor: storage_value` (default `plan_soc`, the rule above, unchanged) replaces the
+plan-SOC test, which limits each slot to the energy the plan budgeted from a load forecast frozen at local
+midnight (too low at one peak hour, too high at the next), with a test of value. In a `discharge` slot the
+raised cap is engaged while
+
+```
+spread = slot price - planning.throughput_cost_eur_per_kwh - storage value   >=   storage_value_margin_eur_per_kwh
+```
+
+where the slot price is the intent's `expected_buy_price_eur_per_kwh` and the storage value is the plan's
+[value of stored energy](#storage-value-of-the-plan) at the end of that slot (EUR per AC kWh), so a kWh is
+discharged now when discharging it beats keeping it, wear included. Otherwise the planned cap stands, exactly as
+today. In a one-week replay of real loads and prices this closed most of the gap between the plan-SOC rule and a
+perfect load forecast; the owner runs it live to measure the real value.
+
+- **Constants of the slot:** price, wear cost and value do not change inside a slot, so the rule cannot flap; it
+  can change at a slot edge (a new intent, a new value), each change one cap write.
+- **Fallback:** an intent without a usable value (`null`: a failed extra solve, `at_floor`, a late or older
+  plan's later slot), without a price, or with no tariff floor in the context is decided by the `plan_soc` rule,
+  recorded as `load_following_rule: plan_soc`.
+- **SOC floor:** the plan's end-of-slot SOC no longer bounds the discharge, so the SOC is held clear of the tariff
+  floor (`battery.soc_window_min`, the planner's minimum SOC and the reserve protection's floor): it engages at
+  floor + `soc_floor_hysteresis_pct` + `load_following.soc_hysteresis_pct` (2 points by default) and releases below
+  floor + `soc_floor_hysteresis_pct`, the point where [reserve protection](#reserve-protection) would release, so
+  the two never trade places. Reserve protection, the guard, the settle hold, the kill switch and the cap bounds
+  (`[min_discharge_cap_w, max_discharge_cap_w]`, the entity's max, never below the planned cap) apply unchanged,
+  and charge and idle intents are never touched.
+- **Records and log (only with this floor):** the `desired` state adds `load_following_rule` (`storage_value` or
+  `plan_soc`), `load_following_storage_value_eur_per_kwh` (the value used) and `load_following_spread_eur_per_kwh`;
+  `load_following_floor_pct` is the SOC release point; the `load_following=on|off` log line appends
+  `rule=… storage_value=… spread=…`. The default floor adds nothing: records, metrics and writes are as before.
+- **Metrics (only with this floor):** `actuator_load_following_storage_value_eur_per_kwh` and
+  `actuator_load_following_value_rule` (gauges of the last tick), and the counters
+  `actuator_load_following_extra_kwh_total{rule}` and `actuator_load_following_extra_value_eur_total`.
+- **Realised value:** each tick books the AC kWh the battery discharged *above the planned cap* since the previous
+  tick, while that tick had load-following engaged (the trapezoid of the two measured discharge powers; a gap over
+  two tick intervals is capped). Without the raise the battery could not have exceeded the planned cap, so that
+  energy is the raise's doing. The value earned over keeping it is `spread x extra kWh`, booked in
+  `extra_value_eur_total` for the `storage_value` rule: over a period, `increase(…extra_value_eur_total)` is the
+  realised value added and `increase(…extra_kwh_total{rule="storage_value"})` its energy, so the mean spread is
+  their ratio. The counters restart at zero with the process.
 
 ### Reserve protection
 

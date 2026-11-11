@@ -513,3 +513,60 @@ Operations: [service](../service.md#reserve-protection). Open hardware validatio
 the backup port's DC current and the battery's internal standby loss to attribute the residual drain; this amendment
 holds the floor the owner already set, it does not decide a larger outage reserve and does not claim to prevent drain
 physically.
+
+## Amendment 2026-11-11 (value-based load-following)
+
+**Decision (owner, 2026-11-11).** Run the value-based load-following floor **live directly** in the deployed
+config, without a `dry_run` stage, to measure its real value; the previous floor stays one line away. The code
+default is unchanged: `actuation.load_following.floor` defaults to `plan_soc` (the rule of the 2026-11-07
+amendment), `live` is never a default, and with `floor: plan_soc` the records, metrics and writes are exactly as
+before.
+
+**Why.** The 2026-11-07 rule raises the discharge cap to the ceiling only while the measured SOC is at or above the
+plan's end-of-slot SOC, which limits each slot to the energy the plan budgeted from its load forecast. That forecast
+is frozen at local midnight and is wrong by slot (too low at one evening hour, too high at the next), so energy is
+held back when the house needs it at peak prices and used later at lower prices. A one-week replay (2026-11-04 to
+11-10; an LP approximation of the planner with the real loads and prices) compared three rules: the plan-SOC rule,
+covering the real load while the slot's price net of wear is at least the value of one kWh kept plus a small
+tolerance, and a perfect load forecast. The value rule closed most of the gap between the first and the third. It
+helped only in discharge-intent slots (extending it to idle slots gave nothing), and a tolerance of 0.005 EUR/kWh was
+robust (0 was slightly worse in a variant that allowed any slot, 0.02 the same).
+
+**What changes.**
+
+1. *Planner: the value of stored energy.* After each regular solve the planner prices one more stored kWh at the end
+   of the plan's first slot with that slot's decision held fixed: the tail problem (same model and objective, from
+   slot 1) is solved from the planned SOC `s1` and from `s1 - delta`, `delta` 0.25 kWh DC clipped at the SOC floor,
+   `value_dc = (J(s1 - delta) - J(s1)) / delta` in the solver's objective units (wear, terminal value, and the
+   dwell and soft-cap costs when on), and `value_ac = value_dc / discharge_efficiency`, EUR per AC kWh discharged,
+   so it compares with a slot price. It is recorded on the plan (`storage_value`), on the first slot's intent
+   (`storage_value_eur_per_kwh`, hence in the slot record) and as the gauge `planner_storage_value_eur_per_kwh`. It
+   is an **output**: in neither `inputs_hash` nor `content_hash`, and a failed, timed-out or implausible extra solve
+   gives `null` and an unchanged, valid plan ([service](../service.md#storage-value-of-the-plan)).
+2. *Actuator: the floor.* With `floor: storage_value`, in a discharge intent the raised cap is engaged while
+   `price - planning.throughput_cost_eur_per_kwh >= storage value + storage_value_margin_eur_per_kwh` (0.005), and the
+   planned cap stands otherwise, exactly as today. A plan without a value (or a price, or a tariff floor) uses the
+   `plan_soc` rule. The SOC stays clear of the tariff's floor (engage at floor + `soc_floor_hysteresis_pct` +
+   `soc_hysteresis_pct`, release below floor + `soc_floor_hysteresis_pct`), so it never trades places with the
+   reserve protection. Price, wear and value are constants of a slot: the rule cannot flap inside it.
+3. *Measurement.* The actuator books the energy discharged above the planned cap while engaged
+   (`actuator_load_following_extra_kwh_total{rule}`) and its value against keeping it
+   (`actuator_load_following_extra_value_eur_total`, `(price - wear - storage value) x kWh`), so the real value added is
+   read from the live counters ([service](../service.md#storage-value-floor)).
+
+**What does not change (hard limits).** The write path and `service/ha_guard.py` (untouched): the same entity and
+`number.set_value` on the system discharge cap inside `[min_discharge_cap_w, max_discharge_cap_w]`, the entity's own
+max, never below the planned cap; the PD target stays `discharge_margin_w` (so no intended export); a charge or idle
+intent is never turned into a discharge; the kill switch, the heartbeat, the guard, the settle hold and the reserve
+protection keep their priority; `live` is never a default and nothing is added to the allowlist.
+
+**Risks and how they are bounded.** The value is the plan's own marginal value under the forecast, so a load that
+stays below the forecast later in the evening can leave the battery lower than the plan would have; that is the
+trade the rule makes on purpose when the price now beats the value of keeping the energy, and the next replan prices
+the lower SOC (the value rises as the battery empties, so the rule releases by itself). The SOC cannot go below the
+tariff floor plus the release band. The extra solves cost 0.01 to 0.2 s per plan on 24 to 192 slots (two tail solves,
+5 s limit each). Rollback is one overrides line, `actuation.load_following.floor: plan_soc` (or `enabled: false`);
+nothing else depends on it.
+
+Operations: [service](../service.md#storage-value-floor); component record:
+[battery-optimizer](../components/battery-optimizer.md).

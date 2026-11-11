@@ -269,10 +269,20 @@ actuation:
   # one; the PD target stays discharge_margin_w, so no export.  It engages at plan SOC +
   # soc_hysteresis_pct and releases below the plan SOC.  max_w: null = max_discharge_cap_w; it
   # must lie in [min_discharge_cap_w, max_discharge_cap_w], the guard's bound on the cap.
+  #
+  # floor (ADR-0007 amendment 2026-11-11): what holds the raised cap back.  plan_soc (the default,
+  # the rule above) or storage_value: raise it while the slot's price less
+  # planning.throughput_cost_eur_per_kwh is at least the plan's marginal value of stored energy
+  # (recorded on the plan's first intent) plus storage_value_margin_eur_per_kwh, so the battery
+  # covers the real load at peak prices instead of the energy the forecast budgeted; the measured
+  # SOC must also stay above the tariff floor + soc_floor_hysteresis_pct (+ soc_hysteresis_pct to
+  # engage), and a plan without a value uses the plan_soc rule.  Applies in dry_run and live.
   load_following:
     enabled: false
     max_w: null
     soc_hysteresis_pct: 1
+    floor: plan_soc
+    storage_value_margin_eur_per_kwh: 0.005
   # Reserve protection (ADR-0007 amendment 2026-11-08).  While the MEASURED SOC sits at or below
   # the tariff's floor, a tick the plan maps to idle or discharge becomes a bounded recovery charge
   # of this many W through the existing charge row (the PD target is house load + this, inside

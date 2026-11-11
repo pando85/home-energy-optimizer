@@ -195,6 +195,7 @@ class TestGolden:
             "snapshot",
             "inputs",
             "intents",
+            "storage_value",  # an output of the plan, in neither hash
         }
         assert run_planner(snapshot).full_charge is None
 

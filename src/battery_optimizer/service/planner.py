@@ -50,7 +50,13 @@ import numpy as np
 from battery_optimizer.battery import BatterySpec, Horizon, Schedule
 from battery_optimizer.config import TariffConfig
 from battery_optimizer.dispatch import DispatchMode, DispatchPlan, intents_from_schedule
-from battery_optimizer.oracle import FullChargeModel, checkpoint_outcome, solve_oracle
+from battery_optimizer.oracle import (
+    FullChargeModel,
+    charge_soft_cap_excess_kwh,
+    checkpoint_outcome,
+    high_soc_dwell_kwh_h,
+    solve_oracle,
+)
 
 __all__ = [
     "FullChargeEvaluation",
@@ -58,12 +64,26 @@ __all__ = [
     "PlanResult",
     "PlanningSnapshot",
     "ShadowIntent",
+    "StorageValue",
     "battery_spec_from_tariff",
     "clamp_soc",
+    "compute_storage_value",
     "evaluate_full_charge",
     "run_planner",
     "shadow_intents",
 ]
+
+#: Marginal value of stored energy (see :func:`compute_storage_value`): the SOC step (DC kWh) of
+#: the finite difference.  Large enough that the MIP gap (1e-6 relative here) and the solver's
+#: tolerances stay far below the margin the actuator compares against (EUR 0.005 per kWh).
+STORAGE_VALUE_DELTA_KWH = 0.25
+#: A step clipped below this by the SOC floor is not trusted: no value (the actuator falls back).
+STORAGE_VALUE_MIN_DELTA_KWH = 0.05
+#: Wall-clock limit of each of the two tail solves (s); never above the plan's own limit.  The
+#: tail solve is a strict subproblem of the plan's, so it normally ends in a fraction of a second.
+STORAGE_VALUE_TIME_LIMIT_S = 5.0
+#: Relative MIP gap of the tail solves (the plan's own solve keeps the kernel default, 1e-4).
+STORAGE_VALUE_MIP_REL_GAP = 1e-6
 
 
 def battery_spec_from_tariff(
@@ -160,6 +180,37 @@ class FullChargeEvaluation:
         out = asdict(self)
         out["checkpoint_slot"] = _iso(self.checkpoint_slot) if self.checkpoint_slot else None
         return out
+
+
+@dataclass(frozen=True)
+class StorageValue:
+    """The marginal value of stored energy at the end of a plan's first slot.
+
+    ``eur_per_kwh`` is EUR per AC kWh discharged (``eur_per_dc_kwh / discharge_efficiency``), in
+    the planner's objective units: wear (throughput cost), the terminal value and the optional
+    dwell and soft-cap costs included, the load term and the real bill's inventory offset not.
+    ``None`` when the extra solve was not possible or not trusted: ``status`` says why
+    (``ok``; ``no_tail`` a one-slot plan; ``at_floor`` the first slot ends at the SOC floor so
+    the step would be clipped to nothing; ``time_limit`` a tail solve used its limit;
+    ``solver_error``; ``full_charge_commit`` a full-charge day's plan, whose tail model differs).
+    """
+
+    eur_per_kwh: float | None
+    eur_per_dc_kwh: float | None
+    status: str
+    delta_kwh: float | None = None  # the SOC step actually used (DC kWh), clipped at the floor
+    soc_kwh: float | None = None  # the plan's SOC at the end of the first slot (DC kWh)
+    objective_eur: float | None = None  # the tail objective at that SOC
+    objective_lower_eur: float | None = None  # ... and at delta_kwh less
+    seconds: float = 0.0
+    error: str | None = None
+
+    @classmethod
+    def unavailable(cls, status: str, *, error: str | None = None, **fields: Any) -> StorageValue:
+        return cls(None, None, status, error=error, **fields)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -305,6 +356,10 @@ class ShadowIntent:
     inputs_hash: str
     code_version: str
     shadow: bool = True
+    storage_value_eur_per_kwh: float | None = None
+    """Marginal value of stored energy at the end of this slot, EUR per AC kWh discharged
+    (:func:`compute_storage_value`); set on a plan's first slot only, ``None`` elsewhere or when
+    the extra solve failed.  An output of the plan, not an input: it is in neither hash."""
 
     @property
     def actionable(self) -> bool:
@@ -333,12 +388,19 @@ class ShadowIntent:
             "inputs_hash": self.inputs_hash,
             "code_version": self.code_version,
             "shadow": self.shadow,
+            "storage_value_eur_per_kwh": self.storage_value_eur_per_kwh,
         }
 
 
 def shadow_intents(
-    plan: DispatchPlan, *, plan_id: str, inputs_hash: str, code_version: str
+    plan: DispatchPlan,
+    *,
+    plan_id: str,
+    inputs_hash: str,
+    code_version: str,
+    storage_value: tuple[datetime, float] | None = None,
 ) -> list[ShadowIntent]:
+    """The plan's intents; *storage_value* is ``(slot start, EUR per AC kWh)`` of the one slot."""
     out: list[ShadowIntent] = []
     for intent in plan.intents:
         mode = DispatchMode(intent.mode)
@@ -362,6 +424,11 @@ def shadow_intents(
                 expires_at=plan.expires_at,
                 inputs_hash=inputs_hash,
                 code_version=code_version,
+                storage_value_eur_per_kwh=(
+                    storage_value[1]
+                    if storage_value is not None and storage_value[0] == intent.start
+                    else None
+                ),
             )
         )
     return out
@@ -377,6 +444,12 @@ class PlanResult:
     solver: dict[str, Any]
     solve_seconds: float
     full_charge: FullChargeEvaluation | None = None
+    storage_value: StorageValue | None = None
+
+    @property
+    def storage_value_eur_per_kwh(self) -> float | None:
+        """The first slot's marginal value of stored energy (EUR per AC kWh), if it was found."""
+        return None if self.storage_value is None else self.storage_value.eur_per_kwh
 
     def current_intent(self, now: datetime) -> ShadowIntent | None:
         for intent in self.intents:
@@ -408,6 +481,8 @@ class PlanResult:
         }
         if self.full_charge is not None:
             record["full_charge"] = self.full_charge.to_dict()
+        if self.storage_value is not None:
+            record["storage_value"] = self.storage_value.to_dict()
         return record
 
 
@@ -426,11 +501,14 @@ def _solve(
     spec: BatterySpec,
     horizon: Horizon,
     full_charge: FullChargeModel | None = None,
+    **solver: float,
 ) -> Schedule:
+    """The plan's solve; *solver* overrides ``time_limit_s`` and the MIP gaps (tail solves)."""
+    solver = {"time_limit_s": snapshot.solver_time_limit_s, **solver}
     return solve_oracle(
         spec,
         horizon,
-        time_limit_s=snapshot.solver_time_limit_s,
+        **solver,
         terminal_mode="free",
         terminal_value_eur_per_kwh=snapshot.terminal_value_eur_per_kwh,
         floor_kwh=spec.soc_bound_kwh("min"),
@@ -570,6 +648,115 @@ def evaluate_full_charge(snapshot: PlanningSnapshot, regular: PlanResult) -> Ful
     )
 
 
+def _objective_eur(snapshot: PlanningSnapshot, spec: BatterySpec, schedule: Schedule) -> float:
+    """The solver's objective of *schedule*, up to the constants every tail solve shares.
+
+    ``meter cost + throughput cost * (AC charge + AC discharge) - terminal value * terminal SOC``
+    plus the optional dwell and soft-cap costs: exactly what the MIP minimises (the load term is
+    inside the meter cost and is the same for every initial SOC).  The reported ``cost_eur`` is
+    not used: it adds ``terminal value * initial SOC``, which differs between the two solves.
+    """
+    h = snapshot.interval_seconds
+    throughput = float(np.sum(schedule.charge_kwh) + np.sum(schedule.discharge_kwh))
+    total = schedule.meter_cost_eur if schedule.meter_cost_eur is not None else schedule.cost_eur
+    total += snapshot.throughput_cost_eur_per_kwh * throughput
+    total -= snapshot.terminal_value_eur_per_kwh * schedule.terminal_soc_kwh
+    if snapshot.high_soc_cost_eur_per_kwh_h > 0.0:
+        total += snapshot.high_soc_cost_eur_per_kwh_h * high_soc_dwell_kwh_h(
+            schedule, spec, h, snapshot.high_soc_threshold_frac
+        )
+    if snapshot.charge_soft_cap_eur_per_kwh > 0.0:
+        total += snapshot.charge_soft_cap_eur_per_kwh * charge_soft_cap_excess_kwh(
+            schedule, h, snapshot.charge_soft_cap_kw
+        )
+    return float(total)
+
+
+def compute_storage_value(
+    snapshot: PlanningSnapshot, spec: BatterySpec, horizon: Horizon, schedule: Schedule
+) -> StorageValue:
+    """The marginal value of stored energy at the end of the plan's first slot.
+
+    The first slot's decision stays as planned.  The *tail* problem (slots 1.. of the horizon,
+    same model and objective as the plan) is solved from the planned SOC ``s1`` and from
+    ``s1 - delta``; ``value_dc = (J(s1 - delta) - J(s1)) / delta`` is what one more DC kWh in
+    the battery saves, and ``value_ac = value_dc / discharge_efficiency`` is the price of
+    discharging one more AC kWh now instead of keeping it, in the units of a slot price.
+
+    ``delta`` is :data:`STORAGE_VALUE_DELTA_KWH`, clipped so ``s1 - delta`` stays at or above
+    the SOC floor; a step smaller than :data:`STORAGE_VALUE_MIN_DELTA_KWH` gives no value.
+    Never raises: a failed, timed-out or implausible extra solve is a ``None`` value with the
+    reason in ``status``, and the plan stays valid.
+    """
+    started = time.perf_counter()
+
+    def elapsed() -> float:
+        return time.perf_counter() - started
+
+    try:
+        if horizon.n < 2:
+            return StorageValue.unavailable("no_tail", seconds=elapsed())
+        soc_kwh = float(schedule.soc_kwh[0])
+        floor_kwh = spec.soc_bound_kwh("min")
+        delta = min(STORAGE_VALUE_DELTA_KWH, soc_kwh - floor_kwh)
+        if delta < STORAGE_VALUE_MIN_DELTA_KWH:
+            return StorageValue.unavailable(
+                "at_floor", soc_kwh=soc_kwh, delta_kwh=max(delta, 0.0), seconds=elapsed()
+            )
+        tail = Horizon(
+            interval_seconds=horizon.interval_seconds,
+            prices=horizon.prices[1:],
+            load_kwh=horizon.load_kwh[1:],
+            usable=horizon.usable[1:],
+            import_limit_kw=horizon.import_limit_kw,
+        )
+        limit = min(STORAGE_VALUE_TIME_LIMIT_S, snapshot.solver_time_limit_s)
+        capacity = spec.capacity_kwh
+        objective: list[float] = []
+        for seed_kwh in (soc_kwh, soc_kwh - delta):
+            seed_frac = min(max(seed_kwh / capacity, spec.soc_min_frac), spec.soc_max_frac)
+            tail_spec = replace(spec, initial_soc_frac=seed_frac, terminal_soc_frac=None)
+            began = time.perf_counter()
+            solved = _solve(
+                snapshot,
+                tail_spec,
+                tail,
+                time_limit_s=limit,
+                mip_rel_gap=STORAGE_VALUE_MIP_REL_GAP,
+            )
+            if time.perf_counter() - began >= 0.9 * limit:
+                # The kernel reports a penalised plan as "feasible" whatever stopped the solver,
+                # so a solve that used its limit is told apart by the clock.
+                return StorageValue.unavailable(
+                    "time_limit", soc_kwh=soc_kwh, delta_kwh=delta, seconds=elapsed()
+                )
+            objective.append(_objective_eur(snapshot, tail_spec, solved))
+        value_dc = (objective[1] - objective[0]) / delta
+        value_ac = value_dc / spec.discharge_efficiency
+        if not math.isfinite(value_ac):
+            return StorageValue.unavailable(
+                "solver_error",
+                error="non-finite value",
+                soc_kwh=soc_kwh,
+                delta_kwh=delta,
+                seconds=elapsed(),
+            )
+        return StorageValue(
+            eur_per_kwh=value_ac,
+            eur_per_dc_kwh=value_dc,
+            status="ok",
+            delta_kwh=delta,
+            soc_kwh=soc_kwh,
+            objective_eur=objective[0],
+            objective_lower_eur=objective[1],
+            seconds=elapsed(),
+        )
+    except Exception as exc:  # noqa: BLE001 - the value is optional: the plan stays valid
+        return StorageValue.unavailable(
+            "solver_error", error=f"{type(exc).__name__}: {exc}"[:200], seconds=elapsed()
+        )
+
+
 def run_planner(snapshot: PlanningSnapshot) -> PlanResult:
     """Solve one snapshot.  CPU-bound and pure: runs in the bounded worker.
 
@@ -586,7 +773,16 @@ def run_planner(snapshot: PlanningSnapshot) -> PlanResult:
         try:
             spec, model, schedule, seconds = _solve_variant(snapshot, horizon, checkpoint=True)
             evaluation = _evaluation(snapshot, model, schedule, seconds)
-            return _plan_result(snapshot, spec, horizon, schedule, started, evaluation)
+            # The plan is a lifted-ceiling target solve: its tail model is not the regular one.
+            return _plan_result(
+                snapshot,
+                spec,
+                horizon,
+                schedule,
+                started,
+                evaluation,
+                StorageValue.unavailable("full_charge_commit"),
+            )
         except Exception as exc:  # noqa: BLE001 - the regular plan is the safe fallback
             result = _regular(snapshot, horizon, started)
             error = f"{type(exc).__name__}: {exc}"
@@ -605,7 +801,8 @@ def run_planner(snapshot: PlanningSnapshot) -> PlanResult:
 def _regular(snapshot: PlanningSnapshot, horizon: Horizon, started: float) -> PlanResult:
     spec = _regular_spec(snapshot, capped=snapshot.full_charge is not None)
     schedule = _solve(snapshot, spec, horizon)
-    return _plan_result(snapshot, spec, horizon, schedule, started)
+    storage_value = compute_storage_value(snapshot, spec, horizon, schedule)
+    return _plan_result(snapshot, spec, horizon, schedule, started, storage_value=storage_value)
 
 
 def _plan_result(
@@ -615,6 +812,7 @@ def _plan_result(
     schedule: Schedule,
     started: float,
     evaluation: FullChargeEvaluation | None = None,
+    storage_value: StorageValue | None = None,
 ) -> PlanResult:
     plan = intents_from_schedule(
         schedule,
@@ -631,8 +829,13 @@ def _plan_result(
         f"{snapshot.decision_time.strftime('%Y%m%dT%H%M%SZ')}-{snapshot.plan_sequence}-"
         f"{plan.content_hash[:8]}"
     )
+    value = None if storage_value is None else storage_value.eur_per_kwh
     intents = shadow_intents(
-        plan, plan_id=plan_id, inputs_hash=inputs_hash, code_version=snapshot.code_version
+        plan,
+        plan_id=plan_id,
+        inputs_hash=inputs_hash,
+        code_version=snapshot.code_version,
+        storage_value=None if value is None else (snapshot.first_slot, value),
     )
     solver = {
         "kernel": "oracle.solve_oracle(terminal_mode='free') + dispatch.intents_from_schedule",
@@ -654,4 +857,5 @@ def _plan_result(
         solver=solver,
         solve_seconds=time.perf_counter() - started,
         full_charge=evaluation,
+        storage_value=storage_value,
     )

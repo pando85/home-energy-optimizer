@@ -161,12 +161,23 @@ IDs, import cap, margins, command policy, freshness) is documented in
 measured `actuation.battery_ac_power_sign`, and `live` also without `planning.soc_source: entity`. Changing the
 mode is a homelab config change of the deployed `service.yaml`, never an environment variable.
 
-`actuation.load_following` (`enabled`, `max_w`, `soc_hysteresis_pct`; **off by default**) lets a planned discharge
+`actuation.load_following` (`enabled`, `max_w`, `soc_hysteresis_pct`, `floor`, `storage_value_margin_eur_per_kwh`; **off by default**) lets a planned discharge
 follow the real house load: in a discharge slot, while the measured SOC is at or above the plan's end-of-slot SOC,
 the system discharge cap is raised from the planned power to `max_w` (null = `max_discharge_cap_w`, and never
 outside `[min_discharge_cap_w, max_discharge_cap_w]`, the guard's existing bound). It adds no entity, service call or
 credential and is excluded from the plan's config hash; see
-[service.md](service.md#load-following-discharge).
+[service.md](service.md#load-following-discharge). `floor` (`plan_soc`, the default and the rule above, or
+`storage_value`) and `storage_value_margin_eur_per_kwh` (default **0.005**, `0` to `0.1`) choose what holds the raised
+cap back: with `storage_value` the cap is raised while the slot's price less `planning.throughput_cost_eur_per_kwh` is
+at least the plan's marginal value of stored energy plus the margin
+([service.md](service.md#storage-value-floor), [ADR-0007 amendment 2026-11-11](adr/0007-live-battery-control.md#amendment-2026-11-11-value-based-load-following)).
+Enable it with a one-key overrides entry (`enabled` and `max_w` are the existing ones):
+
+```yaml
+actuation:
+  load_following:
+    floor: storage_value
+```
 
 `actuation.soc_floor_recovery_w` (default **200 W**) and `actuation.soc_floor_hysteresis_pct` (default **1.0** SOC
 point, `0 < value <= 10`) are the reserve protection of
