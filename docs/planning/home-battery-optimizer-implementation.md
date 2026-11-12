@@ -124,9 +124,10 @@ Phases 0–4 can proceed without the physical battery. **Phase 5 requires verifi
 - [ ] **TODO-5.5** Instrument Grafana dashboard for current plan, source freshness, controller ownership/blockers, last applied HA config and requested vs observed battery/grid power, forecast quality, intended vs actual AC energy, opportunity cost and alerts. Keep all input data local; Vault-backed secrets if needed.
 - [ ] **TODO-5.6 — Omnibattery contract characterization (shadow/test bench).** Inventory current HA entity IDs and attributes. Test positive import targets during charge vs requested battery watts (include changing base load), a small positive import target during discharge, power-cap enable/disable, **cap=0 semantics**, permission switches and physical stop, controller target overrides (pricing, predictive, time slots, hourly balance, peak shaving), and command behavior across HA restarts. Confirm full control cycle sign conventions, meter cadences, sensor staleness, and the ~250 W BACKUP load's actual *AC Bypass* state versus true off-grid exclusion (default 50 W threshold + 5 min cooldown). *Progress 2026-11-03:* PD target bounded by the system caps while
 the power limits are on; PD oscillation ±150 to 200 W at ~2 s; backup switchover passed three times (Backup Mode
-1 to 6 s after AC loss, no load drop); an upstream race can latch `backup_mode` (workaround: threshold above the backup load, 500 W now;
-fixed upstream by ffunes/Omnibattery#723; 2026-11-11: fix installed with Omnibattery 1.6.0, threshold back to 50 W,
-see [known issues](../known-issues.md#omnibattery-can-stay-in-backup_mode-after-the-grid-returns)).
+1 to 6 s after AC loss, no load drop); an upstream race can latch `backup_mode` (fixed by ffunes/Omnibattery#723, installed with Omnibattery 1.6.0);
+2026-11-12: `backup_mode` while a load sits on the backup port is by design, the threshold stays above that load
+(500 W, permanent; 50 W caused an incident on 2026-11-11/12),
+see [known issues](../known-issues.md#omnibattery-backup_mode-and-the-backup-off-grid-threshold)).
 Test partial updates and out-of-band HA configuration changes. Preserve settings set by the user/installer; do not overwrite them indefinitely.
 
 
