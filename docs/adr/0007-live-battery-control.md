@@ -360,13 +360,22 @@ configuration or the [live preconditions](#live-preconditions-2026-11-03).
   keeps commanding the islanded battery) and there is no 5-minute settle after the grid returns. Removal
   procedure (back to 50 W once a release with #723 is installed, then `integration_status` must return to
   `balanced` within 5 minutes with a backup-port load in Bypass) in
-  [known issues](../known-issues.md#omnibattery-can-stay-in-backup_mode-after-the-grid-returns).
+  [known issues](../known-issues.md#omnibattery-backup_mode-and-the-backup-off-grid-threshold).
   **Note 2026-11-11:** resolved. Omnibattery v1.6.0 (installed by the owner on 2026-11-10) contains #723; the
   owner set the threshold back to 50 W on 2026-11-11 at 23:17 local. A passive check in Bypass with 237 to
   251 W on the backup port kept `integration_status` at `balanced` for 20 minutes (it latched within 5 minutes
   before the fix), so the two side effects above no longer apply. The supervised grid-loss test is pending
   (deferred by the owner); the rollback is 500 W plus reopening the upstream issue. The paragraph above is
   kept as the record of the 2026-11-03 to 2026-11-11 state.
+  **Note 2026-11-12:** superseded. The 50 W setting caused an incident (a planned charge took the inverter out of
+  Bypass, the servers' 220 to 280 W exceeded 50 W, Omnibattery entered `backup_mode` and, because it skips power
+  writes while a battery is excluded, left the last command running for about 8 h and later a discharge, with the
+  allow switches off; the guard refused the plan as designed). The maintainer confirmed that the threshold is a
+  configuration knob and `backup_mode` is by design for whole-house backup: **500 W is the permanent setting**,
+  above the backup load with margin (maximum 2500 W), and the "workaround" and "removal procedure" wording above no
+  longer applies. With it a servers-only outage does not set `backup_mode`, so the guard does not see an outage
+  through that signal; the outage behaviour is unverified and the supervised grid-loss test stays open to verify
+  it. Details in [known issues](../known-issues.md#omnibattery-backup_mode-and-the-backup-off-grid-threshold).
 - **Measured SOC.** `planning.soc_source: entity`, required by `live` (decision 1), aged the SOC against
   `freshness_s.battery_soc` (900 s); an idle battery's SOC looked stale (decision 6), so planning would stop.
   Resolved: the planner now checks the SOC as the actuator does, availability only by default

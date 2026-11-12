@@ -310,42 +310,53 @@ not depend on HA. See ADR-0007.
   of the plan before that change) the checkpoint sits at the end of the cheapest block. The config refuses a
   `shortfall_penalty_eur_per_kwh` that the dwell cost over the longest horizon could outweigh.
 
-### Omnibattery can stay in `backup_mode` after the grid returns
+### Omnibattery `backup_mode` and the backup off-grid threshold
 
-Status: **fixed upstream and installed (Omnibattery v1.6.0, 2026-11-10); workaround removed 2026-11-11; the
-supervised grid-loss test is pending (deferred by the owner).**
+Status: **closed 2026-11-12, not a bug: configuration. `number.venus_backup_offgrid_threshold` stays at 500 W
+(intended permanent setting). The supervised grid-loss test is open, reframed to verify outage behaviour with
+500 W.**
 
-After a grid return the inverter goes back to Bypass, but Omnibattery v1.5.0 could stay in its `backup_mode`
-cooldown: an upstream race (in `coordinator.py` the key-update timestamps are set mid-poll, the data is
-published later) skipped the Bypass zeroing, and a backup-port load above `number.venus_backup_offgrid_threshold`
-(default 50 W; 57 to 85 W observed) kept refreshing the 5-minute cooldown. While it lasted
-`integration_status` was `backup_mode`, so the actuator held safe idle (`integration_unhealthy`), possibly
-indefinitely. Upstream: issue ffunes/Omnibattery#660, fixed by ffunes/Omnibattery#723 (stage
-`_key_update_times` together with `data.update`).
+**Upstream clarification (2026-11-12, maintainer ffunes on ffunes/Omnibattery#660).** The threshold is a
+configuration knob, not a workaround. Omnibattery's `backup_mode` exclusion is designed for whole-house backup,
+where all of the battery's output goes through the uncontrollable backup (off-grid) port and Omnibattery must not
+try to control it through PD. For a permanent small load on the backup port (a server, a fridge) the threshold is
+meant to be set above that load; even the maximum (2500 W) is fine and only means the battery is never excluded.
+This is by design and brand-specific fixes are not wanted: our upstream PR ffunes/Omnibattery#861 (exempt inverter
+states Charge 2 and Discharge 3 like Bypass 6) was closed after that explanation. Omnibattery v1.6.0 (installed
+2026-11-10) also contains #723, the race fix for the latch after a grid return.
 
-**Resolution.**
+**Incident 2026-11-11/12 (the threshold set back to 50 W).** Times UTC.
 
-- 2026-11-10: the owner upgraded Omnibattery (HACS) from v1.5.1b1 to **v1.6.0**, which contains #723 and keeps
-  the grid-target bound of #597/#598 (identical code).
-- 2026-11-11 23:17 local: the owner set `number.venus_backup_offgrid_threshold` back from the 500 W
-  workaround (in place since the commissioning evening, 2026-11-03; 200 W had cleared the state within 5
-  minutes in the test) to **50 W**, the Omnibattery default.
-- Passive check passed: in Bypass with 237 to 251 W on the backup port (the servers),
-  `sensor.omnibattery_integration_status` stayed `balanced` and the optimizer's guard passed for 20 minutes
-  (23:17 to 23:37). Before the fix this latched within 5 minutes.
-- With 50 W the side effects of the high threshold are gone (small-load outages are detected as backup again,
-  the 5-minute post-backup cooldown is back, and the shutdown standby is skipped while the battery feeds the
-  servers), to be confirmed in practice by the grid-loss test.
+- 22:17: threshold 500 -> 50 W; a 20-minute passive check in idle Bypass passed.
+- 22:45:00: the optimizer started a planned grid charge (allow_charge on, PD target 2120 W). The inverter left
+  Bypass and the servers' 220 to 280 W on the backup port exceeded 50 W, so Omnibattery entered `backup_mode`
+  (about 22:45:30) and kept refreshing its 5-minute cooldown. The guard (`integration_unhealthy`) held safe idle
+  and turned allow_charge off at 22:45:30, but **Omnibattery skips all power writes while a battery is excluded,
+  so the last command kept running**: a fixed 533 W charge for about 8 h with allow_charge off (SOC 20% to 100%,
+  stopped by itself at full, about 06:44).
+- 06:50:00: the status had returned to `balanced`, the guard passed for one tick and the optimizer started a
+  discharge (PD 100 W); `backup_mode` again at 06:50:30 and a fixed discharge of about 110 W with allow_discharge
+  off (SOC 100% to 85%) until the owner set the threshold to 500 W at 12:04:44. The latch cleared between 12:10:07
+  and 12:10:27 (remaining cooldown) and the actuator resumed (write at 12:10:18).
+- `BatteryOptimizerActuatorSafeIdle` fired. The optimizer behaved as designed (the guard refused the plan); it
+  cannot stop the battery while Omnibattery ignores writes.
 
-**Still to do (pending, owner's choice of date):** a short supervised grid-loss test (as in the commissioning
-test) that confirms Backup Mode on loss and the return to `balanced` after the grid comes back. Until it is
-done the 50 W setting is verified only by the passive check above.
+**Decision.** 500 W is the intended permanent setting (servers about 220 to 280 W on the backup port, margin for
+growth). Do not set it back to 50 W. If the permanent backup-port load grows, the threshold must stay above it with
+margin (maximum 2500 W).
 
-**Rollback:** if `integration_status` ever latches at `backup_mode` with the grid present, put
-`number.venus_backup_offgrid_threshold` back to **500 W** (it must stay above the servers' backup-port load of
-about 225 to 255 W; the side effects of the high threshold then apply again: a backup load below it is not
-treated as off-grid demand and there is no 5-minute settle after the grid returns) and reopen the upstream
-issue. The change and its checks are in the [regime log](components/regime-log.md).
+**Consequences.**
+
+- With the threshold above the backup load, a grid outage with only the servers on the backup port does not change
+  `integration_status` to `backup_mode`, so the guard's `integration_unhealthy` check does not see the outage
+  through that signal. How the optimizer behaves during a grid outage with this setting is **not verified**.
+- **Open (owner's choice of date):** a short supervised grid-loss test that verifies the outage behaviour with
+  500 W (what the status, the guard and the battery do on loss and after the return). It no longer validates 50 W.
+- Operational note: `integration_status` at `backup_mode` with the grid present means the backup-port load
+  (`sensor.venus_ac_offgrid_power`) exceeds the threshold while the inverter is out of Bypass; while a battery is
+  excluded Omnibattery leaves the last power command running even with the allow switches off.
+
+The changes and their times are in the [regime log](components/regime-log.md).
 
 ## Planned discharge is not delivered (planner bound enabled since 0.14.0, monitoring)
 
