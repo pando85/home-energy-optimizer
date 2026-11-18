@@ -5,7 +5,7 @@
   day** because Load Forecaster P4 met its restart condition (the 14:00 schedule guess on
   `persistence` prices misses 17-24 % of the measured climate energy, see the
   [Load Forecaster plan](load-forecaster-improvement-plan.md)); it is built (`omie_outlook.py`) and
-  evaluated, **gate GC passed** (see §PO-C). PO-D and PO-E stay **deferred**, and the whole plan is **parked** with the Load Forecaster plan (see its [§6](load-forecaster-improvement-plan.md#6-decision-parked-2026-10-25)). The MPC keeps planning on published prices only. **Re-checked 2026-11-18 on the live regime (§4): GA still fails; the MPC keeps published prices only.** Refines the
+  evaluated, **gate GC passed** (see §PO-C). PO-D and PO-E stay **deferred**, and the whole plan is **parked** with the Load Forecaster plan (see its [§6](load-forecaster-improvement-plan.md#6-decision-parked-2026-10-25)). The MPC keeps planning on published prices only. **Re-checked 2026-11-18 on the live regime (§4): GA still fails; the MPC keeps published prices only.** The remaining gap is a terminal-value effect, parked with three candidate strategies until more data (§5). Refines the
   [Price Outlook roadmap](components/price-outlook.md) stages PO-1…PO-4 into executable phases.
 - **Why now:** P4 of the [Load Forecaster plan](load-forecaster-improvement-plan.md) replays
   AppDaemon's price-driven heat-pump schedule. At the 14:00 decision tomorrow's PVPC is not
@@ -271,3 +271,57 @@ local day 2026-10-08 (outage, masked).
 small: a terminal value that reflects the overnight refill price. The OMIE estimate stays useful
 where ordering matters for a decision taken before the publication (the heat-pump and DHW
 schedules), see [DHW price scheduling](dhw-price-scheduling.md) section 6.
+
+## 5. Terminal-value gap and strategies (parked 2026-11-18)
+
+**What the gap is.** The live planner's horizon ends at the last published price
+(`service/planner.py`); the energy left at the end is credited at the terminal value,
+`planning.terminal_value: trailing_mean` (mean PVPC of the last 28 days, `service/runtime.py`
+`_terminal_value`, exported as `battery_optimizer_terminal_value_eur_per_kwh`). From midnight until
+the next-day publication (about 20:35) every plan ends at local midnight, so the 18:00 to 20:35 part
+of the evening peak, and the value-based load-following floor (the plan's storage value), compare
+discharging now against that terminal value. The trailing mean averages peaks with cheap night
+hours, so it sits well above the cost of refilling the same kWh in the next night's valle hours.
+Result in the §4 replay: the published-only planner holds energy back in the peak and enters the
+night fuller (storage value at 20:00 about 8 % higher, battery at midnight about 0.2 kWh fuller on
+average, 106 days), while a planner that sees tomorrow empties more in 18 to 22 h and refills
+overnight. After 20:35 the plan sees tomorrow, which is why the gap is small.
+
+**Size** (ceiling = exact prices for tomorrow from 14:00, against the live trailing-mean terminal
+value).
+
+- 2026-08-01 to 11-16, 106 days: about 0.6 % of the battery saving, interval includes zero.
+- 2026-11-04 to 11-16, 13 days: about 5 %, no interval (too few weeks). A full-year figure between
+  those is plausible; winter is unmeasured, and the gap concentrates on few days (top 10 % of days
+  about 87 % of it) and on Mondays.
+- For context: all forecast knowledge (load and prices, oracle against the live-like replay) is about
+  7 % on the November days, prices most of it; the load part is in the
+  [load forecaster plan §7](load-forecaster-improvement-plan.md#7-re-check-after-the-battery-went-live-2026-11-18).
+
+**Candidate strategies** (share of the ceiling captured, 106 days, live terminal value; none has an
+interval above zero).
+
+| Strategy | Captured | Effort and risk |
+|---|---|---|
+| A. A lower constant terminal value (config only, `planning.terminal_value: <number>`) | A constant about 30 % below the November trailing mean: about half | No code. Goes stale with the season; too low and the plan empties the battery before midnight when tomorrow morning or a non-cheap night would pay more |
+| B. Terminal value from the refill cost (for example the cheapest published valle price over the charge efficiency plus wear, capped by the trailing mean) | not measured | Small code change, tests and a shadow period; same edge cases as A but tracks the season; plans stay on published prices |
+| C. Extend the horizon with estimated prices for tomorrow (`persistence` or `omie_period`) | about 64 % (`persistence`), about 58 % (`omie_period`); about 97 % on the 13 November days | Estimated prices would drive the 14:00 to 20:35 physical actions, against this plan's scope and the [periodic full-charge](periodic-full-charge.md) rule that an estimated price never decides a physical action; needs PO-E shadow, estimated-slot provenance in the live curve, and still a terminal value one day later |
+
+- C works for the same reason as B: it puts a cheap night inside the horizon. `persistence` does as
+  well as `omie_period`, so price accuracy is not what matters here.
+- Side effect of any change: the terminal value also marks the inventory in the shadow report
+  (`service/shadow_report.py`), so reported savings before and after are not directly comparable. The
+  interaction with the full-charge day is untested.
+
+**Re-analysis (pre-registered).** Re-run the §4 replay with A (a few constants), B and C against the
+live trailing mean when either: (1) a winter of live battery data exists (after 2027-02-28), or
+earlier on request with a simulated battery over winter 2025-26 (published prices and gross load
+exist); (2) the battery, tariff or load-following changes. Rule: adopt a strategy only if the
+weekly-block bootstrap interval of its paired daily gain lies above zero and no weekday gets worse;
+prefer B over C unless C beats B with an interval above zero; C additionally needs the owner to
+revisit the estimated-price rule.
+
+**Larger levers, for priority.** The unit-side hot-water run at about 18:15 local
+([DHW price scheduling](dhw-price-scheduling.md) section 2 and 6) is real peak consumption the
+battery cannot cover, roughly estimated to be worth more than this whole gap; and usable capacity
+(about 3.8 kWh, below the 18 to 22 h load) bounds every dispatch strategy.
