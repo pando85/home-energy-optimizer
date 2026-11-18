@@ -25,11 +25,28 @@ switches it live). Owner: this repository (`climate/mpc*.py`, `b2d.py`,
   `day_min_c_by_room` that override it; without the maps the arrays are exactly the single schedule's (tested).
   Every room with a day minimum above its floor gets the optimum start and the raised setpoint, not only the
   day room. The live shadow additionally reads the controller's per-room helpers from Prometheus
-  (`input_number.comfort_floor_<room>` and `comfort_day_minimum_<room>`, metric `hass_input_number_state`):
+  (`input_number.comfort_floor_<room>` and `comfort_day_minimum_<room>`, metric family `hass_input_number_state(_<unit>)?`, because HA's exporter appends the
+  helper's unit to the name: a degC helper is `hass_input_number_state_celsius`, an hours helper
+  `hass_input_number_state_h`, a unit-less one `hass_input_number_state`; read as
+  `{__name__=~"hass_input_number_state(_[a-zA-Z0-9_]+)?", entity="..."}`):
   the value in effect at the decision, held over its horizon, replaces the config's per room and helper; absent
   (not yet deployed), stale (older than 2 h), or outside 18 to 23 degC (floor) / 18 to 26 degC (day minimum)
   means the config's value. Each decision records the levels used and which came from helpers
   (`inputs.comfort`), so a mid-evaluation change is logged. Read-only; no new write path.
+  The shared **day window** has three more house-wide helpers, `input_number` hours:
+  `input_number.comfort_day_start_weekday_hour`, `input_number.comfort_day_start_weekend_hour` and
+  `input_number.comfort_day_end_hour` (create them with min 0, max 24, step 0.25). They are `input_number`s, not
+  time-only `input_datetime`s, because HA's Prometheus exporter publishes no state for an `input_datetime`
+  (only its last-update time, checked 2026-11-18 on the heartbeat helpers), so a time could not be read.
+  Same rules as the per-room helpers (value at the decision held over the horizon, scrape older than 2 h, absent
+  or outside 0 to 24 h means the config's `day_start_weekday_hour` / `day_start_weekend_hour` / `day_end_hour`),
+  plus the window checks of `mpc_replay.comfort_window`: a value is rounded to the 15-minute slot, and each
+  start must be before the end. A start that is not goes back to its config value; if a config start is
+  still not before a helper end, that end goes back to the config too (the helper starts are then checked against
+  the config end). The effective window drives both the comfort minimum and the optimum start (the lead table
+  counts back from the effective start). The decision records the hours used as `inputs.comfort.window_h` and the
+  fields that came from helpers under `from_helpers.window`. Helper values are inputs, never part of the
+  configuration: the MPC config hash does not change. Read-only; the actuator allowlist is not touched.
 - **Model interface** (`climate/mpc_model.py`, `MpcModel`): `dynamics()`, `drive()`, `room_outputs()`, `heat_table()`, `valves()`, `simulate()`, `capacities`. Implementations: `b2d` (default) and `c2`.
 - **In:** climate feature set, [outdoor-temperature](outdoor-temperature.md), [cop-model](cop-model.md),
   comfort rooms and offsets as in [thermal-model](thermal-model.md); setpoints from design sections 3

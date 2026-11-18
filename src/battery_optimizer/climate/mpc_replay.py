@@ -47,6 +47,7 @@ Reported (all private figures; the data dir only):
 from __future__ import annotations
 
 import logging
+import math
 import multiprocessing
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
@@ -67,11 +68,13 @@ from battery_optimizer.climate.mpc_model import Exogenous, HeatLaw, RcComfortMod
 __all__ = [
     "ACTIONS",
     "ComfortLevels",
+    "ComfortWindow",
     "Context",
     "Prior",
     "causal_outdoor",
     "comfort_levels",
     "comfort_minimum",
+    "comfort_window",
     "decision_inputs",
     "fit_cop",
     "fit_prior",
@@ -114,13 +117,69 @@ def check_configs(ccfg: ClimateConfig, cfg: MpcConfig) -> None:
         raise ValueError(f"comfort.day_room {cfg.comfort.day_room!r} is not a comfort room")
 
 
+#: The helper-settable fields of the day window: ``{field: config key}``.
+WINDOW_FIELDS = {
+    "start_weekday": "day_start_weekday_hour",
+    "start_weekend": "day_start_weekend_hour",
+    "end": "day_end_hour",
+}
+
+
+@dataclass(frozen=True)
+class ComfortWindow:
+    """The shared day window in effect, in local hours on the 15-minute grid: it starts at
+    ``start_weekday`` / ``start_weekend`` and ends at ``end``.  ``from_helper`` names the fields
+    (keys of :data:`WINDOW_FIELDS`) that come from a live helper rather than the config."""
+
+    start_weekday: float
+    start_weekend: float
+    end: float
+    from_helper: tuple[str, ...] = ()
+
+
+def comfort_window(cfg: MpcConfig, override: Mapping[str, float] | None = None) -> ComfortWindow:
+    """The day window: the config's hours, each replaced by its *override* entry (the live helper
+    hours, keys of :data:`WINDOW_FIELDS`) when that is finite, within 0 to 24 h and before the end
+    of the window it starts.  A value is rounded to the 15-minute slot.
+
+    A start that is not before the end falls back to its config value.  If a config start is still
+    not before a helper end, that end is the culprit and falls back to the config too (and the
+    helper starts are checked against the config end), so the result is always a valid window."""
+    base = {f: float(cfg.comfort[key]) for f, key in WINDOW_FIELDS.items()}
+    cand: dict[str, float] = {}
+    for f, v in (override or {}).items():
+        if f in base and math.isfinite(v) and 0.0 <= v <= 24.0:
+            cand[f] = round(float(v) * 4.0) / 4.0
+
+    def resolve(end: float, end_from_helper: bool) -> ComfortWindow | None:
+        starts, used = {}, []
+        for f in ("start_weekday", "start_weekend"):
+            if f in cand and cand[f] < end:
+                starts[f] = cand[f]
+                used.append(f)
+            else:
+                starts[f] = base[f]
+        if not all(s < end for s in starts.values()):
+            return None
+        if end_from_helper:
+            used.append("end")
+        return ComfortWindow(starts["start_weekday"], starts["start_weekend"], end, tuple(used))
+
+    window = resolve(cand["end"], True) if "end" in cand else None
+    window = window or resolve(base["end"], False)
+    assert window is not None  # the config validates start < end
+    return window
+
+
 @dataclass(frozen=True)
 class ComfortLevels:
     """The per-room comfort levels in effect: ``floor`` (always) and ``day_min`` (in the shared
-    day window), one value per room.  The effective day minimum is ``max(day_min, floor)``."""
+    day window), one value per room, and the day ``window``.  The effective day minimum is
+    ``max(day_min, floor)``."""
 
     floor: np.ndarray  # (rooms,)
     day_min: np.ndarray  # (rooms,)
+    window: ComfortWindow
 
     @property
     def day(self) -> np.ndarray:
@@ -134,7 +193,8 @@ def comfort_levels(
 ) -> ComfortLevels:
     """The levels of *rooms*: the config's (``floor_c`` / ``day_min_c`` for the day room, the
     floor for the others, each replaced by its ``*_by_room`` entry), then any *override* of the
-    form ``{"floor": {room: degC}, "day_min": {room: degC}}`` (the live helper values)."""
+    form ``{"floor": {room: degC}, "day_min": {room: degC}, "window": {field: hour}}`` (the live
+    helper values; see :func:`comfort_window` for the window)."""
     c = cfg.comfort
     if c.day_room not in rooms:
         raise ValueError(f"the day room {c.day_room!r} is not a modelled room {list(rooms)}")
@@ -145,7 +205,8 @@ def comfort_levels(
         base = c.day_min_c if r == c.day_room else c.floor_c
         floor.append(float(f))
         day_min.append(float(over.get("day_min", {}).get(r, c.day_min_c_by_room.get(r, base))))
-    return ComfortLevels(np.array(floor), np.array(day_min))
+    window = comfort_window(cfg, over.get("window"))
+    return ComfortLevels(np.array(floor), np.array(day_min), window)
 
 
 def comfort_minimum(
@@ -159,10 +220,10 @@ def comfort_minimum(
     floor everywhere, ``max(day minimum, floor)`` in the shared window (weekday or weekend start
     until the end hour).  *levels* default to the config's.  Callers pass the slot-**end** time
     (slot start + 0.25 h)."""
-    c = cfg.comfort
     lv = levels or comfort_levels(rooms, cfg)
-    start = np.where(weekend, c.day_start_weekend_hour, c.day_start_weekday_hour)
-    in_day = (hour_frac >= start) & (hour_frac < c.day_end_hour)
+    w = lv.window
+    start = np.where(weekend, w.start_weekend, w.start_weekday)
+    in_day = (hour_frac >= start) & (hour_frac < w.end)
     return np.where(in_day[None, :], lv.day[:, None], lv.floor[:, None])
 
 
@@ -250,9 +311,9 @@ def schedule_setpoints(ctx: Context, t0: int, hi: int, rooms: Sequence[str]) -> 
         _label, lo, end = d.days[j]
         hf = ctx.hour_frac[lo:end]
         weekend = bool(ctx.weekend[lo])
-        start_h = c.day_start_weekend_hour if weekend else c.day_start_weekday_hour
+        start_h = lv.window.start_weekend if weekend else lv.window.start_weekday
         ws = lo + _first_at(hf, start_h)
-        we = lo + _first_at(hf, c.day_end_hour)
+        we = lo + _first_at(hf, lv.window.end)
         night = series[max(0, lo - evening) : ws]
         band_t = float(np.nanmean(night)) if np.isfinite(night).any() else -np.inf
         band = int(np.searchsorted(np.asarray(o.band_edges_c, float), band_t, side="right"))
