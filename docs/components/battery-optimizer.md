@@ -51,6 +51,7 @@ has no writer; `dry_run` records the Omnibattery writes it would make; `live` se
 - Load is exogenous. The decoupled design keeps the objective unchanged; only price-driven heat-pump
   planning and a joint MPC are dropped ([ADR-0006](../adr/0006-decouple-heat-pump-comfort-from-battery-price-optimisation.md)).
 - The horizon ends at the last published price slot; there is no unpublished-price forecast live.
+- The terminal value (`trailing_mean`) values energy left at the end of the published horizon above its overnight refill cost, so before the next-day publication the plan holds back a little in the evening peak; measured at about 0.6 % (106 days) to 5 % (13 November days) of the saving, parked with candidate fixes in the [price outlook plan §5](../planning/price-outlook-improvement-plan.md#5-terminal-value-gap-and-strategies-parked-2026-11-18).
 - **Hard constraint (owner-confirmed 2026-10-30):** the 5.0 kW import limit is enforced by the smart
   meter, which cuts supply on overload; this has happened. A trip is a safety and availability failure,
   never an acceptable cost trade-off. The trip is **instantaneous**, not a 15-minute average (owner-confirmed
