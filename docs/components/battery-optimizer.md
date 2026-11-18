@@ -230,14 +230,14 @@ plan until the run ends. With the feature off (the committed default) nothing ch
 the recalibration when it is switched on is the `dry_run` decision study above plus the first supervised run.
 
 High-SOC dwell cost (2026-11-04, code only): `high_soc_cost` in the solver, the planner, the service config and the
-benchmark, default 0, so plans, `inputs_hash` and `config_hash` are byte-identical until a deploy sets it (planned,
-regime log). Merging changes nothing observable and nothing goes stale; enabling it changes the plans (less time
+benchmark, default 0, so plans, `inputs_hash` and `config_hash` are byte-identical until a deploy sets it (set on
+2026-11-04, regime log). Merging changes nothing observable and nothing goes stale; enabling it changes the plans (less time
 above 90%, same cost within 0.1%) and is recorded in the regime log when it happens, with the dependants checked
 then (the replay benchmark and the dry-run decision study are recomputed on plans made with it).
 
 Thermal charge soft cap (2026-11-04, code only): `charge_soft_cap` in the solver, the planner, the service config and the
-benchmark, default 0, so plans, `inputs_hash` and `config_hash` are byte-identical until a deploy sets it (planned,
-regime log). Merging changes nothing observable and nothing goes stale; enabling it changes the plans (charge spread over
+benchmark, default 0, so plans, `inputs_hash` and `config_hash` are byte-identical until a deploy sets it (set on
+2026-11-04, regime log). Merging changes nothing observable and nothing goes stale; enabling it changes the plans (charge spread over
 more slots, same cost within 0.1%) and is recorded in the regime log when it happens, with the dependants checked then.
 
 Discharge margin bound (2026-11-05): `discharge_margin_kw` in the solver, `planning.discharge_margin_bound` in

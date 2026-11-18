@@ -69,6 +69,14 @@ for `k_c` 11.7 to 8.7; PR #91's 1.8 kW at 45 degC used the discharge gain).
   case for fans rests on battery longevity more than on the energy the derate costs. A deeper analysis is scheduled for
   the 7-day review, once load-following data exists: measure how much charge temperature derating cost and whether it
   limited the evening discharge, then propose fan thresholds.
+- **Observation 2026-11-05 to 11-17 (read 2026-11-18, not a recalibration).** The daily peak of the internal temperature
+  was 45.8 to 51.4 degC. On 10 of the 13 days the peak follows a midday charge (about 1.4 to 1.8 kWh in the preceding
+  hour, 46 to 47 degC). Since load-following went live, the three hottest peaks were on the evening discharge at about
+  17:40 UTC: 51.4 (11-12), 51.2 (11-13) and 47.7 degC (11-17), each after about 1.2 kWh of discharge in the preceding
+  hour, with load-following discharges up to 2.5 kW. Omnibattery settings read 2026-11-18:
+  `switch.omnibattery_temp_charge_limit` on, limit 40 degC, band 10, floor 40%;
+  `switch.omnibattery_temp_charge_limit_discharge` **off**, so discharge is not derated and a hot evening discharge is
+  followed by a charge that starts hot.
 - Omnibattery's curve is the documented one (1 up to the limit, linear to the floor over the band, continuous, no hysteresis,
   never below the driver minimum, no temperature means no derate), checked only between 48.3 and 50.2 degC.
 
@@ -81,7 +89,10 @@ for `k_c` 11.7 to 8.7; PR #91's 1.8 kW at 45 degC used the discharge gain).
 - The sensor jumps (a firmware change that alters register 35000) or the discharge switch is enabled (the discharge gain is a prior).
 - Load-following discharge is enabled (`actuation.load_following`, [regime log](regime-log.md)): discharges up to 2.5 kW
   become normal, far above the 0.82 kW the discharge gain was seen at, so a charge after an evening discharge starts hotter.
-  Re-read `k_d` on the first week of such discharges; the gain stays a prior until then.
+  Re-read `k_d` on the first week of such discharges; the gain stays a prior until then. **Due as of 2026-11-18:** that
+  week of data now exists (load-following since 2026-11-07, value-based since 2026-11-11, with the gap of 2026-11-08 to
+  11-11 in which the deployed config had load-following off, [regime log](regime-log.md)); the re-read has not been
+  done and `k_d` stays a prior.
 
 ## Recalibrate by
 
@@ -100,6 +111,8 @@ achievable-power gap, hours per week above 35, 40 and 45 degC.
 of `k_c` are usable, `k_c` above 1.9 kW and `k_d` are not accepted (the acceptance check above fails), and the derate curve is
 confirmed only over 13.5 minutes at 48.3 to 50.2 degC. Not used by the planner.
 
+**`k_d` re-read due** (2026-11-18): the first week of load-following discharges now exists (see Invalidated when and the observation under Assumptions); the status stays `provisional` and `k_d` a prior until the fit is run.
+
 **Parked** (2026-11-04, owner): fans are to be added to the battery, so the thermal analysis is not prioritised and may be
 deprecated; the shadow keeps running as the before/after measurement. See the
 [parked note](../planning/thermal-derate-aware-planning.md#7-rollout-and-pr-breakdown).
@@ -111,6 +124,6 @@ numbers, the temperature and the AC power, keeps a one-minute buffer, refits dai
 parameters above are the prior, and `thermal_model_status{status="prior"}` says so. The page stays `provisional` until the
 acceptance criteria of "Recalibrate by" are met on the service's own data (the KPIs it exports are the end-temperature error
 by lead and the achievable-charge error in derate slots; the model-skill and curve-conformance KPIs are not computed yet).
-Switching the shadow on is not a plant or control change, so the regime log has no entry. The soft cap's thermal fit
+Switching the shadow on is not a plant or control change (the regime log records the date, 2026-11-04, for reference only). The soft cap's thermal fit
 ([study](../planning/thermal-charge-soft-cap.md#2-thermal-evidence)) is superseded by this page; its 1.5 kW knee is
 unchanged.
