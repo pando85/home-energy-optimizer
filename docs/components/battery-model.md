@@ -185,3 +185,5 @@ proposal is in Calibrated on), and the wear cost (0.01) is a planning convention
 re-checked on measured data. Recalibrate by step 1 on the live cycles; idle draw was not set before go-live.
 The full-charge ceiling and taper rows (above) are provisional and unmeasured, which extends the same reason; no
 benchmark claim changes (the benchmark ladder does not model the full-charge day).
+2026-11-18: the periodic full charge goes live ([regime log](regime-log.md)); the taper parameters and the 100% ceiling are measured on the first supervised run, so the
+status stays `stale` until then.
