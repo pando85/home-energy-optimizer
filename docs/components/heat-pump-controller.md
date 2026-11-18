@@ -11,6 +11,8 @@ The successor is specified in [comfort-controller-design](../planning/comfort-co
 (agreed 2026-10-31, not built; merged only once the house battery works): AppDaemon decides heating on/off
 from room temperatures, writes the water temperature from a software curve in direct mode and keeps DHW
 price-optimised with the tank target at most 50 degC (never the 3 kW heater).
+Open question of 2026-11-18, who owns DHW price scheduling after AppDaemon is retired, and the owner's decisions
+on the tank target: [dhw-price-scheduling](../planning/dhw-price-scheduling.md).
 
 ## Interfaces
 

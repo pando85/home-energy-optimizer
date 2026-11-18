@@ -199,6 +199,8 @@ is the better place to use a cheap hour.
 - **Legionella / sterilization** is currently off (`binary_sensor.aquarea_sterilization_state` 0) and
   **stays off for now** (owner, 2026-10-31). The final MPC (track B, section 13) should schedule it
   eventually; this is a future extension of the B-track scope.
+- Analysis of 2026-11-18 (the evening run, timing before the evening use, the rejected setback, who owns DHW
+  after AppDaemon): [dhw-price-scheduling](dhw-price-scheduling.md).
 
 ### 7.3 Price reactors become three
 
