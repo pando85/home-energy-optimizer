@@ -2,6 +2,11 @@
 
 - **Status:** Proposed
 - **Date:** 2026-10-23
+- **Note 2026-11-18:** the feasibility probe says NILM is not worth building for forecasting. The main
+  meter is stored only at 60 s, and cooking (about 1.4 kW, about 17 minutes) explains about 90 % of the
+  18 to 21 h residual variance. Washer and dishwasher are already identified through the channel 2 branch
+  and Home Connect, and these flags give no gain over persistence at 15 to 120 minutes. Details:
+  [plan section 7](../planning/load-forecaster-improvement-plan.md#7-re-check-after-the-battery-went-live-2026-11-18).
 - **Decision owners:** Homelab maintainers
 - **Extends:** [ADR-0001 — Forecast-informed economic dispatch](0001-home-battery-economic-dispatch.md)
 - **Implementation plan:** [Home battery optimizer](../planning/home-battery-optimizer-implementation.md)
