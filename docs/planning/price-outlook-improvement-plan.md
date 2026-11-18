@@ -5,7 +5,7 @@
   day** because Load Forecaster P4 met its restart condition (the 14:00 schedule guess on
   `persistence` prices misses 17-24 % of the measured climate energy, see the
   [Load Forecaster plan](load-forecaster-improvement-plan.md)); it is built (`omie_outlook.py`) and
-  evaluated, **gate GC passed** (see §PO-C). PO-D and PO-E stay **deferred**, and the whole plan is **parked** with the Load Forecaster plan (see its [§6](load-forecaster-improvement-plan.md#6-decision-parked-2026-10-25)). The MPC keeps planning on published prices only. Refines the
+  evaluated, **gate GC passed** (see §PO-C). PO-D and PO-E stay **deferred**, and the whole plan is **parked** with the Load Forecaster plan (see its [§6](load-forecaster-improvement-plan.md#6-decision-parked-2026-10-25)). The MPC keeps planning on published prices only. **Re-checked 2026-11-18 on the live regime (§4): GA still fails; the MPC keeps published prices only.** Refines the
   [Price Outlook roadmap](components/price-outlook.md) stages PO-1…PO-4 into executable phases.
 - **Why now:** P4 of the [Load Forecaster plan](load-forecaster-improvement-plan.md) replays
   AppDaemon's price-driven heat-pump schedule. At the 14:00 decision tomorrow's PVPC is not
@@ -20,7 +20,7 @@
 
 | Fact | Evidence | Implication |
 |---|---|---|
-| PVPC is **hourly**, with no variation within an hour through 2026-09. REE publishes D+1 at about 20:15, and the HA integration fetches from 20:00 into `price_next_day_HHh`. | `service/pvpc.py`; dataset `dd5a2178…` | Between about 13:00 and 20:15, tomorrow is unknown to the service. |
+| PVPC is **hourly**, with no variation within an hour through 2026-09. REE publishes D+1 at about 20:35 (measured, see §4), and the HA integration fetches from 20:00 into `price_next_day_HHh`. Measured since 2026-10-25 (24 days), the `prices_tomorrow_published` flag flips at 20:19 earliest, 20:35 median, 20:46 90th percentile, 20:50 latest; the `pvpc_snapshots` archive agrees (20:18 to 20:49, 17 days). Still hourly on 2026-11-18: in the per-minute Prometheus series 2026-04-25 to 2026-11-18 the value changes only at minute :01 of the hour, in all of 4941 changes. | `service/pvpc.py`; dataset `dd5a2178…`; §4 | Between about 13:00 and about 20:35 (measured, see §4), tomorrow is unknown to the service. |
 | The service plans **only up to the last published price** and then uses a terminal value. | `service/runtime.py` | The live 14:00 plan does not see tomorrow at all. |
 | The canonical `rolling_horizon` rung gives the 14:00 event **exact** prices for tomorrow (σ = 0). | `rolling_horizon.py`, [benchmark](../benchmark.md) | The benchmark overstates what is achievable today. That rung is an upper bound, not the service's behaviour. |
 | No archive records when a price was published. Prometheus keeps only the current-hour value, and the HA recorder keeps 8 days. | [roadmap PO-1](components/price-outlook.md) | The *published = realized* assumption is still unverified. Snapshots have to start being collected. |
@@ -180,7 +180,7 @@ They feed the MPC only once the Dispatch Optimizer has an approved scenario inte
 
 - The service fetches OMIE D+1 once a day, after publication, with retry and a staleness flag.
   Egress is unrestricted once the NetworkPolicy is removed (see §3).
-- It computes the estimate and records it with provenance. At the 20:15 publication it scores the
+- It computes the estimate and records it with provenance. At the next-day publication (about 20:35) it scores the
   estimate and exports `battery_optimizer_price_estimate_abs_error{metric}` along with rule-hour
   overlap metrics.
 - The MPC keeps using published prices only. A config flag extends the horizon with estimated slots
@@ -209,3 +209,65 @@ Decided 2026-10-25:
 
 - **GA (after PO-A):** failed. PO-C and everything after it are deferred; P4 uses published prices
   where they exist and `persistence` for tomorrow at 14:00.
+
+## 4. Re-check on the live regime (2026-11-18)
+
+Read-only experiments, private outputs in the data dir / scratch; relative figures only.
+
+**Value of tomorrow's prices at 14:00 (PO-A again).** Rolling-LP replay (the one of the
+[load forecaster plan §7](load-forecaster-improvement-plan.md#7-re-check-after-the-battery-went-live-2026-11-18):
+re-plan every 15 minutes, value-based load-following, executed against real load, LF-0 forecast
+load), modes `published_only` (horizon to the last published slot, then the terminal value), `exact`
+from 14:00, `omie_period` from 13:30, `persistence` from 14:00.
+
+- Live window 2026-11-04 to 11-16 (13 days, minute execution): `exact` is worth about 5 % of the
+  `published_only` saving; `omie_period` and `persistence` each capture about 97 % of that gap. 3
+  days better, 2 worse, 8 equal: too few weeks for an interval.
+- Longer window 2026-08-01 to 11-16 (106 days, slot execution, gross load before the battery):
+  about 1.3 % with a constant terminal value (weekly-block bootstrap interval above zero);
+  `omie_period` captures about 82 % and `persistence` about 86 %. With the service's terminal value
+  (trailing mean price) the gap is about 0.6 % and its interval **includes zero**; `exact` is
+  insensitive to the terminal value, `published_only` is not.
+- Knowing tomorrow before 14:00 adds nothing over 14:00 (`exact` vs always-known differ in a handful
+  of slots).
+- Mechanism: emptying the battery more in 18 to 22 h and refilling in cheap night hours; holding
+  charge for an expensive tomorrow morning is not the driver. The top 10 % of days give about 87 %
+  of the gap.
+- Reading: `persistence` captures as much as `omie_period`, so the gain is the planner's midnight
+  valuation of stored energy (the terminal value), not price accuracy. A terminal value that
+  reflects the overnight refill price would target the same small gap without a new data source.
+
+**Accuracy of the 14:00 estimate (PO-C again, walk-forward, reimplemented `omie_period`, not the
+repo module).** 2026-10-01 to 11-17 (46 days) against 2026-06-01 to 09-30 (121 days):
+
+| Metric | `omie_period` Oct–Nov | `omie_period` Jun–Sep | `persistence` Oct–Nov |
+|---|---|---|---|
+| MAE, % of mean price | 14 % | 9 % | 22 % |
+| Hours within ±10 % | 43 % | 58 % | 35 % |
+| Hours within ±20 % | 66 % | 84 % | 56 % |
+| Hours within ±30 % | 81 % | 90 % | 68 % |
+| Within-day Spearman, mean | 0.98 | 0.97 | 0.79 |
+| Overlap, cheapest 4 hours / dearest 4 hours | 91 % / 93 % | 88 % / 90 % | 58 % / 78 % |
+| Daily spread error, % of mean spread | 12 % (under-estimated) | 9 % | 18 % |
+
+- Ordering is excellent; the level is weaker since October. 78 % of the Oct–Nov squared error is a
+  daily level offset (39 % in Jun–Sep), worst on days with a very low OMIE mean, Sundays and
+  near-zero or negative hours (34 negative hours in Oct–Nov; the P1 intercept stays positive when
+  OMIE is about zero). The within-day slope of PVPC on OMIE is about 1.16 but the between-day slope
+  about 0.51 in Oct–Nov (1.02 and 0.80 in Jun–Sep); one slope over-reacts to the day level.
+- Diagnostic only, chosen after seeing these windows, not validated out of sample: separate slopes
+  for the day mean and the within-day deviation give about 5 % MAE and about 91 % of hours within
+  ±20 % in both windows.
+- A 15-minute variant gains nothing (PVPC is hourly). The 2026-10-25 DST day misses on level, not
+  shape.
+- OMIE D+1 was absent at 13:27 and present at 13:31 local on 2026-11-18 (one sample); the 13:30
+  as-of rule holds with little margin.
+
+**Data gaps found.** The local OMIE raw store ends 2026-10-25 and the repo reader found no OMIE
+manifest (the experiments fetched the public files separately); the PVPC sensor read 0 for the whole
+local day 2026-10-08 (outage, masked).
+
+**Decision.** GA still fails on the live regime: no estimated price goes into the MPC. Optional and
+small: a terminal value that reflects the overnight refill price. The OMIE estimate stays useful
+where ordering matters for a decision taken before the publication (the heat-pump and DHW
+schedules), see [DHW price scheduling](dhw-price-scheduling.md) section 6.

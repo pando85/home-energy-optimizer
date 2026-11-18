@@ -274,8 +274,8 @@ asks for it), by re-reading the source for the contracts of this section.
 | Input | Availability in this service | Use |
 |---|---|---|
 | PVPC today | Always, `service/pvpc.py` | Plans |
-| **PVPC tomorrow** | `price_next_day_HHh` appears from about 20:00 to 20:15 local (the passive archive `pvpc_snapshots` records the true instants). The live horizon ends at the last published slot (`max_horizon_slots` 192 caps it): about 96 slots until then, about 110 to 112 slots at 20:30 | **The decision input.** Decide when `PriceCurve.tomorrow_published` first holds, about 3.5 h before the day starts |
-| OMIE day-ahead for tomorrow | Public from about 13:00; the offline estimators `omie_outlook.py` (PO-C, gate GC passed) are **not wired into the live service** (its horizon is published-only) | Not used. It would only move the decision from about 20:15 to about 14:00, which buys nothing because arming happens on the day itself, and an estimated price must never decide a physical action |
+| **PVPC tomorrow** | `price_next_day_HHh` appears at about 20:35 local (median; 20:19 to 20:50) (the passive archive `pvpc_snapshots` records the true instants). The live horizon ends at the last published slot (`max_horizon_slots` 192 caps it): about 96 slots until then, about 110 to 112 slots at 20:30 | **The decision input.** Decide when `PriceCurve.tomorrow_published` first holds, about 3.5 h before the day starts |
+| OMIE day-ahead for tomorrow | Public from about 13:00; the offline estimators `omie_outlook.py` (PO-C, gate GC passed) are **not wired into the live service** (its horizon is published-only) | Not used. It would only move the decision from about 20:35 to about 14:00, which buys nothing because arming happens on the day itself, and an estimated price must never decide a physical action |
 | Prices two or more days ahead | Do not exist | A "cheapest day among the next three" rule is impossible; that is why the rule is a sequential threshold |
 | Load forecast | `trailing_mean`, 28 days, used by every plan | Same for both solves |
 | Weather forecast | Passive archive only; no PV, and the load forecaster does not use it | Not used |
@@ -567,7 +567,7 @@ Required by AGENTS.md in the implementation PRs (this plan PR changes none of th
   `tariff.yaml`'s window, and a different charge-delay configuration; recalibration is the existing benchmark plus the
   `dry_run` decision study. Status reason extended; no new benchmark claim is made, since the benchmark ladder does not
   model the full-charge day.
-- **`tariff-prices.md`**: one assumption: the decision depends on the next-day publication time (about 20:15), measured
+- **`tariff-prices.md`**: one assumption: the decision depends on the next-day publication time (about 20:35 median, 20:19 to 20:50), measured
   by the `pvpc_snapshots` archive.
 - **`docs/service.md`, `docs/configuration.md`, `config/service.yaml`, `README.md`/`docs/README.md` index, `known-issues.md`**
   (the missing weekly-status entity and the guard conflict): in the PR that makes each change.
