@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.19.0](https://github.com/pando85/home-energy-optimizer/tree/v0.19.0) - 2026-11-18
+
+### Added
+
+- climate: Add the live climate actuator of ADR-0009, shadow by default ([1e896ef](https://github.com/pando85/home-energy-optimizer/commit/1e896efc28415334db071662308fcd6f6cd7fd20))
+
+### Documentation
+
+- adr: Accept ADR-0009, the optimizer writes space heating (shadow first) ([2a5f3bf](https://github.com/pando85/home-energy-optimizer/commit/2a5f3bfbd29c92b4a288bc3fedc4a7992435dcac))
+- dhw: Record the DHW price-scheduling analysis and owner decisions ([b346fde](https://github.com/pando85/home-energy-optimizer/commit/b346fde60d6f01071c2ec84275387fa36a5d4446))
+- Record the Omnibattery 1.6.0 upgrade and the 50 W backup threshold ([2447dfc](https://github.com/pando85/home-energy-optimizer/commit/2447dfc8441b53a70ccff626f12dfe4ba437f623))
+- Record the backup off-grid threshold as configuration, 500 W permanent ([fdafb2e](https://github.com/pando85/home-energy-optimizer/commit/fdafb2e2b4fcd0af0fdb9a1b5f29ed1f9561d951))
+- Record the margin, config and review findings of 2026-11-04 to 11-18 ([e4f4ab0](https://github.com/pando85/home-energy-optimizer/commit/e4f4ab0c34d248e7bc91aade07114493e44c38d6))
+- Record the periodic full charge going live on 2026-11-18 ([85301e7](https://github.com/pando85/home-energy-optimizer/commit/85301e73065d09c04d004d8f5823c2a5bb97666c))
+
+### Chore
+
+- deps: Update dependency opentelemetry-api to v1.45.2 [security] ([ae43e93](https://github.com/pando85/home-energy-optimizer/commit/ae43e938da17a43ef2691c68a3bfa695ab560c73))
+
 ## [v0.18.2](https://github.com/pando85/home-energy-optimizer/tree/v0.18.2) - 2026-11-11
 
 ### Fixed
