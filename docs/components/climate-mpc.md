@@ -51,7 +51,7 @@ switches it live). Owner: this repository (`climate/mpc*.py`, `b2d.py`,
   is written):** `service/climate_actuator.py` turns the 15-minute slot of the plan this process solved into
   `Heat+DHW` / `DHW` and the integer water target (direct mode), behind the owner's select, the legacy toggle, the
   machine limits (min on 30 min, min off 20 min, water steps of 1 K and 15 min), the comfort floors (default 21
-  degC, helper `comfort_floor_<room>` when fresh) and the safe-state fallback. It changes neither the MPC nor its
+  degC, helper `comfort_floor_<room>` when available and in 18 to 23 degC, no age test: it is static owner configuration) and the safe-state fallback. It changes neither the MPC nor its
   model, config or scoring (no recalibration trigger). The first run after a restart decides its boundary again
   (record flagged `redecision`) so there is a plan of this process.
 

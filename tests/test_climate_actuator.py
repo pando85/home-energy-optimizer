@@ -412,9 +412,9 @@ def test_the_floor_releases_at_the_floor_plus_the_margin_and_minimum_on_still_ap
     assert ha.writes() == [("heishamon_heatmode", HEAT_ON)]  # minimum on holds the switch back
 
 
-def test_a_fresh_in_range_helper_sets_the_floor_otherwise_the_config():
+def test_an_available_in_range_helper_sets_the_floor_otherwise_the_config():
     clock = FakeClock(NOW)
-    # helper 22.5: 22.0 is below it; the other rooms' helpers are out of range or stale
+    # helper 22.5: 22.0 is below it; the other rooms' helpers are out of range
     store = world(
         clock,
         mode="DHW",
@@ -427,16 +427,29 @@ def test_a_fresh_in_range_helper_sets_the_floor_otherwise_the_config():
     record = tick(actuator, ctx(clock, make_plan(heating=0)))
     assert record["observed"]["floors"] == {"hall_kitchen": 22.5, "bedroom": 21.0, "office_t": 21.0}
     assert record["desired"]["rooms"] == ["hall_kitchen"]
-    # a helper older than two hours is ignored
-    store2 = world(clock, mode="DHW", water=26, rooms=22.0)
-    store2.apply(
-        entity_state(
-            ENTS.floor_helper("bedroom"), 22.5, clock.now() - timedelta(hours=2, minutes=1)
-        )
-    )
-    actuator2, _ha2, _ = make(clock, store2)
-    record = tick(actuator2, ctx(clock, make_plan(heating=0)))
-    assert record["observed"]["floors"]["bedroom"] == 21.0 and record["desired"]["source"] == "plan"
+
+
+def test_an_owner_floor_helper_is_used_however_long_ago_it_was_set():
+    # an input_number set by the owner never re-reports: 3 h or 30 days old, it still counts
+    for age in (timedelta(hours=3), timedelta(days=30)):
+        clock = FakeClock(NOW)
+        store = world(clock, mode="DHW", since=LONG_AGO, water=26, rooms=21.5)
+        store.apply(entity_state(ENTS.floor_helper("bedroom"), 22.0, clock.now() - age))
+        actuator, _ha, _ = make(clock, store)
+        record = tick(actuator, ctx(clock, make_plan(heating=0)))
+        assert record["observed"]["floors"]["bedroom"] == 22.0
+        assert record["desired"]["source"] == "floor" and record["desired"]["rooms"] == ["bedroom"]
+
+
+def test_an_unavailable_or_non_numeric_floor_helper_falls_back_to_the_config():
+    for state in ("unavailable", "unknown", "garbage", "nan"):
+        clock = FakeClock(NOW)
+        store = world(clock, mode="DHW", since=LONG_AGO, water=26, rooms=22.0)
+        store.apply(entity_state(ENTS.floor_helper("bedroom"), state, clock.now()))
+        actuator, _ha, _ = make(clock, store)
+        record = tick(actuator, ctx(clock, make_plan(heating=0)))
+        assert record["observed"]["floors"]["bedroom"] == 21.0, state
+        assert record["desired"]["source"] == "plan"
 
 
 def test_a_room_without_a_reading_is_skipped_and_none_at_all_is_a_fallback():

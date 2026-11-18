@@ -161,7 +161,7 @@ homelab config change of the deployed `service.yaml`, never an environment varia
 | `mode` | `shadow` | `shadow`, `dry_run` or `live`; anything else is refused at load (a bare YAML `off` is a boolean: refused) |
 | `tick_interval_s` | 60 | Tick of the actuator task, at most 120 |
 | `floor_margin_c` | 0.5 | A comfort-floor override releases at floor plus this, 0 to 2 K |
-| `floor_c` | 21.0 | Floor of a room without a usable `comfort_floor_<room>` helper (helper: fresh within 2 h, 18 to 23 degC), 18 to 23 |
+| `floor_c` | 21.0 | Floor of a room without a usable `comfort_floor_<room>` helper (helper: available, 18 to 23 degC, no age test), 18 to 23 |
 | `safe_water_target_c` | 26 | Water target of the safe state, an integer 20 to 35, written only in direct mode |
 | `readback_timeout_s`, `max_attempts` | 30, 3 | A write stays unconfirmed this long before a retry; tries per write (at most 5), at least 10 s apart |
 | `shutdown_timeout_s` | 20 | How long the safe state at SIGTERM is attempted |
