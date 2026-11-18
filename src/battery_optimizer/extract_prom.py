@@ -616,8 +616,16 @@ def refuse_mixed_lineage(specs: Iterable[EntitySpec]) -> None:
 
 
 def build_range_query(spec: EntitySpec, window_seconds: int) -> str:
-    """Range-vector selector for one entity: ``metric{entity="id"}[<window>s]``."""
-    return f'{spec.metric}{{entity="{escape_promql_string(spec.entity_id)}"}}[{window_seconds}s]'
+    """Range-vector selector for one entity: ``metric{entity="id"}[<window>s]``.
+
+    A *metric* that is not a plain metric name is a regular expression over the name (PromQL
+    anchors it) and gives ``{__name__=~"pattern", entity="id"}[<window>s]``, for a family such as
+    HA's ``input_number`` metrics, whose exporter appends the unit to the name."""
+    entity = escape_promql_string(spec.entity_id)
+    if _METRIC_RE.match(spec.metric):
+        return f'{spec.metric}{{entity="{entity}"}}[{window_seconds}s]'
+    name = escape_promql_string(spec.metric)
+    return f'{{__name__=~"{name}", entity="{entity}"}}[{window_seconds}s]'
 
 
 def range_window_seconds(c_start: datetime, c_end: datetime) -> int:

@@ -25,7 +25,10 @@ switches it live). Owner: this repository (`climate/mpc*.py`, `b2d.py`,
   `day_min_c_by_room` that override it; without the maps the arrays are exactly the single schedule's (tested).
   Every room with a day minimum above its floor gets the optimum start and the raised setpoint, not only the
   day room. The live shadow additionally reads the controller's per-room helpers from Prometheus
-  (`input_number.comfort_floor_<room>` and `comfort_day_minimum_<room>`, metric `hass_input_number_state`):
+  (`input_number.comfort_floor_<room>` and `comfort_day_minimum_<room>`, metric family `hass_input_number_state(_<unit>)?`, because HA's exporter appends the
+  helper's unit to the name: a degC helper is `hass_input_number_state_celsius`, an hours helper
+  `hass_input_number_state_h`, a unit-less one `hass_input_number_state`; read as
+  `{__name__=~"hass_input_number_state(_[a-zA-Z0-9_]+)?", entity="..."}`):
   the value in effect at the decision, held over its horizon, replaces the config's per room and helper; absent
   (not yet deployed), stale (older than 2 h), or outside 18 to 23 degC (floor) / 18 to 26 degC (day minimum)
   means the config's value. Each decision records the levels used and which came from helpers

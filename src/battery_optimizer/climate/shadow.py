@@ -151,7 +151,9 @@ COMFORT_HELPERS = {
     "floor": ("input_number.comfort_floor_", (18.0, 23.0)),
     "day_min": ("input_number.comfort_day_minimum_", (18.0, 26.0)),
 }
-COMFORT_METRIC = "hass_input_number_state"
+#: HA's exporter appends the unit to an ``input_number`` metric (``hass_input_number_state_celsius``
+#: for degC, ``..._h`` for hours, bare when the helper has no unit), so the read is a name pattern.
+COMFORT_METRIC = "hass_input_number_state(_[a-zA-Z0-9_]+)?"
 #: The house-wide day-window helpers, ``input_number`` hours (HA's Prometheus exporter publishes no
 #: state for an ``input_datetime``, only its last-update time: a time-only helper cannot be read).
 #: ``field -> entity``; accepted range 0 to 24 h, rounded to the 15-minute slot and checked as a

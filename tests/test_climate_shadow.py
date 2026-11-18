@@ -22,6 +22,7 @@ from climate_shadow_fakes import (
     utc,
 )
 
+from battery_optimizer import extract_prom
 from battery_optimizer.build import RawPoint
 from battery_optimizer.climate import b2d, mpc_config, mpc_replay, shadow, thermal
 from battery_optimizer.climate.mpc_model import Exogenous
@@ -312,11 +313,11 @@ def test_the_helpers_are_read_from_prometheus_by_entity():
     sources = shadow.live_sources(None)
     assert sources["comfort_floor_bedroom"] == (
         "input_number.comfort_floor_bedroom",
-        "hass_input_number_state",
+        shadow.COMFORT_METRIC,
     )
     assert sources["comfort_day_min_hall_kitchen"] == (
         "input_number.comfort_day_minimum_hall_kitchen",
-        "hass_input_number_state",
+        shadow.COMFORT_METRIC,
     )
     # two helpers x four rooms, plus the three window hours
     assert sum(k.startswith("comfort_") for k in sources) == 8 + 3
@@ -325,7 +326,79 @@ def test_the_helpers_are_read_from_prometheus_by_entity():
         "start_weekend": "input_number.comfort_day_start_weekend_hour",
         "end": "input_number.comfort_day_end_hour",
     }.items():
-        assert sources[f"comfort_window_{field}"] == (entity, "hass_input_number_state")
+        assert sources[f"comfort_window_{field}"] == (entity, shadow.COMFORT_METRIC)
+
+
+def _fake_prometheus(series: dict[tuple[str, str], float], seen: list[str]):
+    """An HTTP client over a Prometheus holding ``{(metric name, entity): value}``, answering the
+    ``__name__`` regex selector (anchored, as PromQL does) or a plain metric selector."""
+    import re
+
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = request.url.params["query"]
+        seen.append(query)
+        t = float(request.url.params["time"])
+        if m := re.fullmatch(r'\{__name__=~"(.*)", entity="(.*)"\}\[\d+s\]', query):
+            name, entity = re.compile(m[1]), m[2]
+            hit = [k for k in series if name.fullmatch(k[0]) and k[1] == entity]
+        else:
+            m = re.fullmatch(r'(\w+)\{entity="(.*)"\}\[\d+s\]', query)
+            hit = [k for k in series if k == (m[1], m[2])]
+        result = [
+            {"metric": {"__name__": k[0], "entity": k[1]}, "values": [[t - 60, str(series[k])]]}
+            for k in hit
+        ]
+        return httpx.Response(
+            200, json={"status": "success", "data": {"resultType": "matrix", "result": result}}
+        )
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_comfort_helpers_are_read_whatever_unit_suffix_the_exporter_gives_the_metric():
+    from battery_optimizer.service.history import fetch_points
+
+    series = {
+        ("hass_input_number_state_celsius", "input_number.comfort_floor_bedroom"): 21.0,
+        ("hass_input_number_state_h", "input_number.comfort_day_end_hour"): 21.5,
+        ("hass_input_number_state", "input_number.comfort_day_start_weekday_hour"): 13.0,
+        ("hass_input_number_state_celsius", "input_number.comfort_floor_office_t"): 22.0,
+        # not an input_number state: never read, even for a helper's entity
+        ("hass_input_boolean_state", "input_number.comfort_day_start_weekend_hour"): 7.0,
+        ("hass_sensor_state", "input_number.comfort_floor_hall_kitchen"): 9.0,
+        ("my_hass_input_number_state_celsius", "input_number.comfort_floor_hall_kitchen"): 9.0,
+    }
+    seen: list[str] = []
+    now = utc(2026, 11, 16, 12)
+    sources = shadow.live_sources(None)
+
+    def read(key):
+        entity, metric = sources[key]
+        with _fake_prometheus(series, seen) as client:
+            return fetch_points(
+                client, "http://prometheus.test", entity, metric, now - timedelta(hours=1), now
+            )
+
+    assert [p.value for p in read("comfort_floor_bedroom")] == [21.0]  # _celsius
+    assert [p.value for p in read("comfort_window_end")] == [21.5]  # _h
+    assert [p.value for p in read("comfort_window_start_weekday")] == [13.0]  # unit-less
+    assert [p.value for p in read("comfort_floor_office_t")] == [22.0]
+    assert read("comfort_window_start_weekend") == []  # a boolean state is not read
+    assert read("comfort_floor_hall_kitchen") == []  # other metric names are not read
+    assert all(q.startswith('{__name__=~"hass_input_number_state(_') for q in seen)
+
+
+def test_the_regex_metric_selector_is_an_anchored_name_match():
+    spec = extract_prom.EntitySpec("input_number.x", "hass_input_number_state(_[a-z]+)?", "")
+    assert extract_prom.build_range_query(spec, 60) == (
+        '{__name__=~"hass_input_number_state(_[a-z]+)?", entity="input_number.x"}[60s]'
+    )
+    plain = extract_prom.EntitySpec("input_number.x", "hass_input_number_state", "")
+    assert extract_prom.build_range_query(plain, 60) == (
+        'hass_input_number_state{entity="input_number.x"}[60s]'
+    )
 
 
 def test_absent_helper_series_fall_back_to_the_config():
