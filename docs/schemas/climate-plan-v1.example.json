@@ -55,7 +55,7 @@
   "requested_mode": "live",
   "effective_mode": "shadow",
   "live_locked": true,
-  "live_lock_reason": "ADR-0008 proposed, not accepted; homelab hard lock optimizer_live_allowed=false",
+  "live_lock_reason": "climate_actuation.mode is not live",
   "mode_source": "helper",
   "summary": {
     "as_of": "2026-11-16T09:25:00+00:00",

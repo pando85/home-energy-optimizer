@@ -15,6 +15,10 @@ Layout (partitioned by **UTC** day, so a DST day is never split or doubled)::
     service/v1/actuation/date=YYYY-MM-DD/actuation.jsonl  dry_run / live only: one row per
                                                        actuator tick that wrote (or would
                                                        write) or changed state (ADR-0007)
+    service/v1/climate_actuation/date=YYYY-MM-DD/climate_actuation.jsonl
+                                                       climate_actuation dry_run / live only: one
+                                                       row per write (or would-be write) and per
+                                                       tick that changed state (ADR-0009)
     service/v1/full_charge/date=YYYY-MM-DD/full_charge.jsonl
                                                        periodic full charge (only when enabled):
                                                        one row per decision, reading, transition,
@@ -105,6 +109,9 @@ class ShadowSink:
 
     def append_actuation(self, at: datetime, record: dict[str, Any]) -> Path:
         return self._append("actuation", at, record)
+
+    def append_climate_actuation(self, at: datetime, record: dict[str, Any]) -> Path:
+        return self._append("climate_actuation", at, record)
 
     def append_full_charge(self, at: datetime, record: dict[str, Any]) -> Path:
         return self._append("full_charge", at, record)
@@ -198,8 +205,8 @@ def iter_records(
     data_dir: Path, kind: str, since: datetime, until: datetime
 ) -> Iterator[dict[str, Any]]:
     """Records of *kind* (``slots``/``events``/``plans``/``pvpc_snapshots``/
-    ``weather_forecasts``/``climate_*``/``actuation``/``full_charge``) from the UTC-day partitions
-    overlapping ``[since, until)``; torn or corrupt lines are skipped."""
+    ``weather_forecasts``/``climate_*``/``actuation``/``climate_actuation``/``full_charge``) from
+    the UTC-day partitions overlapping ``[since, until)``; torn or corrupt lines are skipped."""
     root = data_dir / _ROOT / kind
     day = since.astimezone(UTC).date() - timedelta(days=1)
     last: date = until.astimezone(UTC).date()

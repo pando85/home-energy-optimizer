@@ -195,6 +195,9 @@ def test_the_service_set_is_closed():
         ("number", "set_value"),
         ("input_datetime", "set_datetime"),
         ("select", "select_option"),
+        # ADR-0009: the climate actuator's two services (tests/test_climate_actuation_guard.py)
+        ("input_select", "select_option"),
+        ("input_number", "set_value"),
     }
 
 

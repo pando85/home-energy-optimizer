@@ -6,7 +6,9 @@ Decides when the Panasonic Aquarea heats rooms and makes hot water. **Owner: the
 (AppDaemon `climate_control.py` and `dhw_control.py`, HA helpers, HeishaMon automations); this repository
 only observes it and replays it. Water-temperature control, its modes and the commands the unit accepts
 are documented in the homelab repository at `docs/user-guide/heat-pump-water-temperature.md`. This
-repository never writes to it (shadow phase, [AGENTS.md](../../AGENTS.md)).
+repository writes to it only through the climate actuator of [ADR-0009](../adr/0009-live-climate-control.md),
+which exists in code with `climate_actuation.mode: shadow` (nothing is written) until the owner approves the switch
+(shadow phase, [AGENTS.md](../../AGENTS.md)).
 The successor is specified in [comfort-controller-design](../planning/comfort-controller-design.md)
 (agreed 2026-10-31, not built; merged only once the house battery works): AppDaemon decides heating on/off
 from room temperatures, writes the water temperature from a software curve in direct mode and keeps DHW
@@ -19,6 +21,13 @@ on the tank target: [dhw-price-scheduling](../planning/dhw-price-scheduling.md).
 - **In:** the PVPC price sensor, `input_number.appdaemon_climate_min_hours_per_day`, the enable toggles,
   manual thermostat setpoints, and the water-target helper (absolute value, direct mode).
 - **Out:** operating mode `Heat+DHW` or `DHW`, `switch.aquarea_force_dhw_mode`; the unit's own water target.
+- **Successor interface (ADR-0009; code exists, mode `shadow`, nothing is written):** the optimizer's climate actuator
+  writes `input_select.heishamon_heatmode` (`Heat+DHW` / `DHW`, minimum on 30 min and off 20 min) and the integer
+  Z1 water target `input_number.heishamon_heatshift_z1` (20 to 35 degC, direct mode only, steps of at least 1 K, once
+  per 15 min) and a heartbeat helper, only while `climate_actuation.mode` is `live`, the owner's
+  `input_select.climate_optimizer_mode` is `live` and `input_boolean.appdaemon_climate_enable` is not `on`. DHW
+  (`switch.aquarea_force_dhw_mode`, the tank target), the heater, setpoints and cooling stay out of its reach
+  ([service](../service.md#live-climate-control-adr-0009)).
 - **Consumers:** the whole-house load that the [battery load forecast](battery-load-forecast.md) learns
   from; [cop-model](cop-model.md) and [thermal-model](thermal-model.md) data; LF-1
   ([hp-consumption-forecast](hp-consumption-forecast.md)) replays it.
@@ -159,6 +168,6 @@ hours, the mode it commanded): the legacy rule exports only the helpers above an
 
 ## Status
 
-**valid (legacy rule), being replaced** (2026-10-30; successor designed 2026-10-31, **planned**, merge
-gated on the battery working). Space heating is off for the season; the comfort controller is planned
+**valid (legacy rule), being replaced** (2026-10-30; successor decided in ADR-0009 on 2026-11-18, **code exists,
+mode `shadow`, nothing written**; the switch needs the owner's separate approval). Space heating is off for the season; the optimizer as the space-heating writer is planned
 ([regime log](regime-log.md#planned-not-yet-real-dates-to-be-filled-in)).

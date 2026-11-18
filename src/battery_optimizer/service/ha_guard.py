@@ -54,6 +54,16 @@ Omnibattery weekly-full-charge switch and ``select.select_option`` on its day se
 weekday values of :data:`WEEKDAY_OPTIONS`).  Its delay switch, the charge-delay switch, the
 cutoff numbers, any button and every other entity of those domains stay refused.
 
+Live climate control (ADR-0009) adds exactly three more entries, and only when the caller's
+allowlist is built from ``climate_actuation.mode: live`` (:func:`actuation_allowlist`; ``shadow``,
+the default, and ``dry_run`` add nothing, and the battery's ``mode: live`` alone adds none of
+them): ``input_select.select_option`` on the heat-mode select with ``option`` exactly ``Heat+DHW``
+or ``DHW`` (:data:`CLIMATE_HEAT_MODE_OPTIONS`), ``input_number.set_value`` on the Z1 water-target
+helper with ``value`` an **integer** in ``[20, 35]`` degC (:data:`CLIMATE_WATER_RANGE_C`) and
+``input_datetime.set_datetime`` on the climate heartbeat helper.  ``Heat``, ``Cool*``, ``Auto*``,
+every other option, a float, an out-of-range value, DHW, the heater, the setpoints and every other
+entity of those domains stay refused.
+
 The guard holds no credentials and does no I/O; the transports call it.
 """
 
@@ -72,16 +82,20 @@ __all__ = [
     "ALLOWED_SUBSCRIBE_EVENT_TYPES",
     "ALLOWED_WEATHER_FORECAST_TYPES",
     "ALLOWED_WS_TYPES",
+    "CLIMATE_HEAT_MODE_OPTIONS",
+    "CLIMATE_WATER_RANGE_C",
     "WEEKDAY_OPTIONS",
     "ActuationAllowlist",
     "ForbiddenHACallError",
     "actuation_allowlist",
     "actuation_request",
+    "battery_allowlist",
     "check_actuation_call",
     "check_rest_request",
     "check_weather_forecast_call",
     "check_ws_frame",
     "check_ws_message",
+    "climate_allowlist",
     "weather_forecast_request",
 ]
 
@@ -196,8 +210,17 @@ ACTUATION_SERVICES: frozenset[tuple[str, str]] = frozenset(
         ("number", "set_value"),
         ("input_datetime", "set_datetime"),
         ("select", "select_option"),
+        ("input_select", "select_option"),
+        ("input_number", "set_value"),
     }
 )
+
+#: The only options the climate actuator may write to the heat-mode select (ADR-0009), verbatim:
+#: space heating on (with hot water) and off (hot water only).  Not configurable.
+CLIMATE_HEAT_MODE_OPTIONS: frozenset[str] = frozenset({"Heat+DHW", "DHW"})
+
+#: The water target's inclusive integer range in degC (ADR-0009).  Not configurable.
+CLIMATE_WATER_RANGE_C: tuple[int, int] = (20, 35)
 
 #: The options of Omnibattery's weekly-full-charge day select, verbatim (not configurable).
 WEEKDAY_OPTIONS: tuple[str, ...] = (
@@ -221,12 +244,17 @@ class ActuationAllowlist:
     ``switches``: ``switch.turn_on``/``turn_off``; ``numbers``: ``number.set_value`` with
     inclusive ``(low, high)`` bounds; ``datetimes``: ``input_datetime.set_datetime``;
     ``selects``: ``select.select_option`` with the options each entity may be set to.
+    ``input_selects``: ``input_select.select_option`` with the options each entity may be set to;
+    ``input_numbers``: ``input_number.set_value`` with inclusive **integer** ``(low, high)`` bounds
+    (the two fields of the climate actuator, ADR-0009).
     """
 
     switches: frozenset[str] = frozenset()
     numbers: Mapping[str, tuple[float, float]] = field(default_factory=dict)
     datetimes: frozenset[str] = frozenset()
     selects: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    input_selects: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    input_numbers: Mapping[str, tuple[int, int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for domain, entities in (
@@ -234,6 +262,8 @@ class ActuationAllowlist:
             ("number", self.numbers),
             ("input_datetime", self.datetimes),
             ("select", self.selects),
+            ("input_select", self.input_selects),
+            ("input_number", self.input_numbers),
         ):
             for entity in entities:
                 if not isinstance(entity, str) or not _ENTITY.match(entity):
@@ -243,13 +273,30 @@ class ActuationAllowlist:
         for entity, (low, high) in self.numbers.items():
             if not (math.isfinite(low) and math.isfinite(high) and low <= high):
                 raise ValueError(f"actuation allowlist: bad bounds for {entity}: {low}..{high}")
-        for entity, options in self.selects.items():
+        for entity, options in (*self.selects.items(), *self.input_selects.items()):
             if not options or not all(isinstance(o, str) and o for o in options):
                 raise ValueError(f"actuation allowlist: bad options for {entity}: {options!r}")
+        for entity, (int_low, int_high) in self.input_numbers.items():
+            ints = all(isinstance(b, int) and not isinstance(b, bool) for b in (int_low, int_high))
+            if not (ints and int_low <= int_high):
+                raise ValueError(
+                    f"actuation allowlist: bad integer bounds for {entity}: {int_low}..{int_high}"
+                )
+
+    def merged(self, other: ActuationAllowlist) -> ActuationAllowlist:
+        """The union of two allowlists (the battery's and the climate actuator's)."""
+        return ActuationAllowlist(
+            switches=self.switches | other.switches,
+            numbers={**self.numbers, **other.numbers},
+            datetimes=self.datetimes | other.datetimes,
+            selects={**self.selects, **other.selects},
+            input_selects={**self.input_selects, **other.input_selects},
+            input_numbers={**self.input_numbers, **other.input_numbers},
+        )
 
 
-def actuation_allowlist(config: Any) -> ActuationAllowlist | None:
-    """The allowlist for a :class:`~.config.ServiceConfig`; ``None`` unless ``mode: live``.
+def battery_allowlist(config: Any) -> ActuationAllowlist | None:
+    """The Omnibattery allowlist (ADR-0007); ``None`` unless the service ``mode: live``.
 
     The two direction switches and the power-limit switch; the PD grid target bounded to
     ``[0, import_cap_w]`` (never an export target, never above the cap); the system
@@ -281,6 +328,39 @@ def actuation_allowlist(config: Any) -> ActuationAllowlist | None:
         },
         datetimes=frozenset({ents.heartbeat}),
     )
+
+
+def climate_allowlist(config: Any) -> ActuationAllowlist | None:
+    """The climate actuator's allowlist (ADR-0009); ``None`` unless ``climate_actuation`` is live.
+
+    Exactly three entries: the heat-mode select with the options ``Heat+DHW`` / ``DHW``, the Z1
+    water-target helper with integers in ``[20, 35]`` and the climate heartbeat helper.  The
+    options and the range are the module's constants, not configuration; the entity IDs are the
+    ``climate_actuation.entities`` map.  Nothing else: not DHW, the heater, the setpoints, the
+    owner's select or the legacy helpers.
+    """
+    climate = getattr(config, "climate_actuation", None)
+    if climate is None or climate.mode != "live":
+        return None
+    ents = climate.entities
+    return ActuationAllowlist(
+        datetimes=frozenset({ents.heartbeat}),
+        input_selects={ents.heat_mode: CLIMATE_HEAT_MODE_OPTIONS},
+        input_numbers={ents.water_target: CLIMATE_WATER_RANGE_C},
+    )
+
+
+def actuation_allowlist(config: Any) -> ActuationAllowlist | None:
+    """The allowlist for a :class:`~.config.ServiceConfig`; ``None`` unless something is ``live``.
+
+    The union of :func:`battery_allowlist` (``mode: live``) and :func:`climate_allowlist`
+    (``climate_actuation.mode: live``): a battery in ``live`` with the climate in ``shadow`` gets
+    none of the climate entries, and the reverse.  ``shadow`` and ``dry_run`` add nothing.
+    """
+    battery, climate = battery_allowlist(config), climate_allowlist(config)
+    if battery is None:
+        return climate
+    return battery if climate is None else battery.merged(climate)
 
 
 def _finite_number(value: Any) -> float | None:
@@ -326,6 +406,30 @@ def check_actuation_call(message: Mapping[str, Any], allowlist: ActuationAllowli
         if value is None or not low <= value <= high:
             raise ForbiddenHACallError(
                 f"number.set_value: {entity} value {data['value']!r} outside [{low}, {high}]"
+            )
+    elif domain == "input_number":  # input_number.set_value: the climate water target
+        if entity not in allowlist.input_numbers:
+            raise ForbiddenHACallError(f"input_number.set_value: {entity!r} is not allowlisted")
+        if set(data) != {"value"}:
+            raise ForbiddenHACallError("input_number.set_value: service_data must be exactly value")
+        value = data["value"]
+        low_i, high_i = allowlist.input_numbers[entity]
+        if isinstance(value, bool) or not isinstance(value, int) or not low_i <= value <= high_i:
+            raise ForbiddenHACallError(
+                f"input_number.set_value: {entity} value {value!r} is not an integer in "
+                f"[{low_i}, {high_i}]"
+            )
+    elif domain == "input_select":  # input_select.select_option: the climate heat mode
+        if entity not in allowlist.input_selects:
+            raise ForbiddenHACallError(f"input_select.select_option: {entity!r} is not allowlisted")
+        if set(data) != {"option"}:
+            raise ForbiddenHACallError(
+                "input_select.select_option: service_data must be exactly option"
+            )
+        option = data["option"]
+        if not isinstance(option, str) or option not in allowlist.input_selects[entity]:
+            raise ForbiddenHACallError(
+                f"input_select.select_option: {entity} option {option!r} is not allowlisted"
             )
     elif domain == "select":  # select.select_option: the weekly-full-charge day
         if entity not in allowlist.selects:

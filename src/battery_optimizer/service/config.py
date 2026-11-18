@@ -38,6 +38,9 @@ __all__ = [
     "ArchiveSettings",
     "BatteryHealthEntities",
     "BatteryHealthSettings",
+    "CLIMATE_ACTUATION_MODES",
+    "ClimateActuationEntities",
+    "ClimateActuationSettings",
     "ClimateShadowSettings",
     "EntityMap",
     "FULL_CHARGE_MODES",
@@ -401,6 +404,98 @@ MAX_TICK_INTERVAL_S = 120.0
 _OPTIONAL_ACTUATION_ENTITIES: frozenset[str] = frozenset()
 
 
+#: ``climate_actuation.mode`` (ADR-0009): ``shadow`` has no climate actuator and no write path;
+#: ``dry_run`` runs the actuator and records every write it would make; ``live`` sends them.
+CLIMATE_ACTUATION_MODES: tuple[str, ...] = ("shadow", "dry_run", "live")
+
+#: Longest climate actuator tick: well inside the HA watchdog's 10-minute heartbeat window.
+MAX_CLIMATE_TICK_INTERVAL_S = 120.0
+
+#: The comfort-floor helper's accepted range in degC (ADR-0009 decision 6), also the range of the
+#: configured default floor.
+CLIMATE_FLOOR_RANGE_C = (18.0, 23.0)
+
+#: Climate actuation entity -> required HA domain.  ``heat_mode``, ``water_target`` and
+#: ``heartbeat`` are written (``climate_actuation.mode: live``, through :mod:`.ha_guard`); the
+#: rest is only read.
+CLIMATE_ACTUATION_DOMAINS: dict[str, str] = {
+    "heat_mode": "input_select",
+    "water_target": "input_number",
+    "heartbeat": "input_datetime",
+    "observed_mode": "sensor",
+    "heating_mode": "sensor",
+    "water_request": "sensor",
+    "legacy_enable": "input_boolean",
+}
+
+_DEFAULT_CLIMATE_ROOMS = {
+    "hall_kitchen": "climate.thermostat_hall_kitchen",
+    "bedroom": "climate.thermostat_bedroom",
+    "office_t": "climate.thermostat_office_t",
+}
+
+
+@dataclass(frozen=True)
+class ClimateActuationEntities:
+    """The heat pump's control surface in Home Assistant (ADR-0009).
+
+    Written (live mode only): the heat-mode select (``Heat+DHW`` / ``DHW``), the Z1 water-target
+    helper (integers 20 to 35, direct mode) and the heartbeat helper.  Only read: the unit's
+    observed operating mode, its ``Heating_Mode`` (1 = direct, 0 = curve), its Z1 request, the
+    legacy controller's enable toggle, the thermostats (``current_temperature``) and the optional
+    per-room comfort-floor helpers ``<floor_helper_prefix><room>``.  The owner's select is
+    ``climate_shadow.entities.mode``.
+    """
+
+    heat_mode: str = "input_select.heishamon_heatmode"
+    water_target: str = "input_number.heishamon_heatshift_z1"
+    heartbeat: str = "input_datetime.climate_optimizer_heartbeat"
+    observed_mode: str = "sensor.aquarea_mode"
+    heating_mode: str = "sensor.aquarea_heating_mode"
+    water_request: str = "sensor.aquarea_z1_heat_request_temperature"
+    legacy_enable: str = "input_boolean.appdaemon_climate_enable"
+    #: Comfort room -> thermostat entity (the rooms of the plan and of the preregistered gate).
+    rooms: Mapping[str, str] = field(default_factory=lambda: dict(_DEFAULT_CLIMATE_ROOMS))
+    floor_helper_prefix: str = "input_number.comfort_floor_"
+
+    def written(self) -> tuple[str, ...]:
+        return (self.heat_mode, self.water_target, self.heartbeat)
+
+    def floor_helper(self, room: str) -> str:
+        return f"{self.floor_helper_prefix}{room}"
+
+    def all(self) -> tuple[str, ...]:
+        """Every entity the climate actuator reads or writes (the entity store tracks them)."""
+        singles = tuple(getattr(self, key) for key in CLIMATE_ACTUATION_DOMAINS)
+        return (*singles, *self.rooms.values(), *(self.floor_helper(r) for r in self.rooms))
+
+
+@dataclass(frozen=True)
+class ClimateActuationSettings:
+    """Live climate control (ADR-0009): the optimizer writes space heating (``shadow``: nothing).
+
+    The machine limits (minimum on 30 min and off 20 min, water only in direct mode, integers 20 to
+    35, change of at least 1 K, once per 15 min, 10 s between writes to one entity) are code, not
+    settings.
+    """
+
+    mode: str = "shadow"
+    entities: ClimateActuationEntities = field(default_factory=ClimateActuationEntities)
+    tick_interval_s: float = 60.0
+    #: A room releases its floor override at ``floor + floor_margin_c`` (hysteresis).
+    floor_margin_c: float = 0.5
+    #: The comfort floor of a room without a usable helper (degC).
+    floor_c: float = 21.0
+    #: The water target of the safe state (integer degC, 20 to 35), direct mode only.
+    safe_water_target_c: int = 26
+    #: One write may stay unconfirmed this long (the unit's own state topic is the acknowledgement).
+    readback_timeout_s: float = 30.0
+    max_attempts: int = 3
+    shutdown_timeout_s: float = 20.0
+    #: A thermostat reading older than this is not usable (a stale reading proves nothing).
+    room_max_age_s: float = 3600.0
+
+
 @dataclass(frozen=True)
 class ActuationEntities:
     """The Omnibattery control surface plus the owner's kill switch and heartbeat helper.
@@ -734,6 +829,7 @@ class ServiceConfig:
     archive: ArchiveSettings = field(default_factory=ArchiveSettings)
     climate_shadow: ClimateShadowSettings = field(default_factory=ClimateShadowSettings)
     actuation: ActuationSettings = field(default_factory=ActuationSettings)
+    climate_actuation: ClimateActuationSettings = field(default_factory=ClimateActuationSettings)
     full_charge: FullChargeSettings = field(default_factory=FullChargeSettings)
     battery_health: BatteryHealthSettings = field(default_factory=BatteryHealthSettings)
     timezone: str = "Europe/Madrid"
@@ -804,6 +900,7 @@ class ServiceConfig:
             },
             "freshness_s": dict(self.freshness_s),
             "actuation": asdict(self.actuation),
+            "climate_actuation": asdict(self.climate_actuation),
             "full_charge": {
                 **asdict(self.full_charge),
                 "bootstrap_last_full": self.full_charge.bootstrap_last_full.isoformat()
@@ -826,6 +923,7 @@ class ServiceConfig:
         public.pop("archive", None)  # passive collection never changes a plan
         public.pop("climate_shadow", None)  # nor does the climate shadow (it plans no battery)
         public.pop("actuation", None)  # nor does the way a plan is sent
+        public.pop("climate_actuation", None)  # nor does the climate actuator (no battery plan)
         public.pop("full_charge", None)  # a committed plan carries its spec in its own inputs
         public.pop("battery_health", None)  # read-only telemetry never changes a plan
         public["planning"].pop("thermal", None)  # nor does the thermal shadow (observability only)
@@ -1145,6 +1243,133 @@ def _parse_climate_shadow(raw: Mapping[str, Any]) -> ClimateShadowSettings:
         optimizer_mode=mode,
         plan_ttl_minutes=ttl,
     )
+
+
+_CLIMATE_ACTUATION_KEYS = (
+    "mode",
+    "entities",
+    "tick_interval_s",
+    "floor_margin_c",
+    "floor_c",
+    "safe_water_target_c",
+    "readback_timeout_s",
+    "max_attempts",
+    "shutdown_timeout_s",
+    "room_max_age_s",
+)
+_CLIMATE_ACTUATION_ENTITY_KEYS = (*CLIMATE_ACTUATION_DOMAINS, "rooms", "floor_helper_prefix")
+_FLOOR_PREFIX = re.compile(r"^input_number\.[a-z0-9_]*_$")
+
+
+def _parse_climate_actuation(
+    raw: Mapping[str, Any], climate_shadow: ClimateShadowSettings, actuation: ActuationSettings
+) -> ClimateActuationSettings:
+    """Validate ``climate_actuation:`` (ADR-0009); ``mode`` defaults to ``shadow`` (no writes)."""
+    from .ha_guard import CLIMATE_WATER_RANGE_C
+
+    name = "climate_actuation"
+    _keys(raw, name, _CLIMATE_ACTUATION_KEYS)
+    defaults = ClimateActuationSettings()
+    mode = raw.get("mode", defaults.mode)
+    if mode not in CLIMATE_ACTUATION_MODES:
+        raise ValueError(
+            f"service config: {name}.mode={mode!r} is not one of {CLIMATE_ACTUATION_MODES}"
+        )
+    ents_raw = _section(raw, "entities")
+    _keys(ents_raw, f"{name}.entities", _CLIMATE_ACTUATION_ENTITY_KEYS)
+    ents: dict[str, Any] = {}
+    for key, domain in CLIMATE_ACTUATION_DOMAINS.items():
+        value = ents_raw.get(key, getattr(defaults.entities, key))
+        if (
+            not isinstance(value, str)
+            or not _ENTITY_ID.match(value)
+            or not value.startswith(f"{domain}.")
+        ):
+            raise ValueError(
+                f"service config: {name}.entities.{key} must be a {domain}.* entity ID"
+            )
+        ents[key] = value
+    rooms = ents_raw.get("rooms", dict(defaults.entities.rooms))
+    if not isinstance(rooms, Mapping) or not rooms:
+        raise ValueError(f"service config: {name}.entities.rooms must be a non-empty mapping")
+    for room, entity in rooms.items():
+        if (
+            not isinstance(room, str)
+            or not re.fullmatch(r"[a-z0-9_]+", room)
+            or not isinstance(entity, str)
+            or not _ENTITY_ID.match(entity)
+            or not entity.startswith("climate.")
+        ):
+            raise ValueError(
+                f"service config: {name}.entities.rooms must map room names to climate.* entities"
+            )
+    ents["rooms"] = dict(rooms)
+    prefix = ents_raw.get("floor_helper_prefix", defaults.entities.floor_helper_prefix)
+    if not isinstance(prefix, str) or not _FLOOR_PREFIX.match(prefix):
+        raise ValueError(
+            f"service config: {name}.entities.floor_helper_prefix must be an input_number.* "
+            "prefix ending in an underscore"
+        )
+    ents["floor_helper_prefix"] = prefix
+    entities = ClimateActuationEntities(**ents)
+    named = entities.all()
+    if len(named) != len(set(named)):
+        raise ValueError(f"service config: {name}.entities must name distinct entities")
+    if entities.heartbeat == actuation.entities.heartbeat:
+        raise ValueError(
+            f"service config: {name}.entities.heartbeat must not be the battery's heartbeat: a "
+            "battery fault must not hide a climate fault and the reverse"
+        )
+
+    def num(key: str, *, allow_zero: bool = False) -> float:
+        value = raw.get(key, getattr(defaults, key))
+        return _positive(value, f"{name}.{key}", allow_zero=allow_zero)
+
+    floor = num("floor_c")
+    low, high = CLIMATE_FLOOR_RANGE_C
+    if not low <= floor <= high:
+        raise ValueError(f"service config: {name}.floor_c must be within [{low}, {high}] degC")
+    margin = num("floor_margin_c", allow_zero=True)
+    if margin > 2.0:
+        raise ValueError(f"service config: {name}.floor_margin_c must be at most 2 K")
+    water_lo, water_hi = CLIMATE_WATER_RANGE_C
+    safe = raw.get("safe_water_target_c", defaults.safe_water_target_c)
+    if isinstance(safe, bool) or not isinstance(safe, int) or not water_lo <= safe <= water_hi:
+        raise ValueError(
+            f"service config: {name}.safe_water_target_c must be an integer within "
+            f"[{water_lo}, {water_hi}] degC"
+        )
+    settings = ClimateActuationSettings(
+        mode=mode,
+        entities=entities,
+        tick_interval_s=num("tick_interval_s"),
+        floor_margin_c=margin,
+        floor_c=floor,
+        safe_water_target_c=safe,
+        readback_timeout_s=num("readback_timeout_s"),
+        max_attempts=_int(raw.get("max_attempts", defaults.max_attempts), f"{name}.max_attempts"),
+        shutdown_timeout_s=num("shutdown_timeout_s"),
+        room_max_age_s=num("room_max_age_s"),
+    )
+    if settings.tick_interval_s > MAX_CLIMATE_TICK_INTERVAL_S:
+        raise ValueError(
+            f"service config: {name}.tick_interval_s must be <= {MAX_CLIMATE_TICK_INTERVAL_S:.0f} "
+            "s, well inside the 10-minute heartbeat watchdog"
+        )
+    if settings.max_attempts > 5:
+        raise ValueError(f"service config: {name}.max_attempts must be at most 5")
+    if mode != "shadow":
+        if not climate_shadow.enabled:
+            raise ValueError(
+                f"service config: {name}.mode={mode} needs climate_shadow.enabled: the actuator "
+                "acts on the plan the climate shadow solves in this process"
+            )
+        if climate_shadow.mode_entity is None:
+            raise ValueError(
+                f"service config: {name}.mode={mode} needs climate_shadow.entities.mode (the "
+                "owner's select, read only): without it nothing could ever be permitted"
+            )
+    return settings
 
 
 _ACTUATION_KEYS = (
@@ -1933,6 +2158,9 @@ def load_service_config(
     archive = _parse_archive(_section(raw, "archive"))
     climate_shadow = _parse_climate_shadow(_section(raw, "climate_shadow"))
     actuation = _parse_actuation(_section(raw, "actuation"), mode)
+    climate_actuation = _parse_climate_actuation(
+        _section(raw, "climate_actuation"), climate_shadow, actuation
+    )
     battery_health = _parse_battery_health(_section(raw, "battery_health"))
     full_charge = _parse_full_charge(
         _section(raw, "full_charge"),
@@ -1991,6 +2219,7 @@ def load_service_config(
         archive=archive,
         climate_shadow=climate_shadow,
         actuation=actuation,
+        climate_actuation=climate_actuation,
         full_charge=full_charge,
         battery_health=battery_health,
         freshness_s=freshness,

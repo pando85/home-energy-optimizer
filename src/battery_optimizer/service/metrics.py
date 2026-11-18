@@ -198,6 +198,9 @@ class _RuntimeCollector(Collector):
         actuator = snap.get("actuator")
         if actuator is not None:
             yield from _actuator_families(actuator)
+        climate_actuator = snap.get("climate_actuator")
+        if climate_actuator is not None:
+            yield from _climate_actuator_families(climate_actuator)
         full_charge = snap.get("full_charge")
         if full_charge is not None:
             yield from _full_charge_families(full_charge)
@@ -545,6 +548,110 @@ def _actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
             yield value
 
 
+def _climate_actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
+    """The climate actuator's scrape-time gauges (``battery_optimizer_climate_actuator_``)."""
+    from .climate_actuator import (
+        ACTUATOR_MODES,
+        FALLBACK_REASONS,
+        GUARD_REASONS,
+        HOLD_REASONS,
+        OWNER_STATES,
+        WRITE_ROLES,
+    )
+
+    name = f"{PREFIX}_climate_actuator"
+
+    def gauge(suffix: str, doc: str, value: float | None) -> GaugeMetricFamily:
+        family = GaugeMetricFamily(f"{name}_{suffix}", doc, labels=[])
+        if value is not None:
+            family.add_metric([], float(value))
+        return family
+
+    def labelled(suffix: str, doc: str, label: str, values: Iterable[str], active: set[str]):
+        family = GaugeMetricFamily(f"{name}_{suffix}", doc, labels=[label])
+        for value in values:
+            family.add_metric([value], 1.0 if value in active else 0.0)
+        return family
+
+    yield labelled(
+        "mode", "1 for the climate actuation mode", "mode", ACTUATOR_MODES, {a.get("mode")}
+    )
+    yield labelled(
+        "owner_select",
+        "1 for the state of the owner's climate_optimizer_mode select (never written)",
+        "state",
+        OWNER_STATES,
+        {a.get("owner_select")},
+    )
+    yield gauge(
+        "in_control",
+        "1 while the actuator may write (select live, legacy off)",
+        a.get("in_control"),
+    )
+    ok = GaugeMetricFamily(
+        f"{name}_guard_ok",
+        "1 when the last tick applied the plan (no guard reason, no fallback)",
+        labels=[],
+    )
+    if a.get("ticked"):
+        ok.add_metric([], 1.0 if a.get("guard_ok") else 0.0)
+    yield ok
+    yield labelled(
+        "guard_reason",
+        "1 for each reason the last tick wrote nothing (legacy_writer_active is alert-worthy)",
+        "reason",
+        GUARD_REASONS,
+        set(a.get("reasons") or ()),
+    )
+    yield labelled(
+        "fallback_active",
+        "1 for the reason of the safe heating state in force (all 0: none)",
+        "reason",
+        FALLBACK_REASONS,
+        {a["fallback"]} if a.get("fallback") else set(),
+    )
+    yield labelled(
+        "hold",
+        "1 for each machine limit that held a write back at the last tick",
+        "reason",
+        HOLD_REASONS,
+        set(a.get("holds") or ()),
+    )
+    yield gauge(
+        "alert",
+        "1 while writes fail (the safe state was attempted, or even that failed)",
+        a["alert"],
+    )
+    yield gauge(
+        "not_direct_mode",
+        "1 while heating is wanted but Heating_Mode is not 1 (curve or unavailable): no water "
+        "target is written (alert-worthy)",
+        a.get("not_direct_mode"),
+    )
+    yield gauge(
+        "floor_override_rooms",
+        "Comfort rooms under a floor override (a room below its floor forces Heat+DHW)",
+        a.get("floor_override_rooms"),
+    )
+    for suffix, key, doc in (
+        ("desired_heating", "desired_heating", "Requested space heating (1 = Heat+DHW, 0 = DHW)"),
+        ("observed_heating", "observed_heating", "Unit's operating mode (1 = Heat+DHW, 0 = DHW)"),
+        ("desired_water_celsius", "desired_water_celsius", "Requested Z1 water target"),
+        ("observed_water_celsius", "observed_water_celsius", "Unit's Z1 water request"),
+    ):
+        yield gauge(suffix, doc, a.get(key))
+    last = GaugeMetricFamily(
+        f"{name}_last_confirmed_write_timestamp_seconds",
+        "Unix time of the last write confirmed by readback, per entity (heat_mode, water_target)",
+        labels=["entity"],
+    )
+    confirmed = a.get("last_confirmed_write") or {}
+    for role in WRITE_ROLES:
+        if role in confirmed:
+            last.add_metric([role], float(confirmed[role]))
+    yield last
+
+
 #: Values of the ``status`` label of the gate state set.
 GATE_STATUSES = ("PASS", "FAIL", "UNDETERMINED")
 CLIMATE_REGIMES = ("legacy", "comfort", "comfort_off", "unknown")
@@ -787,6 +894,7 @@ class ServiceMetrics:
         actuation: bool = False,
         full_charge: bool = False,
         thermal: bool = False,
+        climate_actuation: bool = False,
     ) -> None:
         # ``*_created`` series double the exposition for no use here (process-wide switch).
         disable_created_metrics()
@@ -1003,6 +1111,8 @@ class ServiceMetrics:
             self.load_forecast_abs_error_kwh.labels(plan=plan)
         if actuation:  # dry_run / live only: the shadow exposition stays as it was
             self._register_actuation()
+        if climate_actuation:  # climate_actuation dry_run / live only
+            self._register_climate_actuation()
         if full_charge:  # only with the feature enabled
             self._register_full_charge()
         if thermal:  # only with planning.thermal on: mode off keeps the exposition as it was
@@ -1070,6 +1180,49 @@ class ServiceMetrics:
             self.actuator_safe_idles.labels(reason=reason)
         for result in ("ok", "failed", "dry_run"):
             self.actuator_heartbeats.labels(result=result)
+
+    def _register_climate_actuation(self) -> None:
+        from .climate_actuator import FALLBACK_REASONS, WRITE_FAILURE_REASONS, WRITE_ROLES
+
+        r = self.registry
+        self.climate_actuator_writes = Counter(
+            f"{PREFIX}_climate_actuator_writes",
+            "Heat-pump writes by role and result (ok = sent and read back; dry_run = not sent)",
+            ["entity", "result"],
+            registry=r,
+        )
+        self.climate_actuator_write_failures = Counter(
+            f"{PREFIX}_climate_actuator_write_failures",
+            "Failed write attempts by reason (each retry counts)",
+            ["reason"],
+            registry=r,
+        )
+        self.climate_actuator_fallbacks = Counter(
+            f"{PREFIX}_climate_actuator_fallbacks",
+            "Entries into the safe heating state by reason",
+            ["reason"],
+            registry=r,
+        )
+        self.climate_actuator_heartbeats = Counter(
+            f"{PREFIX}_climate_actuator_heartbeats",
+            "Heartbeats to the climate watchdog helper by result",
+            ["result"],
+            registry=r,
+        )
+        self.climate_actuator_floor_overrides = Counter(
+            f"{PREFIX}_climate_actuator_floor_overrides",
+            "Comfort rooms that entered a floor override (below the floor: Heat+DHW forced)",
+            registry=r,
+        )
+        for role in WRITE_ROLES:
+            for result in ("ok", "failed", "dry_run"):
+                self.climate_actuator_writes.labels(entity=role, result=result)
+        for reason in WRITE_FAILURE_REASONS:
+            self.climate_actuator_write_failures.labels(reason=reason)
+        for reason in FALLBACK_REASONS:
+            self.climate_actuator_fallbacks.labels(reason=reason)
+        for result in ("ok", "failed", "dry_run"):
+            self.climate_actuator_heartbeats.labels(result=result)
 
     def _register_full_charge(self) -> None:
         from .full_charge import OUTCOMES

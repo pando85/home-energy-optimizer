@@ -16,8 +16,8 @@
   control; the HP is comfort plus efficiency, the battery is price) and
   [ADR-0007](0007-live-battery-control.md), whose structure it mirrors (three modes, allowlist, owner switch,
   heartbeat, HA watchdog, rollout).
-- **Implementation (to be built):** `src/battery_optimizer/service/ha_guard.py` (`ActuationAllowlist`),
-  a new climate actuator module next to `service/climate_shadow.py`, `climate/plan_export.py`
+- **Implementation (built 2026-11-18, mode `shadow`):** `src/battery_optimizer/service/ha_guard.py` (`ActuationAllowlist`),
+  `service/climate_actuator.py` next to `service/climate_shadow.py`, `climate/plan_export.py`
   (`LIVE_ALLOWED`), `service/runtime.py`, `service/metrics.py`, and a new `climate_actuation:` section of
   `config/service.yaml`. The homelab half (helpers, watchdog, deployment) is a separate repository's change.
 

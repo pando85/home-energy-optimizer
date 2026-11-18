@@ -81,7 +81,7 @@
       ]
     },
     "requested_mode": {"enum": ["off", "shadow", "live"], "description": "What the owner asked for (HA select, else the config fallback)."},
-    "effective_mode": {"enum": ["off", "shadow"], "description": "What the optimizer does. Never live in this code version."},
+    "effective_mode": {"enum": ["off", "shadow", "live"], "description": "What the optimizer does. live only while climate_actuation.mode is live (ADR-0009); a live request is otherwise served as shadow and flagged live_locked."},
     "live_locked": {"type": "boolean", "description": "True while live is requested and refused."},
     "live_lock_reason": {"type": ["string", "null"]},
     "mode_source": {"enum": ["helper", "config"]},
@@ -127,6 +127,10 @@
       "if": {"properties": {"status": {"const": "planned"}}},
       "then": {"properties": {"slots": {"type": "object"}, "reason": {"type": "null"}}},
       "else": {"properties": {"slots": {"type": "null"}, "reason": {"type": "string"}}}
+    },
+    {
+      "if": {"properties": {"effective_mode": {"const": "live"}}, "required": ["effective_mode"]},
+      "then": {"properties": {"requested_mode": {"const": "live"}, "live_locked": {"const": false}}}
     },
     {
       "if": {"properties": {"live_locked": {"const": true}}},

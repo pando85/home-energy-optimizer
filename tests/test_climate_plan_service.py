@@ -168,8 +168,8 @@ def test_live_is_a_request_only_and_the_plan_says_so(tmp_path):
     service, _ = run_once(tmp_path, "live")
     body = fetch(service, "/climate/plan").json()
     assert body["requested_mode"] == "live" and body["effective_mode"] == "shadow"
-    assert body["live_locked"] is True and "ADR-0008" in body["live_lock_reason"]
-    assert "optimizer_live_allowed=false" in body["live_lock_reason"]
+    assert body["live_locked"] is True
+    assert body["live_lock_reason"] == "climate_actuation.mode is not live"
     assert body["advisory"] is True and body["status"] == "planned"
     Draft202012Validator(SCHEMA).validate(body)
     st = service.status()["climate_plan"]
