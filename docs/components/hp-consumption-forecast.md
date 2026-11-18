@@ -74,5 +74,6 @@ energy on the plan's `meter_basis`).
 
 ## Status
 
-**planned** (2026-10-30): interface specified, not built. **LF-1 goes stale** the day the legacy rule is
-retired; it is parked as a forward-looking forecaster either way.
+**planned** (2026-10-30): interface specified, not built. **LF-1 stale since 2026-11-18**: the legacy space-heating
+rule was retired that day ([regime log](regime-log.md)), so its replay describes a rule that no longer runs; the plan
+the HP-plan interface would carry is now the optimizer's own climate plan ([ADR-0009](../adr/0009-live-climate-control.md)); it is parked as a forward-looking forecaster either way.

@@ -113,7 +113,8 @@ observed because it never acts.
 
 ## Status
 
-**provisional** (2026-10-31): offline replay; live shadow (B2) implemented, not deployed. Exploratory model, no gate yet.
-The climate actuator that would execute its plan exists in code since 2026-11-18 (`climate_actuation.mode: shadow`,
-nothing written; [regime log](regime-log.md)); the switch to live needs the owner's separate approval and marks this
-page `stale` for its 28-day settling clock ([ADR-0009](../adr/0009-live-climate-control.md)).
+**stale** (2026-11-18; provisional before): offline replay; the live shadow (B2) runs since 2026-10-31. Exploratory model, no gate yet.
+Since 2026-11-18 about 14:28 local its plan is executed: the optimizer's climate actuator writes the heat mode and the
+Z1 water target (`climate_actuation.mode: live`, owner approval, [regime log](regime-log.md),
+[ADR-0009](../adr/0009-live-climate-control.md)), so the legacy heat law, offsets and COP it was calibrated on no longer
+hold. The 28-day settling clock runs until 2026-12-16; the legacy window of the preregistration closes at the switch.

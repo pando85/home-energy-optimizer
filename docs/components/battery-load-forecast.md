@@ -112,7 +112,7 @@ nearly identical.
 
 ## Status
 
-**stale** (2026-11-03): the battery is commissioned, so the forecast now learns from reconstructed gross load
+**stale** (2026-11-03; 2026-11-18: the climate optimizer took over space heating, so the heat-pump load shape changes and the 28-day window mixes the legacy and the optimizer's regime until 2026-12-16, [regime log](regime-log.md); recheck the evening and morning slots then): the battery is commissioned, so the forecast now learns from reconstructed gross load
 (grid − charge + discharge after `battery.commissioned_at`, the grid counter alone before). The battery is live
 since 2026-11-03 23:45 (regime log), so the reconstruction now carries real charge and discharge; the load
 shape is unchanged. Recalibrate once the [data-pipeline](data-pipeline.md) reconstruction passes its

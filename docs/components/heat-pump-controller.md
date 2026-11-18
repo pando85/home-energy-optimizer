@@ -1,31 +1,32 @@
-# Heat-pump controller (legacy cheapest hours now, comfort controller next)
+# Heat-pump controller (optimizer's climate actuator for space heating, `dhw_control` for hot water)
 
 ## Purpose and owner
 
-Decides when the Panasonic Aquarea heats rooms and makes hot water. **Owner: the homelab repository**
-(AppDaemon `climate_control.py` and `dhw_control.py`, HA helpers, HeishaMon automations); this repository
-only observes it and replays it. Water-temperature control, its modes and the commands the unit accepts
-are documented in the homelab repository at `docs/user-guide/heat-pump-water-temperature.md`. This
-repository writes to it only through the climate actuator of [ADR-0009](../adr/0009-live-climate-control.md),
-which exists in code with `climate_actuation.mode: shadow` (nothing is written) until the owner approves the switch
-(shadow phase, [AGENTS.md](../../AGENTS.md)).
-The successor is specified in [comfort-controller-design](../planning/comfort-controller-design.md)
-(agreed 2026-10-31, not built; merged only once the house battery works): AppDaemon decides heating on/off
-from room temperatures, writes the water temperature from a software curve in direct mode and keeps DHW
-price-optimised with the tank target at most 50 degC (never the 3 kW heater).
-Open question of 2026-11-18, who owns DHW price scheduling after AppDaemon is retired, and the owner's decisions
-on the tank target: [dhw-price-scheduling](../planning/dhw-price-scheduling.md).
+Decides when the Panasonic Aquarea heats rooms and makes hot water. **Since 2026-11-18 (about 14:28 local) space
+heating is run by this repository's climate actuator ([ADR-0009](../adr/0009-live-climate-control.md))**: it writes the
+heat mode and the Z1 water target from the comfort MPC plan ([climate-mpc](climate-mpc.md)), in
+`climate_actuation.mode: live` with the owner's `input_select.climate_optimizer_mode` at `live`. **Hot water (DHW)
+stays with AppDaemon `dhw_control.py`** (homelab, owner decision 2026-11-18); thermostat setpoints stay manual.
+The legacy cheapest-hours space-heating rule (`climate_control.py`) is retired and archived in the homelab. The
+homelab still owns the HA helpers, the heartbeat watchdog `climate_optimizer_watchdog` and the HeishaMon automations.
+Water-temperature control, its modes and the commands the unit accepts are documented in the homelab repository at
+`docs/user-guide/heat-pump-water-temperature.md`. The AppDaemon comfort controller of
+[comfort-controller-design](../planning/comfort-controller-design.md) (drafts #4699 and #4746) was superseded by
+ADR-0009 and not built. Who owns DHW price scheduling once AppDaemon is gone is open, and the owner's decisions
+on the tank target are in [dhw-price-scheduling](../planning/dhw-price-scheduling.md).
 
 ## Interfaces
 
-- **In:** the PVPC price sensor, `input_number.appdaemon_climate_min_hours_per_day`, the enable toggles,
-  manual thermostat setpoints, and the water-target helper (absolute value, direct mode).
-- **Out:** operating mode `Heat+DHW` or `DHW`, `switch.aquarea_force_dhw_mode`; the unit's own water target.
-- **Successor interface (ADR-0009; code exists, mode `shadow`, nothing is written):** the optimizer's climate actuator
+- **Hot water (`dhw_control.py`, AppDaemon):** in the PVPC price sensor and the tank temperature; out
+  `switch.aquarea_force_dhw_mode`. Manual thermostat setpoints are inputs of the unit.
+- **Space heating, legacy (retired 2026-11-18):** `climate_control.py` read the PVPC price,
+  `input_number.appdaemon_climate_min_hours_per_day` and `input_boolean.appdaemon_climate_enable` and wrote the operating
+  mode; its helpers and watchdog are removed.
+- **Space heating, live since 2026-11-18 (ADR-0009):** the optimizer's climate actuator
   writes `input_select.heishamon_heatmode` (`Heat+DHW` / `DHW`, minimum on 30 min and off 20 min) and the integer
   Z1 water target `input_number.heishamon_heatshift_z1` (20 to 35 degC, direct mode only, steps of at least 1 K, once
-  per 15 min) and a heartbeat helper, only while `climate_actuation.mode` is `live`, the owner's
-  `input_select.climate_optimizer_mode` is `live` and `input_boolean.appdaemon_climate_enable` is not `on`. DHW
+  per 15 min) and a heartbeat helper, only while `climate_actuation.mode` is `live` and the owner's
+  `input_select.climate_optimizer_mode` is `live` (the legacy toggle no longer exists). DHW
   (`switch.aquarea_force_dhw_mode`, the tank target), the heater, setpoints and cooling stay out of its reach
   ([service](../service.md#live-climate-control-adr-0009)).
 - **Consumers:** the whole-house load that the [battery load forecast](battery-load-forecast.md) learns
@@ -126,7 +127,7 @@ Not fitted: the rules and `min_hours` were chosen by the owner. What exists is t
 
 - Any change of rule version, `min_hours`, enable flag, water target, curve or setpoint (log it first).
   A changed hour selection also needs a matching `structured_forecast.py` replay update.
-- The comfort controller goes live, the legacy rule is retired, the DHW rule changes (cheapest 2 h by
+- The comfort controller goes live, the legacy rule is retired (both done by the optimizer on 2026-11-18, regime log), the DHW rule changes (cheapest 2 h by
   price / COP, at most 50 degC) or boost starts: the load shape changes for every consumer listed above.
 - The heater facts change (tank target above about 51 degC, sterilization or "Force Heater" enabled, a
   power-limit input fitted, a model difference from the manual).
@@ -143,8 +144,8 @@ the scheduled time, and kWh per heating degree-day and Kh below 22 degC are no w
 
 ## KPIs
 
-Observability only; the controller is the legacy AppDaemon rule in the homelab repository, so the KPIs come from
-Home Assistant's own `hass_*` metrics. The thresholds are the section-B criteria of the
+Observability only; the KPIs come from Home Assistant's own `hass_*` metrics, and the actuator's own series are
+`battery_optimizer_climate_actuator_*`. The thresholds are the section-B criteria of the
 [preregistration](../planning/climate-preregistration-2026-27.md#3-b-comfort-controller-beforeafter-design-section-12);
 the comfort controller will be judged on the same series. `{R}` stands for
 the matcher `entity=~"climate.thermostat_(bedroom|hall_kitchen|office_t)"`. Dashboard: `Climate: heat-pump controller`
@@ -157,7 +158,7 @@ the matcher `entity=~"climate.thermostat_(bedroom|hall_kitchen|office_t)"`. Dash
 | Hall-kitchen below 23.5 degC in the weekday day window (at most 10%) | `avg_over_time((max(hass_climate_current_temperature_celsius{entity="climate.thermostat_hall_kitchen"}) < bool 23.5 and on() (hour() >= 11 and hour() < 21 and day_of_week() >= 1 and day_of_week() <= 5))[7d:5m])` (UTC 11 to 21 is local 12 to 22 in winter time, an hour off in summer time) |
 | Heating electricity per heating degree-day (at most +20% against the S3 baseline) | `sum(increase(hass_sensor_energy_kwh{entity="sensor.aquarea_heat_energy_consumed"}[1d])) / ((15 - avg_over_time(max(hass_sensor_unit_celsius{entity="sensor.aquarea_outside_ambient_temperature"})[1d:5m])) > 1)` (unit sensor, which reads low while running); offline `hack/climate_audit.py` and the replay's about 0.75 kWh/HDD |
 | Compressor starts per day (median at most 20) | `sum(increase(hass_sensor_state{entity="sensor.aquarea_compressor_start_stop_counter"}[1d]))` |
-| Rule activity: heating and hot-water hours against `min_hours` | `count_over_time((max(hass_sensor_power_w{entity="sensor.aquarea_heat_power_consumed"}) > 0)[1d:5m]) / 12` (and `dhw`) against `hass_input_number_state{entity="input_number.appdaemon_climate_min_hours_per_day"}`; `hass_input_boolean_state{entity="input_boolean.appdaemon_climate_enable"}`; `sum(increase(hass_automation_triggered_count_total{entity="automation.appdaemon_climate_watchdog"}[1d]))` |
+| Rule activity: heating and hot-water hours against `min_hours` | `count_over_time((max(hass_sensor_power_w{entity="sensor.aquarea_heat_power_consumed"}) > 0)[1d:5m]) / 12` (and `dhw`) against the plan; the legacy `min_hours` helper, enable toggle and `automation.appdaemon_climate_watchdog` were removed on 2026-11-18, the optimizer's writes, fallbacks and heartbeats are `battery_optimizer_climate_actuator_*` |
 | Heater safety (booster stays off) | `hass_binary_sensor_state{entity=~"binary_sensor.aquarea_(internal_heater_state\|external_heater_state\|force_heater_state\|sterilization_state)"}`; `sum by (entity) (increase(hass_sensor_unit_h{entity=~"sensor.aquarea_(room\|dhw)_heater_operating_hours"}[7d]))` (hot-water heater hours unchanged) |
 | Backup heater minutes outside defrost (target 0 a day; early November 2026: 0 outside defrost, 6 to 8 min a day inside it) | `sum_over_time(((max(hass_binary_sensor_state{entity=~"binary_sensor.aquarea_(internal\|external)_heater_state"}) > bool 0) * on() (1 - max(hass_binary_sensor_state{entity="binary_sensor.aquarea_defrost_active"})))[24h:1m])`; dashboard panel `Heater minutes outside defrost`; the homelab alert `HeatPumpHeaterOutsideDefrost` fires on heater on and defrost off for 5 minutes (decision in the heater facts above) |
 | Tank never above 50 degC | `max_over_time(max(hass_sensor_unit_celsius{entity="sensor.aquarea_tank_temperature"})[1d:5m])` |
@@ -168,6 +169,9 @@ hours, the mode it commanded): the legacy rule exports only the helpers above an
 
 ## Status
 
-**valid (legacy rule), being replaced** (2026-10-30; successor decided in ADR-0009 on 2026-11-18, **code exists,
-mode `shadow`, nothing written**; the switch needs the owner's separate approval). Space heating is off for the season; the optimizer as the space-heating writer is planned
-([regime log](regime-log.md#planned-not-yet-real-dates-to-be-filled-in)).
+**stale** (2026-11-18): space heating moved from the legacy cheapest-hours rule to the optimizer's climate actuator
+(live since about 14:28 local, [regime log](regime-log.md)); DHW stays with `dhw_control.py`. The legacy-rule
+calibration above (rule versions, `min_hours`, the S1 to S3 comfort history) describes the retired regime and is kept as
+the baseline of the before/after comparison. The 28-day settling clock runs until 2026-12-16; recalibrate by the
+section above on the window after it. Space heating is off for the season at the switch (operating mode `DHW` until the
+owner's first heating day), so the first live ticks are a handover check, not a comfort result.
