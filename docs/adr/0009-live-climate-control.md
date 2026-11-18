@@ -1,9 +1,9 @@
 # ADR-0009: Live climate control: the optimizer writes space heating
 
-- **Status:** **Accepted 2026-11-18 by the owner for build and deployment in shadow.** The switch to live
-  needs the owner's **separate explicit approval**, recorded in this ADR (see
-  [Switch to live](#switch-to-live-not-yet-approved)) and in the [regime log](../components/regime-log.md) on that
-  day. Until then nothing writes to the heat pump: the code ships with `climate_actuation.mode: shadow`, which has
+- **Status:** **Live since 2026-11-18 (owner approval; select live about 13:28 UTC).** Accepted 2026-11-18 by the owner
+  for build and deployment in shadow; the switch to live needed the owner's **separate explicit approval**, recorded in
+  this ADR (see [Switch to live](#switch-to-live-approved-and-done-2026-11-18)) and in the
+  [regime log](../components/regime-log.md). Before it the code shipped with `climate_actuation.mode: shadow`, which has
   no write path, exactly like the battery's `shadow`.
 - **Date:** 2026-11-18
 - **Decision owners:** Homelab maintainers (the owner took the decisions below on 2026-11-18)
@@ -241,7 +241,7 @@ commit** (it re-enables `climate_control.py` and its watchdog and removes this A
 optimizer never restores an earlier configuration; the water target and the mode stay at the last written values
 (the safe state is `Heat+DHW` at 26 degC).
 
-## Switch to live (not yet approved)
+## Switch to live (approved and done 2026-11-18)
 
 1. **Release** the actuator (a code PR against this ADR; docs and a regime-log `planned` row only until then).
 2. **Homelab PR deploying it with `climate_actuation.mode: shadow`** first (the select stays `shadow`): no write
@@ -258,7 +258,9 @@ optimizer never restores an earlier configuration; the water target and the mode
 5. **Regime-log row** and this ADR's record of the date and the owner's approval; the **28-day settling clock**
    starts; the five components above are marked `stale` in the same change, or recalibrated.
 
-Approval record: *pending. The owner's go for the switch is not given by the acceptance of this ADR.*
+Approval record: the owner approved the switch in chat on 2026-11-18 ("go live and verify that it works fine"); the homelab
+switch PR #4832 merged at 13:01:56 UTC (release 0.19.1) and the owner set `input_select.climate_optimizer_mode` to
+`live` at about 13:28 UTC. See the [regime log](../components/regime-log.md); the 28-day settling clock ends 2026-12-16.
 
 ## Open items
 

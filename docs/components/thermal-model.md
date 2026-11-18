@@ -79,5 +79,5 @@ counterpart under the comfort schedule.
 
 ## Status
 
-**parked** (2026-10-30, unchanged by B0 on 2026-10-31). Nothing acts on it; the battery side does not depend on it.
-B0's candidate is under its predeclared evaluation in the B2 shadow (implemented, not deployed); un-park only on that verdict.
+**parked, and stale for any future fit** (2026-11-18: the optimizer now writes the water target (20 to 35 degC) and the heat mode, so the apparent UA and the permission lever change, [regime log](regime-log.md); parked 2026-10-30, unchanged by B0 on 2026-10-31). Nothing acts on it; the battery side does not depend on it.
+B0's candidate is under its predeclared evaluation in the B2 shadow (running since 2026-10-31); un-park only on that verdict.

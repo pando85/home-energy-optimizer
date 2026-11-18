@@ -87,3 +87,6 @@ or cooling, and the allowlist of [ADR-0007](../adr/0007-live-battery-control.md)
 `dhw_control.py` is therefore not retired at the switch, and the question of this section (which component owns DHW
 once AppDaemon is gone) is deferred: a future DHW owner needs its own ADR. Items 1 and 2 of section 6 stay proposals
 for whoever owns DHW.
+
+Confirmed at the switch (2026-11-18, owner set the select `live` about 13:28 UTC): DHW stayed with AppDaemon `dhw_control.py`;
+only space heating moved to the optimizer ([regime log](../components/regime-log.md)).

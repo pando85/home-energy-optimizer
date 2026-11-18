@@ -60,5 +60,6 @@ A against efficiency-first B) crossed with the simulated battery. Owner: this re
 
 ## Status
 
-**valid as recorded** (2026-10-30) for legacy and the transferred efficiency-first regime; stale as a
-description of the comfort schedule from the day it goes live.
+**valid as recorded** (2026-10-30) for legacy and the transferred efficiency-first regime; **stale** (2026-11-18) as a
+description of the house: the optimizer's comfort plan went live that day, so the real load shape is neither A nor B
+([regime log](regime-log.md)). Replays made after it are not comparable with earlier ones.

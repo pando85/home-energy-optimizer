@@ -73,6 +73,6 @@ the model run on live data, which nothing does; offline only.
 
 ## Status
 
-**provisional** (2026-10-30): daily MAPE about 7.7% passes, season error about 5.0% fails the 3% limit.
+**provisional, stale for the new regime** (2026-11-18: the optimizer writes water targets of 20 to 35 degC, outside the 26 to 28 degC it was trained on, and changes compressor behaviour; [regime log](regime-log.md)); (2026-10-30): daily MAPE about 7.7% passes, season error about 5.0% fails the 3% limit.
 Not accepted, not used live. It stays a diagnostic baseline until the water-temperature trial supplies
 a wider lift range.
