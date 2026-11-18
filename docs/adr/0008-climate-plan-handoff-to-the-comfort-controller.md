@@ -1,6 +1,6 @@
 # ADR-0008: Climate plan handoff to the comfort controller
 
-- **Status:** **Proposed** (2026-11-05; not accepted). Nothing in this ADR authorises any climate actuation.
+- **Status:** **Proposed** (2026-11-05; not accepted); **superseded in part by [ADR-0009](0009-live-climate-control.md)** (2026-11-18). Nothing in this ADR authorises any climate actuation.
   The infrastructure it describes ships **disabled** and the optimizer stays read-only toward Home Assistant
   for climate. Acceptance is gated by the [preconditions](#preconditions-to-accept-this-adr-and-flip-the-lock)
   below; the climate C2 gate is still UNDETERMINED / no-go.
