@@ -80,6 +80,10 @@ guard already covers an overlap of DHW and charging ([heat-pump-controller](../c
 
 ## 8. Open
 
-Which component owns DHW once AppDaemon is retired: the optimizer (under a new ADR widening the write allowlist of
-[ADR-0007](../adr/0007-live-battery-control.md)) or a remaining AppDaemon app. This is decided in the
-[climate optimizer release plan](climate-optimizer-implementation.md), not here.
+**Decided 2026-11-18 (owner, [ADR-0009](../adr/0009-live-climate-control.md)): DHW stays with AppDaemon
+`dhw_control.py`** (force-DHW switch `switch.aquarea_force_dhw_mode`, tank target 50 degC) in the release in which the
+optimizer becomes the space-heating writer. The optimizer never writes DHW, the tank target, the heater, sterilization
+or cooling, and the allowlist of [ADR-0007](../adr/0007-live-battery-control.md) widened by ADR-0009 has no DHW entity.
+`dhw_control.py` is therefore not retired at the switch, and the question of this section (which component owns DHW
+once AppDaemon is gone) is deferred: a future DHW owner needs its own ADR. Items 1 and 2 of section 6 stay proposals
+for whoever owns DHW.

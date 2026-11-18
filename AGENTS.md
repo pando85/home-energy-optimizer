@@ -66,12 +66,17 @@ just release           # cut a release (see the release skill)
   owner's kill switch (never written); `switch.turn_on/off` on the Omnibattery weekly-full-charge switch and
   `select.select_option` on its day select (seven weekday values), only with `full_charge.enabled` and
   `full_charge.mode: live`
-  ([plan](docs/planning/periodic-full-charge.md)). Do not widen it, do not add any other service call, Modbus, REST write
+  ([plan](docs/planning/periodic-full-charge.md)). The climate writes of [ADR-0009](docs/adr/0009-live-climate-control.md)
+  are the same kind and the same gate, only with `climate_actuation.mode: live` and the owner's
+  `input_select.climate_optimizer_mode` at `live`: `input_select.select_option` on `input_select.heishamon_heatmode`
+  (`Heat+DHW` or `DHW`), `input_number.set_value` on `input_number.heishamon_heatshift_z1` (integer 20 to 35 degC) and
+  `input_datetime.set_datetime` on `input_datetime.climate_optimizer_heartbeat`, never DHW, heater, boost,
+  sterilization, cooling or setpoints. Do not widen it, do not add any other service call, Modbus, REST write
   or device, and never make `live` a default. The other exception is the non-mutating
   `weather.get_forecasts` query (with `return_response`) of the passive forecast archive, allowed only by the
   narrow check in `service/ha_guard.py`; do not widen it. Home Assistant tokens belong to non-admin users:
   the read-only `battery-optimizer` user's outside `mode: live`, the separate `battery-optimizer-live`
-  user's only in `mode: live`. Never commit a token value.
+  user's only in `mode: live` or `climate_actuation.mode: live`. Never commit a token value.
 - The container image holds no data and no git; `BATTERY_OPTIMIZER_GIT_SHA` is the build-time commit
   identity.
 
