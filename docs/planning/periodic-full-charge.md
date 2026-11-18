@@ -6,6 +6,8 @@
   marked). PRs 1 and 2 are merged (#81 solver and planner, #80 actuator, guard and config); PR 3 (scheduler,
   [implementation notes](#pr-3-implementation-notes)) is implemented. The feature ships off by default. Merging this plan authorises nothing on the installation: each
   implementation PR below is reviewed on its own, and the first live run is supervised.
+  **Deployment status (2026-11-18):** shadow since 2026-11-04 (interrupted 2026-11-08 to 11-11); switched to `full_charge.mode: live` by owner
+  decision on 2026-11-18 (homelab PR #4830, [regime log](../components/regime-log.md)); first live run supervised.
 - **Date:** 2026-11-04
 - **Decisions:** [ADR-0007](../adr/0007-live-battery-control.md) (live control; this plan amends it, text in
   [section 8](#8-adr-0007-amendment-text-and-agentsmd-edit)) and [ADR-0004](../adr/0004-battery-optimizer-production-architecture.md).

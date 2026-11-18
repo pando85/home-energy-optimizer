@@ -228,6 +228,8 @@ prices tomorrow once per evening after the regular plan is published (`planner.e
 day by the adaptive cadence of the balance readings, and from the decision on plans with the commit-mode target
 plan until the run ends. With the feature off (the committed default) nothing changes and no recalibration is due;
 the recalibration when it is switched on is the `dry_run` decision study above plus the first supervised run.
+2026-11-18: `full_charge.mode: live` ([regime log](regime-log.md)); the first supervised run changes the plant (charge to 100%, settle hold), so the status stays `stale`
+until that run is measured and the taper parameters are set from it.
 
 High-SOC dwell cost (2026-11-04, code only): `high_soc_cost` in the solver, the planner, the service config and the
 benchmark, default 0, so plans, `inputs_hash` and `config_hash` are byte-identical until a deploy sets it (set on
