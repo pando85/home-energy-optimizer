@@ -267,6 +267,17 @@ repo module).** 2026-10-01 to 11-17 (46 days) against 2026-06-01 to 09-30 (121 d
 manifest (the experiments fetched the public files separately); the PVPC sensor read 0 for the whole
 local day 2026-10-08 (outage, masked).
 
+**Reproduce:** both experiments are scripts, read-only, outputs in the data dir. The replay,
+`uv run python hack/price_info_replay.py report --from 2026-08-01 --to 2026-11-17 --fetch-omie`
+(106 days, slot execution) and `... report --minute --from 2026-11-04T00:00:00+00:00 --to 2026-11-17`
+(the 13 live days, minute execution; `--load lf0,perfect` adds the perfect-load variant), and the
+estimate accuracy, `uv run python hack/price_estimate_accuracy.py --fetch-omie` (default windows
+2026-10-01 to 11-17 and 2026-06-01 to 09-30). `--fetch-omie` fills the OMIE raw store with the
+repo's own `extract_omie` (public files, idempotent), which closes the store gap below. The accuracy
+script runs the repo's `omie_period` and `persistence` outlooks; `omie_period` gives the figures of
+the table to the third decimal, `persistence` and the weekly baseline differ in the hours that
+follow a PVPC data hole.
+
 **Decision.** GA still fails on the live regime: no estimated price goes into the MPC. Optional and
 small: a terminal value that reflects the overnight refill price. The OMIE estimate stays useful
 where ordering matters for a decision taken before the publication (the heat-pump and DHW
@@ -304,7 +315,7 @@ interval above zero).
 | Strategy | Captured | Effort and risk |
 |---|---|---|
 | A. A lower constant terminal value (config only, `planning.terminal_value: <number>`) | A constant about 30 % below the November trailing mean: about half | No code. Goes stale with the season; too low and the plan empties the battery before midnight when tomorrow morning or a non-cheap night would pay more |
-| B. Terminal value from the refill cost (for example the cheapest published valle price over the charge efficiency plus wear, capped by the trailing mean) | not measured | Small code change, tests and a shadow period; same edge cases as A but tracks the season; plans stay on published prices |
+| B. Terminal value from the refill cost (for example the cheapest published valle price over the charge efficiency plus wear, capped by the trailing mean) | about 42 % with the overnight reading (valle slots 00:00 to 08:00 of the latest published day), interval includes zero, and it fails the adoption rule (two weekdays slightly worse); about 53 % on the 13 November days. C minus B is within noise on the 106 days (interval includes zero), so B stays preferred. Reading every valle slot of the day (replay `refill_p3`) lets a weekend's midday trough set the value and loses about 5 % of the saving on the 106 days, interval below zero, mostly Saturdays and Sundays | Small code change, tests and a shadow period; same edge cases as A but tracks the season; plans stay on published prices |
 | C. Extend the horizon with estimated prices for tomorrow (`persistence` or `omie_period`) | about 64 % (`persistence`), about 58 % (`omie_period`); about 97 % on the 13 November days | Estimated prices would drive the 14:00 to 20:35 physical actions, against this plan's scope and the [periodic full-charge](periodic-full-charge.md) rule that an estimated price never decides a physical action; needs PO-E shadow, estimated-slot provenance in the live curve, and still a terminal value one day later |
 
 - C works for the same reason as B: it puts a cheap night inside the horizon. `persistence` does as
@@ -320,6 +331,14 @@ exist); (2) the battery, tariff or load-following changes. Rule: adopt a strateg
 weekly-block bootstrap interval of its paired daily gain lies above zero and no weekday gets worse;
 prefer B over C unless C beats B with an interval above zero; C additionally needs the owner to
 revisit the estimated-price rule.
+
+**Reproduce:** `uv run python hack/price_info_replay.py reanalysis --from <first day> --to <day after
+the last> [--minute] --fetch-omie` runs strategies A (a few constants, `--a-constants`), B
+(terminal-value rules `refill`, the overnight reading, and `refill_p3`) and C (`persistence`,
+`omie_period`) against the live trailing mean on the same replay as section 4. It prints, per
+candidate, the gain, the share of the ceiling, the weekly-block bootstrap interval, the gain by
+weekday and the adoption rule (interval above zero, no weekday worse), then C against B. The
+measured B above is the 2026-08-01 to 11-16 run (and 11-04 to 11-16 with `--minute`).
 
 **Larger levers, for priority.** The unit-side hot-water run at about 18:15 local
 ([DHW price scheduling](dhw-price-scheduling.md) section 2 and 6) is real peak consumption the
