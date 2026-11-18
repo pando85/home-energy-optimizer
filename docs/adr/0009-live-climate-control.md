@@ -127,7 +127,9 @@ token, and the allowlist in `ha_guard` is the restriction (Home Assistant cannot
 5. **Machine limits in code (not helpers, not plan-settable):**
    - compressor **minimum on 30 min and minimum off 20 min**, applied to the heat-mode command (after `Heat+DHW` no
      `DHW` for 30 min; after `DHW` no `Heat+DHW` for 20 min), the clocks taken from the observed `sensor.aquarea_mode`
-     changes and surviving a restart by that observation;
+     changes and surviving a restart by that observation. Two writes are exempt from the **minimum off** only: the
+     safe-state write (decision 7) and a comfort-floor breach (decision 6); the minimum on still applies to every
+     switch to `DHW`;
    - the water target is written **only in direct mode** (`sensor.aquarea_heating_mode` = 1, available; the mode is
      static, so an availability test and not an age test), as an **integer clamped to 20 to 35 degC**, only on a
      **change of at least 1 K** and **at most once per 15 min**; in curve mode (0) or with the sensor unavailable it
@@ -139,26 +141,30 @@ token, and the allowlist in `ha_guard` is the restriction (Home Assistant cannot
 
 6. **Comfort floors win.** A comfort room (`hall_kitchen`, `bedroom`, `office_t`; the rooms of the plan) below its
    floor forces `Heat+DHW` (with the planned or, without one, the safe water target) **whatever the plan says**, at
-   the earliest the machine limits allow (a floor breach waits for the minimum off, at most 20 min). The floor is the
+   once: a room below its floor outranks short-cycle protection, so the breach is exempt from the minimum off (as the
+   safe state is), while the minimum on still applies to switching heating off again. The floor is the
    per-room `input_number.comfort_floor_<room>` when present, fresh (at most 2 h old) and in 18 to 23 degC, else the
    configured value, **default 21 degC**; it releases at the floor plus `climate_actuation.floor_margin_c` (default
-   0.5 K). The plan can never lower a floor or shorten the comfort schedule. A room with a missing or `unavailable`
+   0.5 K), which is the hysteresis against chatter. The plan can never lower a floor or shorten the comfort schedule. A room with a missing or `unavailable`
    reading cannot be proven below its floor and is skipped; no usable room reading at all is "observer without
    state" (decision 7).
 
 7. **Fallback = the safe heating state.** On any of: a stale, missing or invalid plan (including a plan not solved
    by this process, so after a restart), a solver failure (`plan_failed`), an observer without state, no usable
-   room reading, a guard failure, the owner's select leaving `live`, or a legacy writer still active (below), the
+   room reading, a guard failure, or the owner's select leaving `live`, the
    actuator **writes the safe state once** (`Heat+DHW`; water target `climate_actuation.safe_water_target_c`,
    default **26 degC**, the current legacy direct target, only in direct mode) and **then stops writing** (the
    heartbeat continues while the select is `live`) until a valid plan returns. The safe-state write is exempt from
-   the 15-minute water rate limit and from the minimum off (leaving heating off is the safe direction, as the legacy
-   watchdog does); it is never exempt from validation. **The worst case is extra kWh, never no heating**, and the
+   the 15-minute water rate limit and from the minimum off (turning heating **on** is the safe direction, as the
+   legacy watchdog does); it is never exempt from validation. **The worst case is extra kWh, never no heating**, and the
    thermostats keep protecting the rooms through the floor valves. After a restart the first decision runs at once
    instead of waiting for HH:10 and the safe state holds until it has a plan.
    *One writer only:* while `input_boolean.appdaemon_climate_enable` reads `on` (the legacy controller is active)
-   the actuator refuses to write (guard reason `legacy_writer_active`); a missing helper counts as off, which is its
-   state after the switch commit removes it.
+   the actuator **writes nothing at all**: no plan-driven write, **no safe state and no heartbeat** (guard reason
+   `legacy_writer_active`). It is deliberately not a fallback trigger, because a safe-state write would be a second
+   writer next to the legacy controller. A missing helper counts as off, which is its state after the switch commit
+   removes it. The HA watchdog is unaffected: it acts only while the select is `live`, and the switch procedure turns
+   the legacy toggle off (and disables the app) before the select goes `live`.
 
 8. **Heartbeat and HA watchdog (homelab).** While `climate_actuation.mode` is `live` and the select is `live`,
    every tick that ends reconciled (the desired state, or at least the safe state, confirmed) writes
@@ -246,7 +252,7 @@ optimizer never restores an earlier configuration; the water target and the mode
    `files/service-overrides.yaml`; remove `automation.appdaemon_climate_watchdog` and `input_boolean.appdaemon_climate_enable`;
    **disable and archive `climate_control.py`** (and its helpers) in homelab. The PR states the expected
    `Heating_Mode` (1), who controls DHW (`dhw_control`), and how to verify the pump after stopping the legacy app.
-4. **The owner sets the select to `live` on a day they are home** and a heating day, watching the first runs:
+4. **Before the select goes `live`, the legacy toggle `input_boolean.appdaemon_climate_enable` is off (or its helper gone with the switch commit) and the app disabled.** **The owner then sets the select to `live` on a day they are home** and a heating day, watching the first runs:
    mode and water writes, heartbeat, a floor override, a fallback (stop the pod and watch the watchdog after 10 min).
 5. **Regime-log row** and this ADR's record of the date and the owner's approval; the **28-day settling clock**
    starts; the five components above are marked `stale` in the same change, or recalibrated.
@@ -266,8 +272,8 @@ Approval record: *pending. The owner's go for the switch is not given by the acc
 - **Dwell semantics.** Minimum on 30 min and off 20 min act on the heat-mode command, not on a compressor signal
   (the compressor also runs for DHW and defrost and is the unit's own). Whether to also read the compressor state is
   not decided.
-- **Safe state exempt from the minimum off** is a decision of this ADR, not measured: the unit has its own
-  compressor protections.
+- **Safe state and floor breach exempt from the minimum off** is a decision of this ADR, not measured: the unit has
+  its own compressor protections, and a cold room outranks short-cycle protection.
 - **Comfort floor and day-minimum helpers** do not exist; until they do the floor is the configured 21 degC. The
   owner's starting values are in [comfort-controller-design](../planning/comfort-controller-design.md) section 3.
   `input_boolean.comfort_away` and `input_boolean.comfort_control_enable` (read absent-tolerant by the shadow) do not
