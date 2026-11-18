@@ -144,7 +144,8 @@ token, and the allowlist in `ha_guard` is the restriction (Home Assistant cannot
    once: a room below its floor outranks short-cycle protection, so the breach is exempt from the minimum off (as the
    safe state is), while the minimum on still applies to switching heating off again. The floor is the
    per-room `input_number.comfort_floor_<room>` when present, fresh (at most 2 h old) and in 18 to 23 degC, else the
-   configured value, **default 21 degC**; it releases at the floor plus `climate_actuation.floor_margin_c` (default
+   configured value, **default 21 degC** (**amended 2026-11-18:** available and in range, no age test, see the
+   [amendment](#amendment-2026-11-18-floor-helpers-have-no-age-test)); it releases at the floor plus `climate_actuation.floor_margin_c` (default
    0.5 K), which is the hysteresis against chatter. The plan can never lower a floor or shorten the comfort schedule. A room with a missing or `unavailable`
    reading cannot be proven below its floor and is skipped; no usable room reading at all is "observer without
    state" (decision 7).
@@ -294,3 +295,15 @@ Approval record: *pending. The owner's go for the switch is not given by the acc
 | A separate token for climate | Rejected: the live user's token is already mounted; the allowlist is the restriction (Home Assistant cannot scope tokens) |
 | Heartbeat shared with the battery's | Rejected: a battery fault must not hide a climate fault and the reverse; separate helper, watchdog and thresholds |
 | Writing thermostat setpoints (optimum start) | Not in this release (owner decision 4) |
+
+## Amendment 2026-11-18: floor helpers have no age test
+
+Decision 6 said the per-room `input_number.comfort_floor_<room>` counts only when "fresh (at most 2 h old)". That
+was wrong for a helper the owner sets by hand: it never changes or re-reports on its own, so after about 2 h the
+actuator would have ignored any owner floor and fallen back to `floor_c` (21). The helper is static configuration,
+like `sensor.aquarea_heating_mode`, which this ADR already treats by availability. From this amendment the helper is
+used when it is **available in the Home Assistant session** (a finite number, not `unknown` or `unavailable`) and in
+18 to 23 degC; otherwise the configured value applies. There is no age test. Nothing is written outside a synced
+session (`ha_not_synced`), so a floor is only ever acted on while the session is synced. The rest of decision 6 is
+unchanged. The climate shadow's Prometheus read keeps its 2 h rule: the exporter emits a sample on every scrape, so
+a sample age there is a scrape-freshness test, not a configuration age.

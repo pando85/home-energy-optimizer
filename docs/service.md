@@ -1492,8 +1492,9 @@ A payload that is not a finite integer in range never leaves the process (`Write
 
 **Comfort floors win.** A comfort room (`climate_actuation.entities.rooms`: `hall_kitchen`, `bedroom`, `office_t`)
 whose thermostat reads below its floor forces `Heat+DHW` whatever the plan says, with the planned water target or,
-in an off slot, `safe_water_target_c`. The floor is `input_number.comfort_floor_<room>` when present, at most 2 h
-old and within 18 to 23 degC, else `floor_c` (default 21). The override releases at the floor plus
+in an off slot, `safe_water_target_c`. The floor is `input_number.comfort_floor_<room>` when available (a finite
+number, not `unknown` or `unavailable`; no age test, an owner-set helper never re-reports) and within 18 to 23 degC,
+else `floor_c` (default 21). The override releases at the floor plus
 `floor_margin_c` (0.5 K). A room with a missing, unavailable, implausible or older than `room_max_age_s` (3600)
 reading is skipped; none usable at all is a fallback (`no_room_reading`).
 

@@ -99,8 +99,8 @@ WATER_MIN_STEP_K = 1.0
 WATER_MIN_INTERVAL_S = 15 * 60.0
 #: Least time between two writes to one entity (the HA automations mute their mirror for 5 s).
 MIN_WRITE_GAP_S = 10.0
-#: The per-room comfort-floor helper is used when at most this old and in this range (degC).
-FLOOR_HELPER_MAX_AGE_S = 2 * 3600.0
+#: The per-room comfort-floor helper is used when available and in this range (degC); it is
+#: static owner configuration that never re-reports, so its age is not tested.
 FLOOR_HELPER_RANGE_C = (18.0, 23.0)
 #: A thermostat reading outside this range is a sensor fault, not a temperature.
 _ROOM_PLAUSIBLE_C = (-10.0, 50.0)
@@ -376,7 +376,7 @@ class ClimateActuator:
         floors: dict[str, float] = {}
         for room, entity in e.rooms.items():
             rooms[room] = self._room_temperature(entity, now)
-            floors[room] = self._floor(room, now)
+            floors[room] = self._floor(room)
         return _Readings(
             owner=owner,
             legacy_on=legacy_on,
@@ -404,15 +404,18 @@ class ClimateActuator:
         low, high = _ROOM_PLAUSIBLE_C
         return float(raw) if low <= raw <= high else None
 
-    def _floor(self, room: str, now: datetime) -> float:
-        """The room's comfort floor: its helper if present, fresh and in range, else the config."""
+    def _floor(self, room: str) -> float:
+        """The room's comfort floor: its helper if available and in range, else the config.
+
+        An owner-set ``input_number`` never changes or re-reports on its own, so its age says
+        nothing; availability in the HA session is the test (like ``heating_mode``). Nothing is
+        written outside a synced session (``ha_not_synced``), so the floor is only acted on then.
+        """
         state = self._store.get(self.ents.floor_helper(room))
-        if state is not None and state.available:
-            value = state.numeric()
-            low, high = FLOOR_HELPER_RANGE_C
-            fresh = (now - state.observed_at).total_seconds() <= FLOOR_HELPER_MAX_AGE_S
-            if value is not None and fresh and low <= value <= high:
-                return value
+        value = state.numeric() if state is not None else None
+        low, high = FLOOR_HELPER_RANGE_C
+        if value is not None and low <= value <= high:
+            return value
         return self.settings.floor_c
 
     async def _refresh_entities(self) -> None:
