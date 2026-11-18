@@ -144,6 +144,36 @@ the service config's directory). No new variable or credential: it uses `BATTERY
 and the read-only token, and reads three optional HA helpers of the homelab comfort controller. Set
 `climate_shadow.go_live` on its go-live day. Keys and ops: [shadow service](service.md#climate-shadow-track-b2).
 
+### Live climate control (`climate_actuation`)
+
+`climate_actuation:` in `config/service.yaml` is the heat pump's counterpart of `mode:` ([ADR-0009](adr/0009-live-climate-control.md)):
+`shadow` (the default and the committed value) has no climate actuator and no write path; `dry_run` runs the whole
+actuator and records the writes it would make under `<data dir>/service/v1/climate_actuation/`, sending nothing;
+`live` sends them through the `ha_guard` allowlist (the heat-mode select with `Heat+DHW` / `DHW`, the Z1 water
+target as an integer 20 to 35, the climate heartbeat), only while the owner's `input_select.climate_optimizer_mode`
+reads `live` and `input_boolean.appdaemon_climate_enable` is not `on`. It is independent of the battery's `mode:`,
+needs `climate_shadow.enabled` (and its prior) for `dry_run` and `live`, needs no new credential (the live user's
+token the service already holds) and is excluded from the battery plan's config hash. Changing the mode is a
+homelab config change of the deployed `service.yaml`, never an environment variable.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mode` | `shadow` | `shadow`, `dry_run` or `live`; anything else is refused at load (a bare YAML `off` is a boolean: refused) |
+| `tick_interval_s` | 60 | Tick of the actuator task, at most 120 |
+| `floor_margin_c` | 0.5 | A comfort-floor override releases at floor plus this, 0 to 2 K |
+| `floor_c` | 21.0 | Floor of a room without a usable `comfort_floor_<room>` helper (helper: fresh within 2 h, 18 to 23 degC), 18 to 23 |
+| `safe_water_target_c` | 26 | Water target of the safe state, an integer 20 to 35, written only in direct mode |
+| `readback_timeout_s`, `max_attempts` | 30, 3 | A write stays unconfirmed this long before a retry; tries per write (at most 5), at least 10 s apart |
+| `shutdown_timeout_s` | 20 | How long the safe state at SIGTERM is attempted |
+| `room_max_age_s` | 3600 | A thermostat reading older than this is not usable |
+| `entities.heat_mode`, `water_target`, `heartbeat` | `input_select.heishamon_heatmode`, `input_number.heishamon_heatshift_z1`, `input_datetime.climate_optimizer_heartbeat` | **Written** (live only); domain-checked, distinct, the heartbeat must not be the battery's |
+| `entities.observed_mode`, `heating_mode`, `water_request`, `legacy_enable` | `sensor.aquarea_mode`, `sensor.aquarea_heating_mode`, `sensor.aquarea_z1_heat_request_temperature`, `input_boolean.appdaemon_climate_enable` | Only read (readback, dwell clocks, direct mode, the legacy toggle) |
+| `entities.rooms`, `floor_helper_prefix` | `hall_kitchen`, `bedroom`, `office_t` thermostats; `input_number.comfort_floor_` | The comfort rooms (`current_temperature`) and the optional per-room floor helpers |
+
+The heat-mode options, the water range and the machine limits (minimum on 30 min, minimum off 20 min, water only in
+direct mode, steps of at least 1 K, once per 15 min, 10 s between writes to one entity) are code, not settings. Keys,
+behaviour, metrics and the switch procedure: [service.md](service.md#live-climate-control-adr-0009).
+
 ### No recurring scheduler yet
 
 There is no recurring scheduler, cron job, or Kubernetes CronJob wired up for this toolkit yet.

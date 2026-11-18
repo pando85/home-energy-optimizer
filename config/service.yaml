@@ -434,3 +434,45 @@ climate_shadow:
     # The owner's mode select, options exactly off / shadow / live (input_select, created by the
     # homelab).  Read only, like the battery kill switch; absent or unreadable: optimizer_mode.
     mode: input_select.climate_optimizer_mode
+
+# Live climate control (ADR-0009): the optimizer is the only writer of space heating (the heat-pump
+# operating mode and the Z1 water target).  INDEPENDENT of the battery's `mode`.  mode: shadow
+# (default) has NO climate actuator and NO climate write path; dry_run runs the whole actuator and
+# records every write it would make under <data_dir>/service/v1/climate_actuation/, sending nothing;
+# live sends, and only when the owner's select climate_shadow.entities.mode reads `live` AND the
+# legacy controller's toggle entities.legacy_enable is not `on`.  Needs climate_shadow.enabled (the
+# plan it solves in this process).  The guard admits exactly input_select.select_option on
+# entities.heat_mode (options Heat+DHW / DHW only), input_number.set_value on entities.water_target
+# (integers 20 to 35) and input_datetime.set_datetime on entities.heartbeat; the options, the range
+# and the machine limits (min on 30 min, min off 20 min, water only in direct mode, change of at least
+# 1 K, once per 15 min, 10 s between writes to one entity) are code, not settings.  Never DHW, the
+# heater, setpoints or cooling.  mode is one of shadow, dry_run, live.
+climate_actuation:
+  mode: shadow
+  tick_interval_s: 60                 # at most 120 (the HA watchdog acts after 10 min without a heartbeat)
+  floor_margin_c: 0.5                 # a comfort-floor override releases at floor + this (hysteresis)
+  floor_c: 21.0                       # comfort floor of a room without a usable helper (18 to 23)
+  safe_water_target_c: 26             # the safe state's water target (integer 20 to 35), direct mode only
+  readback_timeout_s: 30              # a write stays unconfirmed at most this long before a retry
+  max_attempts: 3                     # tries per write (at least 10 s apart), then a failure
+  shutdown_timeout_s: 20              # safe state at SIGTERM is attempted at most this long
+  room_max_age_s: 3600                # an older thermostat reading is not usable
+  entities:
+    # Written (live mode only).  heat_mode is the select the homelab "Set heatmode" automation
+    # turns into the MQTT operating mode; water_target is the shared Z1 helper (min -5, max 40: the
+    # guard narrows it to 20 to 35); heartbeat is the climate watchdog's helper (not the battery's).
+    heat_mode: input_select.heishamon_heatmode
+    water_target: input_number.heishamon_heatshift_z1
+    heartbeat: input_datetime.climate_optimizer_heartbeat
+    # Only read.
+    observed_mode: sensor.aquarea_mode                              # the unit's mode (readback, dwell clocks)
+    heating_mode: sensor.aquarea_heating_mode                       # 1 direct, 0 curve: water writes need 1
+    water_request: sensor.aquarea_z1_heat_request_temperature       # the unit's Z1 request (readback)
+    legacy_enable: input_boolean.appdaemon_climate_enable           # on = legacy controller active: write nothing
+    # Comfort rooms (the preregistered gate rooms) and their thermostats (current_temperature).
+    rooms:
+      hall_kitchen: climate.thermostat_hall_kitchen
+      bedroom: climate.thermostat_bedroom
+      office_t: climate.thermostat_office_t
+    # Optional per-room floor helpers <prefix><room> (18 to 23, at most 2 h old); absent: floor_c.
+    floor_helper_prefix: input_number.comfort_floor_

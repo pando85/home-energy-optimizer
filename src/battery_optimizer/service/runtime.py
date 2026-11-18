@@ -50,7 +50,18 @@ failure is counted and reported and never touches readiness or the battery plann
 is also shaped into an advisory ClimatePlan (:mod:`battery_optimizer.climate.plan_export`) that
 ``GET /climate/plan`` serves while the owner's mode select (read-only, like the battery kill switch;
 else ``climate_shadow.optimizer_mode``, default ``off``) says ``shadow`` or ``live``: ``live`` is a
-request only, the effective mode is never ``live``, and nothing is written anywhere.
+request only unless ``climate_actuation.mode`` is ``live`` (then the effective mode is ``live``).
+
+Live climate control (ADR-0009)
+-------------------------------
+In ``dry_run`` and ``live`` a :class:`~.climate_actuator.ClimateActuator` runs as its own task on
+``climate_actuation.tick_interval_s`` (and at every new plan, HA sync and change of the owner's
+select or the legacy toggle): it turns the climate shadow's latest plan **solved by this process**
+into the heat-pump operating mode and Z1 water target, behind the owner's select, the legacy
+controller's toggle, the machine limits and the safe-state fallback.  Only ``live`` puts its
+three entities on the HA client's :class:`~.ha_guard.ActuationAllowlist`; a failure never touches
+the battery planner, the battery actuator or readiness, and a graceful stop attempts the safe state
+before the HA session closes.
 
 Safety
 ------
@@ -109,6 +120,7 @@ from .archive import (
     weather_forecast_record,
 )
 from .battery_health import BatteryHealth, HealthParams, parse_text, parse_timestamp
+from .climate_actuator import ClimateActuator, ClimateContext
 from .climate_shadow import ClimateShadowJob, build_job, latest_forecast, next_run_time
 from .clock import Clock
 from .config import ServiceConfig
@@ -164,6 +176,12 @@ _ACTUATION_TEXT = {
     "shadow": "none (read-only adapters; intents are recorded, never sent)",
     "dry_run": "none (writes are computed and recorded under actuation/, never sent)",
     "live": "Omnibattery entities through the ha_guard allowlist, gated by the kill switch",
+}
+_CLIMATE_ACTUATION_TEXT = {
+    "shadow": "none (the plan is advisory only; climate_actuation.mode: shadow)",
+    "dry_run": "none (writes are computed and recorded under climate_actuation/, never sent)",
+    "live": "heat mode and Z1 water target through the ha_guard allowlist, gated by the owner's "
+    "select (ADR-0009)",
 }
 _PLAN_MEMORY = 16
 #: How often a slot that opened without an intent is re-evaluated for a late adoption.
@@ -308,7 +326,10 @@ class ShadowService:
 
         climate_entities = config.climate_shadow.entities() if config.climate_shadow.enabled else ()
         acting = config.mode != "shadow"
+        climate_acting = config.climate_actuation.mode != "shadow"
         actuation_entities = config.actuation.entities.all() if acting else ()
+        if climate_acting:  # the heat pump's control surface, the thermostats, the floor helpers
+            actuation_entities = (*actuation_entities, *config.climate_actuation.entities.all())
         if config.planning.soc_source == "entity" and config.actuation.entities.battery_liveness:
             # The entity SOC is only trusted while Omnibattery reports the battery responsive.
             actuation_entities = (*actuation_entities, config.actuation.entities.battery_liveness)
@@ -379,6 +400,7 @@ class ShadowService:
             actuation=acting,
             full_charge=fc_cfg.enabled,
             thermal=self.thermal is not None,
+            climate_actuation=climate_acting,
         )
         from battery_optimizer import __version__
 
@@ -475,6 +497,20 @@ class ShadowService:
         self._actuator_task: asyncio.Task[None] | None = None
         self._actuator_wake = asyncio.Event()
         self._overcap_wake_at: datetime | None = None
+        self.climate_actuator: ClimateActuator | None = None
+        self._climate_actuator_task: asyncio.Task[None] | None = None
+        self._climate_actuator_wake = asyncio.Event()
+        if climate_acting:
+            self.climate_actuator = ClimateActuator(
+                settings=config.climate_actuation,
+                owner_entity=config.climate_shadow.mode_entity or "",
+                store=self.store,
+                clock=clock,
+                send=self._send_actuation,
+                refresh=self._refresh_entities,
+                record=self._record_climate_actuation,
+                metrics=self.metrics,
+            )
         if acting:
             self.actuator = Actuator(
                 settings=config.actuation,
@@ -498,6 +534,9 @@ class ShadowService:
                 sink=self.sink,
                 code_version=code_version,
                 metrics=self.metrics,
+                # With an actuator the first run after a restart decides again, so it acts on a
+                # plan this process solved (ADR-0009 decision 7).
+                redecide_foreign=climate_acting,
             )
         )
 
@@ -546,9 +585,22 @@ class ShadowService:
             )
         if self.actuator is not None:
             self._actuator_task = asyncio.create_task(self._actuator_loop(), name="actuator")
+        if self.climate_actuator is not None:
+            self._climate_actuator_task = asyncio.create_task(
+                self._climate_actuator_loop(), name="climate-actuator"
+            )
 
     async def stop(self) -> None:
         self._generation += 1  # fence any in-flight solve
+        if self.climate_actuator is not None:
+            # No tick may race the shutdown write; then the safe state while HA is still connected.
+            if self._climate_actuator_task is not None:
+                self._climate_actuator_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._climate_actuator_task
+                self._climate_actuator_task = None
+            with contextlib.suppress(Exception):
+                await self.climate_actuator.shutdown()
         if self.actuator is not None:
             # No tick may race the shutdown write; then safe idle while HA is still connected.
             if self._actuator_task is not None:
@@ -587,6 +639,7 @@ class ShadowService:
         self.observer.mark_synced(self.clock.now())
         self._ha_synced.set()
         self._wake_actuator()
+        self._wake_climate_actuator()
         self._spawn(
             self._record_event("ha_synced", {"resyncs": self.ha.stats.resyncs if self.ha else 0})
         )
@@ -619,6 +672,8 @@ class ShadowService:
         role = self.config.entities.role_of(state.entity_id)
         if self.actuator is not None:
             self._actuation_wake_on(state, role, result)
+        if self.climate_actuator is not None:
+            self._climate_wake_on(state)
         if (
             role == "price"
             and result is UpdateResult.ACCEPTED
@@ -831,6 +886,7 @@ class ShadowService:
             log.exception("climate shadow run failed")
             return None
         self.climate_error = None
+        self._wake_climate_actuator()  # a new plan: act on it now, not at the next tick
         log.info(
             "climate shadow run t0=%s status=%s regime=%s",
             summary.get("t0"),
@@ -848,7 +904,11 @@ class ShadowService:
             catch_up = False
             # at start, catch up the current boundary once its offset has passed (the job skips a
             # boundary it already decided)
-            if first and now >= floor_slot(now, 3600) + offset:
+            # with a climate actuator the first run is at once: until it has a plan of its own
+            # the actuator holds the safe state
+            if first and (
+                self.climate_actuator is not None or now >= floor_slot(now, 3600) + offset
+            ):
                 due = now
                 catch_up = True
             elif self.climate is not None:
@@ -879,11 +939,14 @@ class ShadowService:
 
     def climate_mode(self) -> plan_export.ModeState:
         """The owner's mode: the HA select's state (read only, from the entity store), else the
-        configured fallback.  Never ``live`` in effect (see :mod:`.plan_export`)."""
+        configured fallback.  ``live`` in effect only with ``climate_actuation.mode: live``
+        (see :mod:`.plan_export`)."""
         s = self.config.climate_shadow
         entity = self.store.get(s.mode_entity) if s.mode_entity else None
         state = entity.state if entity is not None and entity.available else None
-        return plan_export.resolve_mode(state, s.optimizer_mode)
+        return plan_export.resolve_mode(
+            state, s.optimizer_mode, live_allowed=self.config.climate_actuation.mode == "live"
+        )
 
     def _climate_plan_now(self) -> tuple[dict[str, Any] | None, plan_export.ModeState, datetime]:
         plan = self.climate.plan if self.climate is not None else None
@@ -940,10 +1003,10 @@ class ShadowService:
         plan, summary, mode = view["plan"], view["summary"], view["mode"]
         return {
             "advisory": True,
-            "actuation": "none (the optimizer only publishes an advisory plan; ADR-0008 proposed)",
+            "actuation": _CLIMATE_ACTUATION_TEXT[self.config.climate_actuation.mode],
             "state": view["state"],
             **mode.fields(),
-            "live_allowed": plan_export.LIVE_ALLOWED,
+            "live_allowed": self.config.climate_actuation.mode == "live",
             "plan_id": plan["plan_id"] if plan else None,
             "status": plan["status"] if plan else None,
             "generated_at": plan["generated_at"] if plan else None,
@@ -2591,6 +2654,51 @@ class ShadowService:
             self.sink.append_actuation, at, {**record, "code_version": self.code_version}
         )
 
+    def _wake_climate_actuator(self) -> None:
+        if self.climate_actuator is not None:
+            self._climate_actuator_wake.set()
+
+    def _climate_wake_on(self, state: EntityState) -> None:
+        """Wake the climate actuator on a change of the owner's select or the legacy toggle."""
+        ents = self.config.climate_actuation.entities
+        if state.entity_id in (self.config.climate_shadow.mode_entity, ents.legacy_enable):
+            self._wake_climate_actuator()
+
+    def climate_actuation_context(self, now: datetime) -> ClimateContext:
+        """The climate shadow's latest plan and whether this process solved it."""
+        job = self.climate
+        return ClimateContext(
+            now=now,
+            ha_synced=self.ha is not None and self.ha.stats.synced,
+            plan=job.plan if job is not None else None,
+            plan_own=job.plan_own if job is not None else False,
+            plan_status=job.plan_status if job is not None else None,
+        )
+
+    async def _record_climate_actuation(self, at: datetime, record: dict[str, Any]) -> None:
+        await self._write(
+            self.sink.append_climate_actuation, at, {**record, "code_version": self.code_version}
+        )
+
+    async def _climate_actuator_loop(self) -> None:
+        assert self.climate_actuator is not None
+        tick_s = self.config.climate_actuation.tick_interval_s
+        while True:
+            self._climate_actuator_wake.clear()
+            try:
+                await self.climate_actuator.tick(self.climate_actuation_context(self.clock.now()))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the loop must survive one bad tick
+                log.exception("climate actuator tick failed")
+            sleep = asyncio.ensure_future(self.clock.sleep(tick_s))
+            wake = asyncio.ensure_future(self._climate_actuator_wake.wait())
+            try:
+                await asyncio.wait({sleep, wake}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (sleep, wake):
+                    task.cancel()
+
     async def _actuator_loop(self) -> None:
         assert self.actuator is not None
         while True:
@@ -2681,6 +2789,11 @@ class ShadowService:
             **({"thermal": self._thermal_view(now)} if self.thermal is not None else {}),
             **({"actuator": self.actuator.snapshot()} if self.actuator is not None else {}),
             **(
+                {"climate_actuator": self.climate_actuator.snapshot()}
+                if self.climate_actuator is not None
+                else {}
+            ),
+            **(
                 {"full_charge": self._full_charge_metric(now)}
                 if self.full_charge is not None
                 else {}
@@ -2751,6 +2864,11 @@ class ShadowService:
             "config_hash": self.config.config_hash(),
             "config_overrides": self.config.override_values(),
             **({"actuator": self.actuator.view()} if self.actuator is not None else {}),
+            **(
+                {"climate_actuator": self.climate_actuator.view()}
+                if self.climate_actuator is not None
+                else {}
+            ),
             **(
                 {"full_charge": self._full_charge_status(now)}
                 if self.full_charge is not None

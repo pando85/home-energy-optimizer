@@ -233,6 +233,8 @@ class FakeHAServer:
         self.connections: list[FakeConnection] = []
         self.all_sent: list[dict[str, Any]] = []
         self.service_calls: list[dict[str, Any]] = []
+        #: written entity -> entity that echoes the write back (the unit's own state), if any
+        self.mirrors: dict[str, str] = {}
         self.connect_attempts = 0
 
     async def connect(self, url: str, *, timeout: float) -> FakeConnection:
@@ -291,14 +293,23 @@ class FakeHAServer:
             at = datetime.now(UTC)
             if message["domain"] == "switch":
                 value: Any = "on" if message["service"] == "turn_on" else "off"
-            elif message["domain"] == "number":
+            elif message["domain"] in ("number", "input_number"):
                 value = data["value"]
+            elif message["domain"] == "input_select":
+                value = data["option"]
             else:
                 value = datetime.fromtimestamp(data["timestamp"], UTC).isoformat()
             old = self.states.get(entity, {})
             payload = ha_state(entity, value, at, attributes=old.get("attributes"))
             self.states[entity] = payload
             conn.push_state(payload)
+            mirror = self.mirrors.get(entity)
+            if mirror is not None:  # the homelab automation -> MQTT -> unit -> state topic path
+                echo = ha_state(
+                    mirror, value, at, attributes=(self.states.get(mirror) or {}).get("attributes")
+                )
+                self.states[mirror] = echo
+                conn.push_state(echo)
         elif kind == "call_service":
             self.service_calls.append(message)
             if b.get("weather_error"):

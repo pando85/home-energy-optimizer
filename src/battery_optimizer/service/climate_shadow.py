@@ -17,6 +17,13 @@ DHW plan helper and an optional away switch, each absent-tolerant), and the weat
 newest record of the service's own passive archive.  Nothing here sends anything to Home
 Assistant; records land under ``<data_dir>/service/v1/climate_*`` (append-only).
 
+The latest plan is also what the climate actuator acts on (ADR-0009, :mod:`.climate_actuator`),
+but only a plan **solved by this process** (:attr:`ClimateShadowJob.plan_own`: not one rebuilt from
+the store at load).  With ``redecide_foreign`` (set when an actuator exists) the first run after a
+restart decides its boundary again even if the previous process already did, so the actuator has
+an own plan at once; that second record of the same ``t0`` is flagged ``redecision`` and is never
+queued for scoring twice.
+
 A failure is counted, logged and recorded; it never touches the battery planner's readiness.
 """
 
@@ -178,6 +185,7 @@ class ClimateShadowJob:
         code_version: str,
         plan_settings: PlanSettings | None = None,
         metrics: Any = None,
+        redecide_foreign: bool = False,
     ) -> None:
         check_configs(climate_config, mpc_config)
         if tuple(climate_config.comfort.rooms) != shadow_gates.GATE_ROOMS:
@@ -211,6 +219,12 @@ class ClimateShadowJob:
         #: The latest advisory ClimatePlan (contract v1), rebuilt from the newest decision record
         #: at load and replaced by every run.  Always built; whether it is served is the mode's.
         self.plan: dict[str, Any] | None = None
+        #: The plan was solved by this process (a run of :meth:`run_once`), not rebuilt at load.
+        self.plan_own = False
+        #: The status of the decision record the plan was built from (``planned``, ``no_state``,
+        #: ``no_inputs``, ``plan_failed``, ``error``): what the actuator's fallback reason names.
+        self.plan_status: str | None = None
+        self.redecide_foreign = redecide_foreign
         self.refit_at: datetime | None = None
         self._loaded = False
 
@@ -254,15 +268,21 @@ class ClimateShadowJob:
             if "origin" in rec and rec["t0"] not in scored and self._own(rec):
                 self.queue[rec["t0"]] = rec
         if newest is not None:  # a restart inside a plan's validity keeps serving it
-            self._publish(newest)
+            self._publish(newest, own=False)
         self._loaded = True
 
-    def _publish(self, rec: Mapping[str, Any]) -> None:
+    def _publish(self, rec: Mapping[str, Any], *, own: bool) -> None:
         """Shape the decision into the advisory plan.  A failure here is reported as an ``error``
-        plan and never reaches the shadow."""
+        plan and never reaches the shadow.  *own*: this process solved it (a run, not a load).
+
+        The actuator reads these attributes from the event loop while a run publishes from the
+        worker thread: the plan is assigned first and the flags that vouch for it after, so a
+        reader can see a new plan with the old flags (at worst a fallback) and never an old,
+        foreign plan marked as this process's."""
         machine = self.cfg.machine
+        status = rec.get("status")
         try:
-            self.plan = plan_export.build_plan(
+            plan = plan_export.build_plan(
                 rec,
                 code_version=self.code_version,
                 ttl_minutes=self.settings.plan_ttl_minutes,
@@ -270,7 +290,7 @@ class ClimateShadowJob:
             )
         except Exception as exc:  # noqa: BLE001 - the plan is advisory, the shadow carries on
             log.exception("climate plan export of %s failed", rec.get("t0"))
-            self.plan = plan_export.build_plan(
+            plan = plan_export.build_plan(
                 {
                     "t0": rec["t0"],
                     "run_at": rec.get("run_at"),
@@ -283,6 +303,10 @@ class ClimateShadowJob:
                 code_version=self.code_version,
                 ttl_minutes=self.settings.plan_ttl_minutes,
             )
+            status = "error"
+        self.plan = plan
+        self.plan_status = status
+        self.plan_own = own
 
     def _own(self, rec: Mapping[str, Any]) -> bool:
         """A record of this job's lineage: its prior and its MPC config."""
@@ -300,7 +324,8 @@ class ClimateShadowJob:
             self.load(now)
         t0 = self.decision_time(now)
         key = _iso(t0)
-        if key in self.decided:
+        redecision = key in self.decided and self.redecide_foreign and not self.plan_own
+        if key in self.decided and not redecision:
             return {"status": "skipped", "t0": key}
         started = time.monotonic()
         summary: dict[str, Any] = {"t0": key, "run_at": _iso(now)}
@@ -339,11 +364,13 @@ class ClimateShadowJob:
             d = None
         rec["run_at"] = _iso(now)
         rec["elapsed_s"] = round(time.monotonic() - started, 3)
+        if redecision:  # the boundary was decided before the restart: never scored twice
+            rec["redecision"] = True
         self._write("climate_decisions", t0, rec)
-        self._publish(rec)
+        self._publish(rec, own=True)
         self.decided.add(key)
         self.day_regimes.setdefault(rec["local_day"], set()).add(rec.get("regime") or "")
-        if "origin" in rec:
+        if "origin" in rec and not redecision:
             self.queue[key] = rec
         self._count_decision(rec)
         summary.update(status=rec["status"], regime=rec.get("regime"))
@@ -489,6 +516,7 @@ def build_job(
     code_version: str,
     samples: SampleSource | None = None,
     metrics: Any = None,
+    redecide_foreign: bool = False,
 ) -> ClimateShadowJob:
     """Load the configs, the prior and the site file and wire the Prometheus cache.
 
@@ -522,4 +550,5 @@ def build_job(
         samples=samples,
         code_version=code_version,
         metrics=metrics,
+        redecide_foreign=redecide_foreign,
     )

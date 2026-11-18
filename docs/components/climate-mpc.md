@@ -6,7 +6,9 @@ Plans space heating for the comfort schedule with the fewest predicted heat-pump
 price**, as the second reference for the rule-based AppDaemon controller
 ([design](../planning/comfort-controller-design.md#13-track-b-shadow-thermal-model-mpc) section 13,
 [ADR-0006](../adr/0006-decouple-heat-pump-comfort-from-battery-price-optimisation.md) amendment). It only
-plans: nothing writes to Home Assistant or the plant. Owner: this repository (`climate/mpc*.py`, `b2d.py`,
+plans; since [ADR-0009](../adr/0009-live-climate-control.md) its plan is also what the optimizer's own climate
+actuator writes to the heat pump (code exists, `climate_actuation.mode: shadow`: nothing is written until the owner
+switches it live). Owner: this repository (`climate/mpc*.py`, `b2d.py`,
 `shadow*.py`, `service/climate_shadow.py`, `hack/climate_*`, [`config/climate-mpc.yaml`](../../config/climate-mpc.yaml)).
 
 ## Interfaces
@@ -43,8 +45,15 @@ plans: nothing writes to Home Assistant or the plant. Owner: this repository (`c
   or `live`. It exports exactly the two levers the MPC plans: space heating on/off per 15-minute slot and the
   absolute water target (curve plus offset, clamped to 20 to 35 degC), plus predicted room temperatures for
   monitoring. It changes neither the MPC nor its model, config or scoring (no recalibration trigger), and turning it
-  on lets nothing act on the heat pump: the effective mode is never `live` in this code version and the only
-  possible writer, the homelab comfort controller, has its own hard lock.
+  on lets nothing act on the heat pump: the effective mode is `live` only with `climate_actuation.mode: live`
+  ([ADR-0009](../adr/0009-live-climate-control.md)), whose actuator is the only writer.
+- **Actuator (ADR-0009,** [ops](../service.md#live-climate-control-adr-0009)**; code exists, mode `shadow`, nothing
+  is written):** `service/climate_actuator.py` turns the 15-minute slot of the plan this process solved into
+  `Heat+DHW` / `DHW` and the integer water target (direct mode), behind the owner's select, the legacy toggle, the
+  machine limits (min on 30 min, min off 20 min, water steps of 1 K and 15 min), the comfort floors (default 21
+  degC, helper `comfort_floor_<room>` when fresh) and the safe-state fallback. It changes neither the MPC nor its
+  model, config or scoring (no recalibration trigger). The first run after a restart decides its boundary again
+  (record flagged `redecision`) so there is a plan of this process.
 
 ## Calibrated on
 
@@ -105,3 +114,6 @@ observed because it never acts.
 ## Status
 
 **provisional** (2026-10-31): offline replay; live shadow (B2) implemented, not deployed. Exploratory model, no gate yet.
+The climate actuator that would execute its plan exists in code since 2026-11-18 (`climate_actuation.mode: shadow`,
+nothing written; [regime log](regime-log.md)); the switch to live needs the owner's separate approval and marks this
+page `stale` for its 28-day settling clock ([ADR-0009](../adr/0009-live-climate-control.md)).

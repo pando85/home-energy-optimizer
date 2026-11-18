@@ -1,19 +1,20 @@
 # ClimatePlan contract v1
 
 The interface between the climate optimizer (this repository) and whoever consumes its plan (the homelab
-comfort controller in AppDaemon, dashboards). It is **advisory**: the optimizer publishes a plan and never
-acts on it. The decision record is [ADR-0008](adr/0008-climate-plan-handoff-to-the-comfort-controller.md)
-(**Proposed, not accepted**). The machine-readable contract is
+comfort controller in AppDaemon, dashboards). The document is **advisory** (`advisory: true`): this endpoint only
+publishes it. Since [ADR-0009](adr/0009-live-climate-control.md) the optimizer's own climate actuator acts on the same
+in-process decision (never on a command, and only with `climate_actuation.mode: live`, default `shadow`). The
+decision record is [ADR-0008](adr/0008-climate-plan-handoff-to-the-comfort-controller.md)
+(**Proposed, not accepted**; ADR-0009 supersedes its decisions 2 and 4 and its precondition 1). The machine-readable contract is
 [`schemas/climate-plan-v1.json`](schemas/climate-plan-v1.json) (JSON Schema 2020-12); a complete example
 is [`schemas/climate-plan-v1.example.json`](schemas/climate-plan-v1.example.json). A test validates every plan
 the code produces against the schema, so the schema and the code cannot drift.
 
-**Safety statement.** The optimizer stays read-only toward Home Assistant for climate: the export is an
-HTTP `GET` on the optimizer's own in-cluster service, it adds no Home Assistant service call, no Modbus or
-REST write and no entity to the write allowlist (`service/ha_guard.py` is untouched), and the optimizer's
-token stays read-only. **Turning the export on does not let anything act on the heat pump**: the real lock
-lives in the consumer (ADR-0008, `optimizer_live_allowed: false`), and the optimizer cannot be effectively
-`live` in this code version whatever the owner selects.
+**Safety statement.** The export is an HTTP `GET` on the optimizer's own in-cluster service and adds no Home
+Assistant service call, no Modbus or REST write and no entity to the write allowlist. **Turning the export on does
+not let anything act on the heat pump.** The only writer is the optimizer's climate actuator, whose allowlist
+entries exist only with `climate_actuation.mode: live` (ADR-0009; default `shadow`), and the plan's
+`effective_mode` is `live` only then: otherwise a `live` request is served as `shadow` with `live_locked: true`.
 
 ## Endpoints
 
@@ -128,11 +129,12 @@ it already has (the same way as the battery kill switch); the helper is created 
 |---|---|---|---|
 | `off` | `off` | no (`404`, `state: mode_off`) | false |
 | `shadow` | `shadow` | yes, advisory | false |
-| `live` | `shadow` | yes, advisory, identical to `shadow` | **true**, `live_lock_reason` set |
+| `live` | `shadow` while `climate_actuation.mode` is not `live` (the default) | yes, advisory, identical to `shadow` | **true**, `live_lock_reason` set |
+| `live` | `live` with `climate_actuation.mode: live` | yes, advisory | false |
 
-- **The effective mode is never `live`** in this code version (a constant and a test enforce it). `live`
-  is a request: the plan says `requested_mode: "live"`, `effective_mode: "shadow"`, `live_locked: true`,
-  `live_lock_reason: "ADR-0008 proposed, not accepted; homelab hard lock optimizer_live_allowed=false"`, and
+- **The effective mode is `live` only with `climate_actuation.mode: live`** in the deployed config (ADR-0009
+  replaces the constant of ADR-0008). Otherwise `live` is a request: the plan says `requested_mode: "live"`,
+  `effective_mode: "shadow"`, `live_locked: true`, `live_lock_reason: "climate_actuation.mode is not live"`, and
   `battery_optimizer_climate_plan_live_locked` is 1, so a dashboard can show "live requested but locked".
 - **Fallback.** A missing, `unavailable`, `unknown` or otherwise unrecognised helper state falls back to
   `climate_shadow.optimizer_mode` of the service config (default `"off"`); `mode_source` says `helper` or

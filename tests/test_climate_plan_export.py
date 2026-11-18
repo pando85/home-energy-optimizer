@@ -318,16 +318,21 @@ def test_the_mode_comes_from_the_helper_else_the_config(
     )
     assert (m.live_lock_reason is not None) is locked
     if locked:
-        assert "ADR-0008" in m.live_lock_reason and "optimizer_live_allowed=false" in (
-            m.live_lock_reason
-        )
+        assert m.live_lock_reason == "climate_actuation.mode is not live"
 
 
-def test_the_effective_mode_is_never_live():
-    assert pe.LIVE_ALLOWED is False
+def test_the_effective_mode_is_live_only_when_the_deployed_config_allows_it():
+    """ADR-0009: the constant of ADR-0008 is replaced by ``climate_actuation.mode: live``."""
+    assert not hasattr(pe, "LIVE_ALLOWED")
     for helper in (None, "off", "shadow", "live", "LIVE", "live ", "x", "unavailable"):
         for configured in pe.MODES:
-            assert pe.resolve_mode(helper, configured).effective in ("off", "shadow")
+            closed = pe.resolve_mode(helper, configured)
+            assert closed.effective in ("off", "shadow")  # the default: never live
+            assert closed == pe.resolve_mode(helper, configured, live_allowed=False)
+            opened = pe.resolve_mode(helper, configured, live_allowed=True)
+            assert opened.effective == ("live" if opened.requested == "live" else closed.effective)
+            assert opened.live_locked is False and opened.live_lock_reason is None
+            assert closed.live_locked is (closed.requested == "live")
     with pytest.raises(ValueError):
         pe.resolve_mode("live", "on")
 
@@ -346,6 +351,11 @@ def test_each_state_is_served_as_documented(plan):
     code, body, summary = get(plan, mode=live)
     assert code == 200 and body["requested_mode"] == "live" and body["effective_mode"] == "shadow"
     assert body["live_locked"] is True and summary["live_locked"] is True
+    validate(body)
+    opened = pe.resolve_mode("live", "off", live_allowed=True)
+    code, body, summary = get(plan, mode=opened)
+    assert code == 200 and body["effective_mode"] == "live" and body["live_locked"] is False
+    assert body["advisory"] is True and summary["effective_mode"] == "live"
     validate(body)
     code, body, summary = get(plan, mode=pe.resolve_mode("off", "shadow"))
     assert code == 404 and body["state"] == "mode_off" and "off" in body["reason"]

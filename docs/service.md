@@ -17,6 +17,9 @@ intents that are never sent anywhere. The one service call they can make is the 
 Omnibattery's Home Assistant entities, `dry_run` only records the writes, `live` sends them through a narrow,
 mode-gated allowlist. See [Live control](#live-control-dry_run-and-live).
 
+The heat pump has its own, independent switch: `climate_actuation.mode` (`shadow` by default, no writes) of
+[ADR-0009](adr/0009-live-climate-control.md); see [Live climate control](#live-climate-control-adr-0009).
+
 ## Architecture
 
 ```
@@ -403,8 +406,9 @@ ID, price, timestamp or household reading is a label.
 | `climate_shadow_regime` | gauge 0/1 (the regime at the last run) | `regime` (`legacy`, `comfort`, `comfort_off`, `unknown`) |
 | `climate_shadow_last_plan_top_offset_share_ratio` | gauge | — |
 | `climate_plan_state` | gauge 0/1 (state set; what `/climate/plan` serves) | `state` (`planned`, `skipped`, `error`, `mode_off`, `no_plan`, `expired`) |
-| `climate_plan_mode_requested`, `climate_plan_mode_effective` | gauge 0/1 (state set; effective is never `live`) | `mode` (`off`, `shadow`, `live`) |
-| `climate_plan_live_locked` | gauge 0/1: live requested and refused (ADR-0008 not accepted) | — |
+| `climate_plan_mode_requested`, `climate_plan_mode_effective` | gauge 0/1 (state set; effective is `live` only with `climate_actuation.mode: live`) | `mode` (`off`, `shadow`, `live`) |
+| `climate_plan_live_locked` | gauge 0/1: live requested and refused (`climate_actuation.mode` is not `live`) | — |
+| `climate_actuator_*` | see [Live climate control](#live-climate-control-adr-0009): only with `climate_actuation.mode` `dry_run` or `live`, absent otherwise | — |
 | `climate_plan_age_seconds` | gauge (since the latest plan was generated; absent before the first) | — |
 | `climate_plan_valid` | gauge 0/1 (1 while the latest plan is inside `valid_until`) | — |
 | `climate_plan_heating_planned_now`, `climate_plan_water_target_celsius` | gauge: the current slot of a `planned` plan; **absent** when mode is off, no plan is current or the plan has no slots (absent is not 0); the water target only while heating is planned | — |
@@ -550,6 +554,7 @@ time it was in force, `1 - adopted_after_s / interval_seconds` of the slot: `pla
 | `weather_forecasts/date=YYYY-MM-DD/weather_forecasts.jsonl` | One row per fetched HA weather forecast (see [Passive archives](#passive-archives)) |
 | `climate_{decisions,scores,days,models}/date=YYYY-MM-DD/*.jsonl` | The [climate shadow](#climate-shadow-track-b2)'s records (only when it is enabled) |
 | `full_charge/date=YYYY-MM-DD/full_charge.jsonl` | Periodic full charge only: one row per decision, reading, state transition, outcome and pause |
+| `climate_actuation/date=YYYY-MM-DD/climate_actuation.jsonl` | `climate_actuation` `dry_run`/`live` only: one row per heat-pump write (or would-be write: entity, old, new, reason, result) and per tick that changed state ([Live climate control](#live-climate-control-adr-0009)) |
 | `actuation/date=YYYY-MM-DD/actuation.jsonl` | `dry_run`/`live` only: one row per actuator tick that wrote (or would write) or changed state: kill switch, guard reasons, intent, desired and observed state, each write with its result, heartbeat, alert ([Live control](#live-control-dry_run-and-live)) |
 
 JSONL rows are appended with a single `O_APPEND` write plus `fsync`; readers skip a torn last line.
@@ -744,10 +749,11 @@ a threshold or a window is a preregistration amendment, allowed only before go-l
 The climate shadow's hourly decision is also published as an **advisory ClimatePlan**, for the homelab comfort
 controller's shadow comparison and for dashboards. Contract, fields and consumer rules:
 [climate-plan-contract](climate-plan-contract.md); decision: [ADR-0008](adr/0008-climate-plan-handoff-to-the-comfort-controller.md)
-(Proposed). **The export is a read-only `GET` on this service: it adds no Home Assistant service call or write,
-`service/ha_guard.py` is unchanged, and turning it on does not let anything act on the heat pump.** The only
-thing that can ever act on it is the homelab consumer, behind its own hard lock
-(`optimizer_live_allowed: false` in git); in this code version the optimizer's effective mode is never `live`.
+(Proposed). **The export itself is a read-only `GET` on this service: it adds no Home Assistant service call or
+write, and turning it on does not let anything act on the heat pump.** What can act on the plan is the
+[climate actuator](#live-climate-control-adr-0009) of [ADR-0009](adr/0009-live-climate-control.md), only with
+`climate_actuation.mode: live` (default `shadow`) and the owner's select at `live`; the effective mode of the
+export is `live` only then.
 
 **Toggle: off by default.** The owner's control is the Home Assistant select
 `input_select.climate_optimizer_mode` (options exactly `off`, `shadow`, `live`; `climate_shadow.entities.mode`),
@@ -760,7 +766,7 @@ which the service reads through its existing read-only state subscription, like 
 |---|---|---|
 | `off` | `off` | `404`, `state: mode_off` |
 | `shadow` | `shadow` | the plan, advisory |
-| `live` | `shadow`, `live_locked: true` | the same plan, `requested_mode: live` and the lock reason |
+| `live` | `shadow`, `live_locked: true` (`climate_actuation.mode` is not `live`); `live`, `live_locked: false` (it is) | the same plan, `requested_mode: live` and, while locked, the lock reason |
 
 The mode only gates what is served: the shadow's hourly run, records and scoring continue in `off` (they are the
 measurement). The plan is rebuilt from the newest stored decision when the service starts, so a restart inside
@@ -784,6 +790,7 @@ the effective mode is `shadow` if a consumer depends on it.
 | Store write fails | `sink_write_errors_total` | Logged; service continues |
 | Archive write fails, or a forecast fetch fails (no session, call refused, timeout, empty or malformed response) | `pvpc_snapshots_total{result="failed"}`, `weather_forecast_fetches_total{result="failed"}` | Logged and counted; the record is dropped; a failed fetch is retried after 30 s, 60 s, ... capped at 10 min (never past the next grid instant); readiness, solves and slot closes are untouched |
 | Climate shadow cannot load (prior, site file or config missing) or a run fails | `climate_shadow_up`, `climate_shadow_runs_total{result="error"}`, `/status` | Recorded (an `error` decision row or a `climate_shadow_error` event), retried at the next hour; readiness and the battery planner are untouched |
+| Climate actuator: legacy controller active, owner select not `live`, plan stale or foreign, no room reading, curve mode, write fails | `climate_actuator_guard_reason`, `_fallback_active`, `_not_direct_mode`, `_alert`, `_write_failures_total` | See [Live climate control](#live-climate-control-adr-0009): nothing written under `legacy_writer_active`; the safe heating state (`Heat+DHW`, 26 degC) written once for every other fallback; the battery planner, the battery actuator and readiness are untouched |
 | Restart | `build_info`, events | No plan is resumed; decisions start after the first fresh solve, a catch-up plan adopted by the slot in progress (`late_intent`) |
 
 ## Shadow-vs-native comparison
@@ -1431,11 +1438,125 @@ Entities must be distinct from each other and from `entities` roles, `actuation.
 | `derate_scored_slots_total`, `achievable_charge_abs_error_kw_total` | counter: slots with a derate whose achievable charge was scored, and the sum of the absolute error | — |
 | `achievable_charge_error_sum_kw` | gauge: the signed sum | — |
 
+## Live climate control (ADR-0009)
+
+**Code exists; the deployed mode is `climate_actuation.mode: shadow`, which has no climate actuator and no
+climate write path.** [ADR-0009](adr/0009-live-climate-control.md) (Accepted 2026-11-18 for build and shadow;
+the switch to live needs the owner's separate approval, not yet given) makes the optimizer the only writer of
+space heating: the heat-pump operating mode and the Z1 water target. It mirrors the battery's three modes and
+is **independent of the battery's `mode`**. The module is `service/climate_actuator.py`; the climate shadow
+([above](#climate-shadow-track-b2)) still produces the plan and the actuator never builds a plan of its own.
+
+| `climate_actuation.mode` | What happens |
+|---|---|
+| `shadow` (default, committed) | No climate actuator, no climate allowlist entry, no `climate_actuator_*` metric, no `climate_actuator` block in `/status`. The plan export is advisory only |
+| `dry_run` | The whole actuator runs (guard, mapping, ordering, limits, owner select, fallback) and records every write it would make under `<data_dir>/service/v1/climate_actuation/`, in the log and in the metrics; nothing is sent and the HA client gets no allowlist |
+| `live` | It sends, through the `ha_guard` allowlist below. Needs `climate_shadow.enabled` (the loader refuses `dry_run`/`live` without it) and the live token |
+
+**Writes happen only when all three hold:** `climate_actuation.mode` is `live`; the owner's
+`input_select.climate_optimizer_mode` (`climate_shadow.entities.mode`; read, never written, never allowlisted)
+reads exactly `live` (missing, `unknown`, `unavailable`, `shadow` and `off` all mean no writes); and
+`input_boolean.appdaemon_climate_enable` (`climate_actuation.entities.legacy_enable`) is not `on` (missing counts
+as off). While the legacy controller is active the actuator writes **nothing at all**: no plan write, no safe
+state, no heartbeat (guard reason `legacy_writer_active`, alert-worthy). The select leaving `live` writes the safe
+state once and then nothing, heartbeat included.
+
+**Allowlist (live only, one entity per call, no `return_response`, no other field).** `ha_guard.climate_allowlist`
+adds exactly: `input_select.select_option` on `input_select.heishamon_heatmode` with `option` exactly `Heat+DHW`
+or `DHW`; `input_number.set_value` on `input_number.heishamon_heatshift_z1` with `value` an **integer** in
+`[20, 35]`; `input_datetime.set_datetime` on `input_datetime.climate_optimizer_heartbeat` (`timestamp`, finite,
+above 0). The options and the range are constants, not configuration; the entity IDs are
+`climate_actuation.entities`. `Heat`, `Cool*`, `Auto*`, floats, out-of-range values, DHW (the force-DHW switch and
+the tank target), the heater, the powerful mode, setpoints, cooling, the owner's select and the legacy helpers
+stay refused, and the battery's allowlist is unchanged: a battery in `live` with the climate in `shadow` gets none
+of these entries, and the reverse (`actuation_allowlist` is the union of the two builders).
+
+**Mapping.** For the 15-minute slot containing now of a plan **solved by this process** (the climate shadow's
+latest decision; a plan rebuilt from the store at start is not one) and inside its `valid_until`: heating on at T
+degC -> `Heat+DHW` and water T; off -> `DHW` and the water target untouched. Turning heating off writes the mode;
+turning it on writes the water target, then the mode. Each write is confirmed by reading the unit's own state back
+(`sensor.aquarea_mode`, `sensor.aquarea_z1_heat_request_temperature`) within `readback_timeout_s`, retried up to
+`max_attempts` (a guard refusal never); a plan write that still fails falls back to the safe state for that tick.
+Every tick that ends reconciled (the desired state, or at least the safe state, confirmed) writes the heartbeat.
+The actuator is its own task on `tick_interval_s` (60, at most 120) and wakes on a new plan, an HA sync and a
+change of the owner's select or the legacy toggle; a failure never touches the battery planner, the battery
+actuator or readiness.
+
+**Machine limits (code, not settings).** Minimum on 30 min and minimum off 20 min on the heat-mode command, with the
+clocks taken from the observed `sensor.aquarea_mode` change (`last_changed`), so a restart does not forget them; the
+safe state and a floor breach are exempt from the minimum off only, the minimum on always applies. The water target
+is written only in direct mode (`sensor.aquarea_heating_mode` = 1 and available; otherwise no water write and
+`climate_actuator_not_direct_mode` = 1), as an integer clamped to 20 to 35, only on a change of at least 1 K and at
+most once per 15 min (the safe state is exempt from the 15 min). At least 10 s separate two writes to one entity.
+A payload that is not a finite integer in range never leaves the process (`Write.validate`, then the guard).
+
+**Comfort floors win.** A comfort room (`climate_actuation.entities.rooms`: `hall_kitchen`, `bedroom`, `office_t`)
+whose thermostat reads below its floor forces `Heat+DHW` whatever the plan says, with the planned water target or,
+in an off slot, `safe_water_target_c`. The floor is `input_number.comfort_floor_<room>` when present, at most 2 h
+old and within 18 to 23 degC, else `floor_c` (default 21). The override releases at the floor plus
+`floor_margin_c` (0.5 K). A room with a missing, unavailable, implausible or older than `room_max_age_s` (3600)
+reading is skipped; none usable at all is a fallback (`no_room_reading`).
+
+**Fallback = the safe heating state.** On a missing, stale, invalid or foreign plan, a failed solve
+(`plan_failed`), an observer without state (`observer_no_state`), no usable room reading, an unreadable mode sensor,
+or the select leaving `live`, the actuator writes `Heat+DHW` and `safe_water_target_c` (26; water only in direct
+mode) **once**, then writes nothing until a valid plan returns; the heartbeat continues while the safe state is
+confirmed. The worst case is extra kWh, never no heating. After a restart the climate shadow decides its current
+boundary again at once (record flagged `redecision`, never scored twice) and the safe state holds until it has that
+plan. A stop (SIGTERM) in `live` cancels the actuator task and attempts the safe state, bounded by
+`shutdown_timeout_s`, before the HA session closes. The homelab `climate_optimizer_watchdog` repeats the safe state
+if the heartbeat is older than 10 min while the select is `live`.
+
+**Configuration.** `climate_actuation:` in `config/service.yaml` (a copy of the keys is in
+[configuration](configuration.md#live-climate-control-climate_actuation)): `mode`, `tick_interval_s`,
+`floor_margin_c`, `floor_c`, `safe_water_target_c`, `readback_timeout_s`, `max_attempts`, `shutdown_timeout_s`,
+`room_max_age_s` and `entities` (`heat_mode`, `water_target`, `heartbeat`, `observed_mode`, `heating_mode`,
+`water_request`, `legacy_enable`, `rooms`, `floor_helper_prefix`). It is excluded from the battery plan's config
+hash.
+
+**Observability.** Scrape-time gauges `battery_optimizer_climate_actuator_*` (only in `dry_run` and `live`):
+
+| Metric | Type | Labels |
+|---|---|---|
+| `climate_actuator_mode` | gauge 0/1 | `mode` (`dry_run`, `live`) |
+| `climate_actuator_owner_select` | gauge 0/1: the owner's select as read | `state` (`live`, `shadow`, `off`, `other`, `missing`) |
+| `climate_actuator_in_control` | gauge 0/1: select live, legacy off, HA synced | — |
+| `climate_actuator_guard_ok` | gauge 0/1: the last tick applied the plan (no guard reason, no fallback; absent before the first tick) | — |
+| `climate_actuator_guard_reason` | gauge 0/1: why nothing was written (**alert on `legacy_writer_active`**) | `reason` (`ha_not_synced`, `legacy_writer_active`, `select_not_live`) |
+| `climate_actuator_fallback_active` | gauge 0/1: the safe state in force | `reason` (see `FALLBACK_REASONS`) |
+| `climate_actuator_hold` | gauge 0/1: a machine limit held a write back at the last tick | `reason` (`min_on`, `min_off`, `water_interval`) |
+| `climate_actuator_alert` | gauge 0/1: writes fail (the safe state was attempted, or even that failed) | — |
+| `climate_actuator_not_direct_mode` | gauge 0/1: heating wanted but `Heating_Mode` is not 1 (**alert**) | — |
+| `climate_actuator_floor_override_rooms` | gauge: rooms under a floor override | — |
+| `climate_actuator_desired_heating`, `_observed_heating` | gauge 0/1 (`Heat+DHW` = 1) | — |
+| `climate_actuator_desired_water_celsius`, `_observed_water_celsius` | gauge | — |
+| `climate_actuator_last_confirmed_write_timestamp_seconds` | gauge | `entity` (`heat_mode`, `water_target`) |
+| `climate_actuator_writes_total` | counter | `entity` (`heat_mode`, `water_target`), `result` (`ok`, `failed`, `dry_run`) |
+| `climate_actuator_write_failures_total` | counter (each retry) | `reason` (`ha_error`, `readback_timeout`, `forbidden`) |
+| `climate_actuator_fallbacks_total` | counter (**alert on any increase except `shutdown`**) | `reason` |
+| `climate_actuator_heartbeats_total` | counter | `result` (`ok`, `failed`, `dry_run`) |
+| `climate_actuator_floor_overrides_total` | counter: rooms that entered an override | — |
+
+`GET /status` carries a `climate_actuator` block (mode, `sends`, `in_control`, guard, fallback, desired, holds,
+`not_direct_mode`, floor-override rooms, observed readings, alert, last write and heartbeat times).
+**Every write is logged** (`climate actuator write entity=... old=... new=... reason=... result=...`) and recorded
+as one JSONL row `kind: climate_actuation_write` (`at`, `entity_id`, `old`, `new`, `reason`, `result`, `sent`,
+`plan_id`) under `climate_actuation/`; a `climate_actuation_tick` row is added when a tick changes the guard,
+fallback, desired state or alert. The plan export's `effective_mode` is `live` only with
+`climate_actuation.mode: live` (`plan_export.resolve_mode(..., live_allowed=)`); otherwise a `live` request is
+served as `shadow` with `live_locked: true` and the reason "climate_actuation.mode is not live". The ClimatePlan v1
+contract is unchanged (`advisory: true`).
+
 ## Safety
 
 * The climate plan export ([Climate plan export](#climate-plan-export)) is an HTTP `GET` on this service and a read of
-  the owner's mode select through the existing state subscription: no new service call, no write, the allowlist
-  below is untouched, and the effective export mode is never `live`.
+  the owner's mode select through the existing state subscription: no new service call and no write; its effective
+  mode is `live` only with `climate_actuation.mode: live`.
+* **Climate write path (`climate_actuation.mode: live` only, ADR-0009).** `ha_guard.climate_allowlist` adds exactly
+  `input_select.select_option` on the heat-mode select (option `Heat+DHW` or `DHW`), `input_number.set_value` on
+  the Z1 water-target helper (integer 20 to 35) and `input_datetime.set_datetime` on the climate heartbeat; one
+  entity per call, nothing else (not DHW, the heater, setpoints, cooling, the owner's select), the battery's
+  entries unchanged and independent ([Live climate control](#live-climate-control-adr-0009)).
 * WebSocket: every outgoing frame is checked against the allowlist `auth`, `ping`,
   `subscribe_events` (only `state_changed`), `subscribe_entities`, `subscribe_trigger` (only state
   triggers), `unsubscribe_events`, `get_states`, `get_config`. Anything else raises

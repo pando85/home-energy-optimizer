@@ -365,7 +365,10 @@ uv run python hack/climate_station.py evaluate --feature-set <climate feature se
 
 **Status: Phase C (PROD-C1 to C3) built — shadow by default, no actuation path in `mode: shadow`.**
 `mode: dry_run` / `mode: live` add `service/actuator.py` ([ADR-0007](adr/0007-live-battery-control.md),
-accepted 2026-11-03; see [service.md](service.md#live-control-dry_run-and-live)). `battery-optimizer serve`
+accepted 2026-11-03; see [service.md](service.md#live-control-dry_run-and-live)); `climate_actuation.mode`
+`dry_run` / `live` independently add `service/climate_actuator.py` for the heat pump
+([ADR-0009](adr/0009-live-climate-control.md); default `shadow`, nothing written; see
+[service.md](service.md#live-climate-control-adr-0009)). `battery-optimizer serve`
 subscribes to Home Assistant (read-only allowlist, reconnect and full resync; passive PVPC-snapshot and
 weather-forecast archives, see [service.md](service.md#passive-archives)), reads load history from
 Prometheus, solves the offline MPC kernel every 15 minutes in a bounded worker, records time-bounded

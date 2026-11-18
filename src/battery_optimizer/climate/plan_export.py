@@ -1,11 +1,12 @@
 """The advisory ClimatePlan (contract v1): the live shadow's decision, shaped for a consumer.
 
-The optimizer **only produces** a plan; it never acts on it and never writes anywhere
-(ADR-0008, proposed).  This module is pure: it turns one stored ``climate_decision`` record into
-the plan document (:func:`build_plan`), resolves the owner's mode (:func:`resolve_mode`) and
-renders the plan for an HTTP reader at a given instant (:func:`plan_response`,
-:func:`summary_response`).  The contract is ``docs/climate-plan-contract.md`` and its JSON Schema
-``docs/schemas/climate-plan-v1.json``.
+This module only **produces** the plan document (ADR-0008); acting on it is the climate actuator's
+business (:mod:`battery_optimizer.service.climate_actuator`, ADR-0009), which consumes the same
+in-process decision and never a command.  This module is pure: it turns one stored
+``climate_decision`` record into the plan document (:func:`build_plan`), resolves the owner's
+mode (:func:`resolve_mode`) and renders the plan for an HTTP reader at a given instant
+(:func:`plan_response`, :func:`summary_response`).  The contract is
+``docs/climate-plan-contract.md`` and its JSON Schema ``docs/schemas/climate-plan-v1.json``.
 
 Two layers, kept apart so the idempotency key stays stable:
 
@@ -15,8 +16,9 @@ Two layers, kept apart so the idempotency key stays stable:
   ``requested_mode`` / ``effective_mode`` / ``live_locked``, and ``summary`` (age, the current
   slot, the next heating run, predicted room temperatures).
 
-The effective mode can never be ``live`` in this code version (:data:`LIVE_ALLOWED`): a ``live``
-request is served as ``shadow`` and flagged ``live_locked``.
+The effective mode is ``live`` only while the caller says the live path is open
+(``live_allowed``: ``climate_actuation.mode: live``, ADR-0009); otherwise a ``live`` request is
+served as ``shadow`` and flagged ``live_locked`` (:data:`LIVE_LOCK_REASON`).
 """
 
 from __future__ import annotations
@@ -32,7 +34,6 @@ from typing import Any
 __all__ = [
     "CONTRACT_VERSION",
     "DEFAULT_TTL_MINUTES",
-    "LIVE_ALLOWED",
     "LIVE_LOCK_REASON",
     "MODES",
     "PLAN_STATES",
@@ -59,9 +60,8 @@ WATER_RANGE_C = (20, 35)
 SUMMARY_HOURS = (1, 2, 3, 4, 5, 6)
 
 MODES = ("off", "shadow", "live")
-#: Nothing in this code version may be effective ``live``; flipping it is ADR-0008's business.
-LIVE_ALLOWED = False
-LIVE_LOCK_REASON = "ADR-0008 proposed, not accepted; homelab hard lock optimizer_live_allowed=false"
+#: Why a ``live`` request is served as ``shadow`` (ADR-0009: the deployed config decides).
+LIVE_LOCK_REASON = "climate_actuation.mode is not live"
 
 #: What a reader is served, in order of precedence (the first that applies).
 NOT_AVAILABLE_STATES = ("climate_shadow_disabled", "mode_off", "no_plan", "expired")
@@ -84,8 +84,9 @@ _REASONS = {
 class ModeState:
     """The owner's request and what the optimizer does with it.
 
-    ``requested`` is the HA select (or the configured fallback); ``effective`` is ``off`` or
-    ``shadow``, never ``live``.  ``live_locked`` is true while ``live`` is requested."""
+    ``requested`` is the HA select (or the configured fallback); ``effective`` is ``off``,
+    ``shadow`` or, only with the live path open, ``live``.  ``live_locked`` is true while ``live``
+    is requested and refused."""
 
     requested: str
     effective: str
@@ -103,11 +104,15 @@ class ModeState:
         }
 
 
-def resolve_mode(helper_state: str | None, configured: str) -> ModeState:
+def resolve_mode(
+    helper_state: str | None, configured: str, *, live_allowed: bool = False
+) -> ModeState:
     """The mode from the HA select's state, falling back to *configured* when the helper is
     missing, unavailable, unknown or anything but one of :data:`MODES`.
 
-    A ``live`` request is honoured as a request only: the effective mode is ``shadow``."""
+    A ``live`` request is effective only with *live_allowed* (``climate_actuation.mode: live``);
+    otherwise it is a request only: the effective mode is ``shadow`` and the plan is flagged
+    ``live_locked``."""
     if configured not in MODES:
         raise ValueError(f"configured mode must be one of {MODES}, not {configured!r}")
     candidate = (helper_state or "").strip().lower()
@@ -116,13 +121,13 @@ def resolve_mode(helper_state: str | None, configured: str) -> ModeState:
     else:
         requested, source = configured, "config"
     live = requested == "live"
-    effective = "off" if requested == "off" else "shadow"
-    assert effective != "live" or LIVE_ALLOWED  # structurally impossible; kept as a tripwire
+    effective = "off" if requested == "off" else "live" if live and live_allowed else "shadow"
+    locked = live and not live_allowed
     return ModeState(
         requested=requested,
         effective=effective,
-        live_locked=live and not LIVE_ALLOWED,
-        live_lock_reason=LIVE_LOCK_REASON if live and not LIVE_ALLOWED else None,
+        live_locked=locked,
+        live_lock_reason=LIVE_LOCK_REASON if locked else None,
         source=source,
     )
 
