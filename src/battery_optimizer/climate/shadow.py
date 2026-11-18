@@ -152,6 +152,16 @@ COMFORT_HELPERS = {
     "day_min": ("input_number.comfort_day_minimum_", (18.0, 26.0)),
 }
 COMFORT_METRIC = "hass_input_number_state"
+#: The house-wide day-window helpers, ``input_number`` hours (HA's Prometheus exporter publishes no
+#: state for an ``input_datetime``, only its last-update time: a time-only helper cannot be read).
+#: ``field -> entity``; accepted range 0 to 24 h, rounded to the 15-minute slot and checked as a
+#: window by :func:`mpc_replay.comfort_window`.
+WINDOW_HELPERS = {
+    "start_weekday": "input_number.comfort_day_start_weekday_hour",
+    "start_weekend": "input_number.comfort_day_start_weekend_hour",
+    "end": "input_number.comfort_day_end_hour",
+}
+WINDOW_RANGE_H = (0.0, 24.0)
 #: A helper sample older than this at the decision is not trusted (the exporter emits one every
 #: scrape, so an older last sample means an outage or a removed helper).
 COMFORT_MAX_AGE_S = 2 * 3600
@@ -165,29 +175,43 @@ def live_sources(price_entity: str | None) -> dict[str, tuple[str, str]]:
     for kind, (prefix, _range) in COMFORT_HELPERS.items():
         for room in DESIGN_ROOMS:
             out[f"comfort_{kind}_{room}"] = (f"{prefix}{room}", COMFORT_METRIC)
+    for field, entity in WINDOW_HELPERS.items():
+        out[f"comfort_window_{field}"] = (entity, COMFORT_METRIC)
     return out
+
+
+def _helper_value(raw: RawSeries | None, at_us: int, lo: float, hi: float) -> float | None:
+    """The sample of *raw* in effect at *at_us* when fresh, finite and within ``[lo, hi]``."""
+    if raw is None or raw.t_us.size == 0:
+        return None
+    i = int(np.searchsorted(raw.t_us, at_us, side="right")) - 1
+    if i < 0 or at_us - int(raw.t_us[i]) > COMFORT_MAX_AGE_S * 1_000_000:
+        return None
+    value = float(raw.values[i])
+    return value if math.isfinite(value) and lo <= value <= hi else None
 
 
 def comfort_helper_levels(
     series: Mapping[str, RawSeries], at: datetime
 ) -> dict[str, dict[str, float]]:
-    """``{"floor": {room: degC}, "day_min": {room: degC}}`` in effect at *at*: the last helper
-    sample at or before it, when it is at most :data:`COMFORT_MAX_AGE_S` old and inside the
-    controller's range.  A missing, stale, non-finite or out-of-range value is simply absent, so
-    the config's value stands for that room and helper."""
+    """``{"floor": {room: degC}, "day_min": {room: degC}, "window": {field: hour}}`` in effect at
+    *at*: the last helper sample at or before it, when it is at most :data:`COMFORT_MAX_AGE_S` old
+    and inside the controller's range (``window``: the house-wide day-window hours of
+    :data:`WINDOW_HELPERS`, 0 to 24 h).  A missing, stale, non-finite or out-of-range value is
+    simply absent, so the config's value stands for that room and helper.  The window's cross
+    checks (start before end) are :func:`mpc_replay.comfort_window`'s."""
     at_us = int(at.timestamp() * 1e6)
     out: dict[str, dict[str, float]] = {kind: {} for kind in COMFORT_HELPERS}
     for kind, (_prefix, (lo, hi)) in COMFORT_HELPERS.items():
         for room in DESIGN_ROOMS:
-            raw = series.get(f"comfort_{kind}_{room}")
-            if raw is None or raw.t_us.size == 0:
-                continue
-            i = int(np.searchsorted(raw.t_us, at_us, side="right")) - 1
-            if i < 0 or at_us - int(raw.t_us[i]) > COMFORT_MAX_AGE_S * 1_000_000:
-                continue
-            value = float(raw.values[i])
-            if math.isfinite(value) and lo <= value <= hi:
+            value = _helper_value(series.get(f"comfort_{kind}_{room}"), at_us, lo, hi)
+            if value is not None:
                 out[kind][room] = value
+    out["window"] = {}
+    for field in WINDOW_HELPERS:
+        value = _helper_value(series.get(f"comfort_window_{field}"), at_us, *WINDOW_RANGE_H)
+        if value is not None:
+            out["window"][field] = value
     return out
 
 
@@ -652,9 +676,10 @@ def decide(
 ) -> dict[str, Any]:
     """The decision record at *t0_at* (a slot start of *d*; *d* extends one horizon past it).
 
-    *comfort* is :func:`comfort_helper_levels` at *t0_at*: the per-room helper values in effect at
-    the decision, held over the horizon (the controller's schedule at the decision is the best
-    knowledge of the schedule after it); absent values fall back to the config.
+    *comfort* is :func:`comfort_helper_levels` at *t0_at*: the per-room helper values and the
+    house-wide day-window hours in effect at the decision, held over the horizon (the controller's
+    schedule at the decision is the best knowledge of the schedule after it); absent values fall
+    back to the config.
 
     ``origin`` (the observer state the predictions start from) is kept whenever it exists, so the
     prediction is scored even if the plan fails; ``plan`` is the MPC's (never executed)."""
@@ -713,11 +738,19 @@ def decide(
         },
     }
     levels = mpc_replay.comfort_levels(model.rooms, cfg, comfort)
+    from_helpers = {k: sorted(v) for k, v in (comfort or {}).items() if v and k != "window"}
+    if levels.window.from_helper:  # the window helpers that passed the window checks
+        from_helpers["window"] = sorted(levels.window.from_helper)
     rec["inputs"]["comfort"] = {
         "rooms": list(model.rooms),
         "floor_c": levels.floor.tolist(),
         "day_min_c": levels.day_min.tolist(),
-        "from_helpers": {k: sorted(v) for k, v in (comfort or {}).items() if v},
+        "window_h": {
+            "start_weekday": levels.window.start_weekday,
+            "start_weekend": levels.window.start_weekend,
+            "end": levels.window.end,
+        },
+        "from_helpers": from_helpers,
     }
     x0 = ctx.season.states[t0]
     age = int(ctx.season.age[t0])

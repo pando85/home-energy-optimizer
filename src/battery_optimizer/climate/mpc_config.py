@@ -88,6 +88,8 @@ _COMFORT_REQUIRED: Spec = section(
         "setpoint_margin_k": num(0.0, 3.0),
     }
 )
+#: The day-window hours above can be overridden live by house-wide helpers
+#: (``shadow.WINDOW_HELPERS``); those are inputs, never part of this file's hash.
 #: Optional per-room schedule (the controller's ``comfort_floor_<room>`` and
 #: ``comfort_day_minimum_<room>`` helpers).  Absent, a room has ``floor_c``, and ``day_min_c`` for
 #: the day room (``floor_c`` for the others), exactly the single schedule of config version 1.

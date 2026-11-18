@@ -66,7 +66,7 @@ Top level of a `200` body of `/climate/plan` (see the schema for exact types and
 | `regime` | `legacy`, `comfort`, `comfort_off` or `unknown`: the control regime the optimizer saw. |
 | `status`, `reason` | `planned` (`reason` null) or `skipped` / `error` (`slots` null, `reason` says why; no plan is exported from a failed decision). |
 | `model` | Lineage for monitoring: `prior_id`, `model_hash`, `mpc_config_sha256`, `solver_status`. |
-| `inputs.comfort` | Per room (`bedroom`, `hall_kitchen`, `office_t`): `floor_c`, `day_min_c` the plan was computed with and whether each came from the controller's helper (`*_from_helper`) or from the optimizer's config. |
+| `inputs.comfort` | Per room (`bedroom`, `hall_kitchen`, `office_t`): `floor_c`, `day_min_c` the plan was computed with and whether each came from the controller's helper (`*_from_helper`) or from the optimizer's config. The decision's `comfort` object also carries `window_h` (`start_weekday`, `start_weekend`, `end`: the shared day window in local hours) and `from_helpers.window` (the fields set by a house-wide helper). |
 | `inputs.away` | Away mode at the decision (every room planned at its floor + 0.5 K), `null` if unknown. |
 | `inputs.weather` | `forecast` or `persistence` (the last outdoor reading held). |
 | `slots` | The per-slot plan (below), `null` unless `planned`. |

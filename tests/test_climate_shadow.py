@@ -23,7 +23,7 @@ from climate_shadow_fakes import (
 )
 
 from battery_optimizer.build import RawPoint
-from battery_optimizer.climate import b2d, mpc_replay, shadow, thermal
+from battery_optimizer.climate import b2d, mpc_config, mpc_replay, shadow, thermal
 from battery_optimizer.climate.mpc_model import Exogenous
 from battery_optimizer.features import RawSeries
 from battery_optimizer.service.climate_shadow import (
@@ -318,13 +318,20 @@ def test_the_helpers_are_read_from_prometheus_by_entity():
         "input_number.comfort_day_minimum_hall_kitchen",
         "hass_input_number_state",
     )
-    assert sum(k.startswith("comfort_") for k in sources) == 8  # two helpers, four rooms
+    # two helpers x four rooms, plus the three window hours
+    assert sum(k.startswith("comfort_") for k in sources) == 8 + 3
+    for field, entity in {
+        "start_weekday": "input_number.comfort_day_start_weekday_hour",
+        "start_weekend": "input_number.comfort_day_start_weekend_hour",
+        "end": "input_number.comfort_day_end_hour",
+    }.items():
+        assert sources[f"comfort_window_{field}"] == (entity, "hass_input_number_state")
 
 
 def test_absent_helper_series_fall_back_to_the_config():
-    assert _levels() == {"floor": {}, "day_min": {}}
+    assert _levels() == {"floor": {}, "day_min": {}, "window": {}}
     empty = RawSeries("e", shadow.COMFORT_METRIC, "", np.zeros(0, np.int64), np.zeros(0))
-    assert _levels(comfort_floor_bedroom=empty) == {"floor": {}, "day_min": {}}
+    assert _levels(comfort_floor_bedroom=empty) == {"floor": {}, "day_min": {}, "window": {}}
 
 
 def test_the_helper_value_in_effect_at_the_decision_is_used():
@@ -389,6 +396,154 @@ def test_helper_values_reach_the_plan_inputs_and_are_recorded():
     )
     for i, row in enumerate(away["inputs"]["setpoints"]):
         assert set(row) == ({22.5} if i == off else {21.5})
+
+
+# ---------------------------------------------------------------------------
+# The day-window helpers (house-wide input_number hours)
+# ---------------------------------------------------------------------------
+
+MINUTE = timedelta(minutes=1)
+
+
+def _window_series(**hours):
+    return {
+        f"comfort_window_{field}": _helper("w", [(-5 * MINUTE, h)]) for field, h in hours.items()
+    }
+
+
+def test_the_window_helper_values_in_effect_are_read():
+    got = shadow.comfort_helper_levels(
+        _window_series(start_weekday=14.0, start_weekend=10.5, end=21.25), AT
+    )
+    assert got["window"] == {"start_weekday": 14.0, "start_weekend": 10.5, "end": 21.25}
+    after = {"comfort_window_end": _helper("w", [(-5 * MINUTE, 21.0), (+2 * MINUTE, 23.0)])}
+    assert shadow.comfort_helper_levels(after, AT)["window"] == {"end": 21.0}
+
+
+@pytest.mark.parametrize("value", [-0.25, 24.25, float("nan"), float("inf")])
+def test_an_invalid_window_helper_value_is_ignored(value):
+    assert shadow.comfort_helper_levels(_window_series(end=value), AT)["window"] == {}
+
+
+@pytest.mark.parametrize("value", [0.0, 24.0])
+def test_the_window_range_is_inclusive(value):
+    assert shadow.comfort_helper_levels(_window_series(end=value), AT)["window"] == {"end": value}
+
+
+def test_a_stale_window_helper_sample_is_ignored():
+    stale = {"comfort_window_end": _helper("w", [(-timedelta(hours=3), 20.0)])}
+    assert shadow.comfort_helper_levels(stale, AT)["window"] == {}
+
+
+def _window(over=None, cfg=MPC):
+    return mpc_replay.comfort_window(cfg, over)
+
+
+def test_the_window_is_the_config_without_a_helper():
+    w = _window()
+    assert (w.start_weekday, w.start_weekend, w.end, w.from_helper) == (12.0, 9.0, 22.0, ())
+    assert _window({}) == w
+
+
+def test_the_window_helpers_replace_the_config_and_round_to_the_slot():
+    w = _window({"start_weekday": 14.1, "start_weekend": 10.4, "end": 21.9})
+    assert (w.start_weekday, w.start_weekend, w.end) == (14.0, 10.5, 22.0)
+    assert w.from_helper == ("start_weekday", "start_weekend", "end")
+    one = _window({"end": 20.0})
+    assert (one.start_weekday, one.start_weekend, one.end) == (12.0, 9.0, 20.0)
+    assert one.from_helper == ("end",)
+    assert _window({"start_weekday": 0.0}).start_weekday == 0.0
+    assert _window({"end": 24.0}).end == 24.0
+
+
+@pytest.mark.parametrize(
+    ("over", "expected", "used"),
+    [
+        # a start at or after the (config) end falls back to its config value
+        ({"start_weekday": 22.0}, (12.0, 9.0, 22.0), ()),
+        ({"start_weekend": 23.5}, (12.0, 9.0, 22.0), ()),
+        # an unusable start does not cost a good helper end or the other start
+        (
+            {"start_weekday": 21.0, "start_weekend": 7.0, "end": 20.0},
+            (12.0, 7.0, 20.0),
+            ("start_weekend", "end"),
+        ),
+        # an end before a config start is the culprit: it falls back, the helper starts stand
+        ({"end": 10.0}, (12.0, 9.0, 22.0), ()),
+        ({"start_weekday": 15.0, "end": 8.0}, (15.0, 9.0, 22.0), ("start_weekday",)),
+        # an end equal to a start is not a window
+        ({"end": 12.0}, (12.0, 9.0, 22.0), ()),
+        # rounding can make a start meet the end
+        ({"start_weekday": 21.9, "end": 22.0}, (12.0, 9.0, 22.0), ("end",)),
+    ],
+)
+def test_a_start_that_is_not_before_the_end_falls_back_to_the_config(over, expected, used):
+    w = _window(over)
+    assert (w.start_weekday, w.start_weekend, w.end) == expected
+    assert w.from_helper == used
+    assert w.start_weekday < w.end and w.start_weekend < w.end
+
+
+def test_the_window_moves_the_comfort_minimum():
+    rooms = ("hall_kitchen",)
+    hours = np.array([8.0, 10.0, 12.25, 15.0, 20.0, 22.25])  # slot-end times
+    wd = np.zeros(6, bool)
+    cfg = mpc_replay.comfort_minimum(rooms, hours, wd, MPC)
+    lv = mpc_replay.comfort_levels(rooms, MPC, {"window": {"start_weekday": 9.0, "end": 20.0}})
+    moved = mpc_replay.comfort_minimum(rooms, hours, wd, MPC, lv)
+    assert (cfg[0] == lv.day[0]).tolist() == [False, False, True, True, True, False]
+    assert (moved[0] == lv.day[0]).tolist() == [False, True, True, True, False, False]
+
+
+def _decide(t0, comfort=None, cfg=MPC):
+    sp = prior()
+    legacy = shadow.LiveInputs(regime="legacy")
+    return shadow.decide(
+        sp, model_rec(sp), live_data(t0), cfg, t0, legacy, settings=SETTINGS, comfort=comfort
+    )
+
+
+def test_the_optimum_start_follows_the_helper_window_start():
+    base = _decide(MIDNIGHT)
+    helped = _decide(MIDNIGHT, {"window": {"start_weekday": 8.0}})
+    # the helper start is exactly a config start of 08:00
+    cfg8 = mpc_config.override(MPC, ("comfort", "day_start_weekday_hour"), 8)
+    assert helped["inputs"]["setpoints"] == _decide(MIDNIGHT, None, cfg8)["inputs"]["setpoints"]
+    assert helped["inputs"]["setpoints"] != base["inputs"]["setpoints"]
+    sp = prior()
+    hall = list(sp.prior.rooms).index("hall_kitchen")
+    day_sp = MPC.comfort.day_min_c + MPC.comfort.setpoint_margin_k
+
+    def raised(rec):
+        return [i for i, v in enumerate(rec["inputs"]["setpoints"][hall]) if v == day_sp]
+
+    assert raised(helped)[0] < raised(base)[0]  # earlier window, earlier optimum start
+    assert raised(helped)[-1] == 4 * 22 - 1 and raised(base)[-1] == 4 * 22 - 1  # unchanged end
+    # a later end shortens nothing before it and extends the raised block to 23:45
+    late = _decide(MIDNIGHT, {"window": {"end": 24.0}})
+    assert raised(late)[-1] == 95
+    # a weekday start the config rejects (not before the end) changes nothing
+    assert _decide(MIDNIGHT, {"window": {"start_weekday": 23.0}})["inputs"] == base["inputs"]
+
+
+def test_window_helpers_are_recorded_per_decision_and_leave_the_config_hash_alone():
+    base = _decide(MIDNIGHT)
+    assert base["inputs"]["comfort"]["window_h"] == {
+        "start_weekday": 12.0,
+        "start_weekend": 9.0,
+        "end": 22.0,
+    }
+    assert base["inputs"]["comfort"]["from_helpers"] == {}
+    over = {"floor": {"office_t": 22.0}, "window": {"start_weekday": 14.0, "end": 21.0}}
+    rec = _decide(MIDNIGHT, over)
+    c = rec["inputs"]["comfort"]
+    assert c["window_h"] == {"start_weekday": 14.0, "start_weekend": 9.0, "end": 21.0}
+    assert c["from_helpers"] == {"floor": ["office_t"], "window": ["end", "start_weekday"]}
+    # a rejected window helper is not recorded as used
+    bad = _decide(MIDNIGHT, {"window": {"start_weekday": 23.0}})
+    assert bad["inputs"]["comfort"]["from_helpers"] == {}
+    # the helper values are inputs, never part of the configuration identity
+    assert rec["mpc_config_sha256"] == base["mpc_config_sha256"] == MPC.sha256
 
 
 # ---------------------------------------------------------------------------

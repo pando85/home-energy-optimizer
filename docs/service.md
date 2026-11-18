@@ -637,7 +637,8 @@ after the boundary (default 10, after the weather fetch at :05), on its own work
 1. **Read.** Raw Prometheus samples of the climate signals the job needs (rooms and setpoints, unit
    outdoor sensor, water target, compressor frequency, heat-pump power by mode, force-DHW, the legacy
    rule's enable and hours, PVPC, and the controller's per-room `input_number.comfort_floor_<room>` /
-   `comfort_day_minimum_<room>` helpers, each absent-tolerant) for the trailing `model.reestimate.window_days + 2` days, cached in
+   `comfort_day_minimum_<room>` helpers and the three day-window hours `input_number.comfort_day_start_weekday_hour`,
+   `comfort_day_start_weekend_hour` and `comfort_day_end_hour`, each absent-tolerant) for the trailing `model.reestimate.window_days + 2` days, cached in
    memory and fetched incrementally after the first run. They go through the feature builder's own slot
    rules and the climate loader, cut at the decision `t0`, so a live slot is computed like an offline
    feature-set slot (debiased outdoor sensor, DHW and cooling masks, comfort-room mean, replayed legacy
