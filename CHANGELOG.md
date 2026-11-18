@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.20.0](https://github.com/pando85/home-energy-optimizer/tree/v0.20.0) - 2026-11-18
+
+### Added
+
+- climate: Read the comfort day window from Home Assistant helpers ([4d15e67](https://github.com/pando85/home-energy-optimizer/commit/4d15e67b84fb93a7fa7d7b41889e4b7a0136daa7))
+
+### Documentation
+
+- components: Record the 2026-11-18 climate go-live and mark dependants stale ([92e5373](https://github.com/pando85/home-energy-optimizer/commit/92e5373eb68600cfe062df87eb97a86a574b61e7))
+- price-outlook: Record the 2026-11-18 live re-check of tomorrow's prices ([dd7917d](https://github.com/pando85/home-energy-optimizer/commit/dd7917dee4f448def3c7d0cb26f5231ff3ab984d))
+- price-outlook: Record the terminal-value gap and park its strategies ([b154b3d](https://github.com/pando85/home-energy-optimizer/commit/b154b3dc8a6438ce9a3543c4015ce2f6990f270f))
+
 ## [v0.19.1](https://github.com/pando85/home-energy-optimizer/tree/v0.19.1) - 2026-11-18
 
 ### Fixed
