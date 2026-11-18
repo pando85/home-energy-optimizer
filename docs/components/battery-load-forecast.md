@@ -80,6 +80,12 @@ below use `plan="day_ahead"` or `"final"`; metrics are prefixed `battery_optimiz
 Offline, per slot and over a window: `uv run python hack/day_ahead_kpis.py --from <day> --to <day>`; compare the
 two plans over the same window.
 
+Offline headroom and candidate studies (read-only; reproduction commands in
+[the improvement plan](../planning/load-forecaster-improvement-plan.md#7-re-check-after-the-battery-went-live-2026-11-18)):
+`hack/load_forecast_value_replay.py` (value of a perfect forecast under the three actuator rules),
+`hack/load_forecast_candidates.py` (nowcast, median, UTC-aligned and heat-pump-known candidates
+against LF-0) and `hack/load_nilm_probe.py` (residual episodes, appliance cycles, identity probe).
+
 ## Live review (2026-11-07)
 
 Live data 2026-11-03 22:45 to 2026-11-07 07:30 UTC, about 80 h, scored on the final plan.

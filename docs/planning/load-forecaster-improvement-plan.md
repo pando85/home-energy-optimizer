@@ -553,6 +553,16 @@ prices. It approximates the service, it is not the service.
   daily correlation 0.82. It ignores derate, idle drain, measured efficiency, PD-loop lag, dwell cost
   and the soft cap.
 
+Reproduce: `uv run python hack/load_forecast_value_replay.py --from 2026-11-04 --to 2026-11-18
+[--run-id <name>]` (`--to` is exclusive; read-only against Prometheus; about 1 to 2 minutes with the
+variants, `--skip-variants` for the six forecast and perfect runs). It prints the gap per rule, by
+hour bucket and week, the error split into heat pump and rest, the sensitivities and the
+replay-vs-realised fidelity. The terminal value is the window's mean price to the cent
+(`--terminal-value` overrides it) and the wear cost is the shipped `planning.throughput_cost_eur_per_kwh`;
+the sensitivities are terminal value -20 % and +20 %, wear 0 and twice. The heat-pump hybrids use the
+package's LF-0 kernel on the local day grid (the 25-hour clock-change day aligned by position, as in
+the service), which moves them by a few tenths of a percent of the saving against the ad-hoc run.
+
 **Cheap candidates (P2 again, 2026-08-01 to 2026-11-17).** Every 15-minute issue time, horizons 15
 minutes to 24 hours, price-weighted MAE against LF-0.
 
@@ -562,6 +572,13 @@ minutes to 24 hours, price-weighted MAE against LF-0.
 | `trailing_median`, 28 days | -4 %, interval includes zero |
 | UTC-aligned history | -2.6 % overall; -33 % in 18 to 21 h in the weeks after the autumn change (-16 % in the spring 2026 replicate), transient for about 4 weeks after each change |
 | Ceiling with the heat pump known | all heat pump -50 %; hot water only -21 % overall and -44 % in 18 to 21 h; heating only -3 % (the heating season has barely started: re-check with winter data only if wanted) |
+
+Reproduce: `uv run python hack/load_forecast_candidates.py --preset autumn-2026 [--run-id <name>]`, and
+`--preset spring-2026` for the replicate (2026-03-17 to 2026-05-14). It prints the MAE and
+price-weighted MAE per horizon bucket against LF-0 for the whole window and each sub-period, the
+bootstrap intervals over local weeks, `--check-gross` the power-vs-counter check of the gross load
+and `--diag` the hot-water profile before and after the clock change. Any other window:
+`--from <local day> --to <UTC end of issue times> [--period NAME=START[,END]]`.
 
 **NILM feasibility ([ADR-0002](../adr/0002-appliance-aware-load-forecasting.md)).**
 - Data: the main meter is stored only at 60 s, the `sensor.aquarea_*_power_consumed` sensors update
@@ -577,6 +594,14 @@ minutes to 24 hours, price-weighted MAE against LF-0.
 - Verdict: NILM is not worth building for forecasting. Observability is achievable without it
   (channel 2 minus the heat pump, Home Connect states, a cooking threshold on the rest). A hob and
   oven circuit meter would be the only ground truth for the dominant evening load.
+
+Reproduce: `uv run python hack/load_nilm_probe.py --from 2026-09-15 --to 2026-11-03 --cycles-from
+2026-10-15 --cycles-to 2026-11-18T10:20 --recent [--inventory] [--run-id <name>]` (`--cycles-to`
+defaults to now, so a later run lists later cycles). It prints the episode inventory and energy
+accounting, the washer and dishwasher cycles, the persistence-vs-identity probe and, with
+`--inventory`, the sensor cadences. The "about 90 %" of the 18 to 21 h residual variance holds for
+the hob and oven sessions together with the kettle-like bursts and the mid-power long episodes
+(91 %); the hob and oven session elements alone give 81 %.
 
 **A lever found elsewhere.** The unit-side hot-water run at about 18:15 to 18:35 local on 6 of 7
 days (fixed in UTC, source unverified; [DHW price scheduling](dhw-price-scheduling.md) section 2) is
