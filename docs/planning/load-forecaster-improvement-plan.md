@@ -3,6 +3,10 @@
 > **Parked on 2026-10-25 (owner decision).** LF-0 (`trailing_mean`) stays the forecaster in the
 > service. The code built here stays in the repository, and the passive archives keep collecting.
 > Why, what is kept and when to resume: [§6](#6-decision-parked-2026-10-25).
+>
+> **Re-checked on 2026-11-18, after the battery went live:** the plan stays parked and LF-0 stays.
+> A perfect load forecast is worth about 1 % of the battery saving under value-based load-following
+> ([§7](#7-re-check-after-the-battery-went-live-2026-11-18)).
 
 - **Status (2026-10-25):** P0, P2 and P3 are done; P2 failed G2, so LF-0 stays the reference. The P1 forecaster seam (`load_forecast.py`) and the
   P1 evaluation harness (`forecast-eval`, see
@@ -517,6 +521,8 @@ kept and documented, not reverted.
    instead of persistence temperature if they are better.
 2. **The real battery appears in Home Assistant.** Its size and the post-commissioning gross load
    change the prize, so re-run P0 first, as the P7 "revalidate after commissioning" note says.
+   *Evaluated 2026-11-18 ([§7](#7-re-check-after-the-battery-went-live-2026-11-18)): the prize is
+   about 1 % of the battery saving, so this does not reopen the plan.*
 3. **The household or the AppDaemon rules change materially**, for example a new heat pump schedule, a
    new large load, or a tariff change. Re-run P0 and P2.
 4. **A cheap hot-water fix is wanted.** Test LF-0 for the hot-water component inside `structured`.
@@ -525,3 +531,57 @@ kept and documented, not reverted.
 **How to resume.** Read §P4 (both runs), the private findings `p4-findings.md` and `p4b-findings.md`
 in `forecast-eval/`, `po-c-findings.md` in `price-eval/`, and the Price Outlook plan. Refresh OMIE
 with `extract --source omie` before any run that uses `omie_period`.
+
+## 7. Re-check after the battery went live (2026-11-18)
+
+Resume trigger 2 of §6 (the battery is commissioned) was evaluated with read-only experiments on the
+live regime, 2026-11-04 to 2026-11-17. Raw series and run outputs stay in the private data dir.
+
+**Value of a perfect load forecast.** A rolling-LP replay re-planned every 15 minutes, executed
+against the minute-level real load with the value-based load-following of the service and the PVPC
+prices. It approximates the service, it is not the service.
+
+- A perfect load forecast is worth about **1 % of the battery saving** under value-based
+  load-following, within the replay's own error. The same replay under the old plan-SOC following
+  rule gives about 9 %, and the P0 study of 2026-10-25 gave about a fifth.
+- Why: load-following absorbs timing errors in real time, and the usable battery energy (about
+  3.8 kWh) is smaller than the 18:00 to 22:00 load, so the battery empties into the peak whatever the
+  forecast says.
+- The heat pump carries about 70 % of the error variance, but a perfect heat-pump forecast alone is
+  worth a fraction of that 1 %. A bias-corrected LF-0 changes nothing.
+- Replay fidelity: about 4 % above the realised saving in the second week and 28 % in the first;
+  daily correlation 0.82. It ignores derate, idle drain, measured efficiency, PD-loop lag, dwell cost
+  and the soft cap.
+
+**Cheap candidates (P2 again, 2026-08-01 to 2026-11-17).** Every 15-minute issue time, horizons 15
+minutes to 24 hours, price-weighted MAE against LF-0.
+
+| Candidate | Result |
+|---|---|
+| Nowcast anomaly correction (best: 15-minute window, tau 60 min) | -16 % at 0 to 1 h only, about 0 beyond; worse in 18 to 21 h and after the clock change |
+| `trailing_median`, 28 days | -4 %, interval includes zero |
+| UTC-aligned history | -2.6 % overall; -33 % in 18 to 21 h in the weeks after the autumn change (-16 % in the spring 2026 replicate), transient for about 4 weeks after each change |
+| Ceiling with the heat pump known | all heat pump -50 %; hot water only -21 % overall and -44 % in 18 to 21 h; heating only -3 % (the heating season has barely started: re-check with winter data only if wanted) |
+
+**NILM feasibility ([ADR-0002](../adr/0002-appliance-aware-load-forecasting.md)).**
+- Data: the main meter is stored only at 60 s, the `sensor.aquarea_*_power_consumed` sensors update
+  every 300 s, and `shellyem_main_channel_2` is a branch inside channel 1 that feeds the heat pump,
+  washer and dishwasher. `circuit_1_power` (from 2026-10-31) is about gross minus channel 2.
+- Residual episodes (2026-09-15 to 2026-11-02): cooking (hob and oven, median about 1.4 kW, about 17
+  minutes, about 1.4 per day) is about 12 % of the residual energy overall and about 22 % in 18 to 21
+  h, and explains about 90 % of the 18 to 21 h residual variance. Washer and dishwasher are identified
+  with high confidence through channel 2 and Home Connect. Overlap is rare.
+- Forecast probe: cluster identity or Home Connect flags give no gain over persistence at 15 to 120
+  minutes. Since 2026-10-15 there were 5 dishwasher and 11 washer cycles, and delayed starts never
+  fell in 18 to 21 h.
+- Verdict: NILM is not worth building for forecasting. Observability is achievable without it
+  (channel 2 minus the heat pump, Home Connect states, a cooking threshold on the rest). A hob and
+  oven circuit meter would be the only ground truth for the dominant evening load.
+
+**A lever found elsewhere.** The unit-side hot-water run at about 18:15 to 18:35 local on 6 of 7
+days (fixed in UTC, source unverified; [DHW price scheduling](dhw-price-scheduling.md) section 2) is
+real peak consumption that the battery cannot cover. Moving it is a load-shift question, not a
+forecast one.
+
+**Conclusion.** LF-0 stays. Resume trigger 2 is evaluated and does not reopen the plan. Reopen it
+only if load-following is switched off or the plant changes materially, for example a larger battery.

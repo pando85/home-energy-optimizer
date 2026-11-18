@@ -93,6 +93,23 @@ Live data 2026-11-03 22:45 to 2026-11-07 07:30 UTC, about 80 h, scored on the fi
 - **To do:** recheck forecast quality (gate G2) after 2026-11-22, the end of the 28-day settling window, and again
   after the March 2027 change. This was a diagnosis, not a recalibration: the status below is unchanged.
 
+## Live review (2026-11-18)
+
+Service counters 2026-11-04 to 2026-11-17, scored on the final plan. The day-ahead and final plans are
+nearly identical.
+
+- MAE about 280 W per slot. The forecast is low by about 76 W on a mean load of about 760 W.
+- Worst hours: 03 to 05 local (night heat-pump spikes, under-forecast by 190 to 400 W) and 12 to 14.
+  At 18 h the forecast is low by about 310 W and at 19 h high by about 360 W: the clock-change artefact
+  of the review above is still visible.
+- Mean absolute daily energy error about 11 % on the 7 complete days.
+- **Value of a better forecast is low now.** A perfect load forecast is worth about 1 % of the battery
+  saving under value-based load-following, and none of the cheap candidates (nowcast correction,
+  `trailing_median`, UTC-aligned history, heat-pump ceilings) is worth a change: see
+  [plan section 7](../planning/load-forecaster-improvement-plan.md#7-re-check-after-the-battery-went-live-2026-11-18).
+  The recalibration below stays the way to refresh the page, but it is a low-value one while
+  load-following is on.
+
 ## Status
 
 **stale** (2026-11-03): the battery is commissioned, so the forecast now learns from reconstructed gross load
