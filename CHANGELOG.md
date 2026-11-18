@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.19.1](https://github.com/pando85/home-energy-optimizer/tree/v0.19.1) - 2026-11-18
+
+### Fixed
+
+- climate: Use the owner's comfort floor helper whatever its age ([dfd37f3](https://github.com/pando85/home-energy-optimizer/commit/dfd37f31525139c9217583a440537613689f678c))
+
+### Documentation
+
+- load-forecast: Record the 2026-11-18 load forecast value and NILM probe ([49f36a2](https://github.com/pando85/home-energy-optimizer/commit/49f36a21f4d2284bdcab481999bfb91d7d76d64f))
+
 ## [v0.19.0](https://github.com/pando85/home-energy-optimizer/tree/v0.19.0) - 2026-11-18
 
 ### Added
