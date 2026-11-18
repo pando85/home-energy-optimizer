@@ -9,7 +9,7 @@ Home Assistant PVPC sensor, fed by the homelab deployment. Roadmap: [Price Outlo
 ## Interfaces
 
 - **In:** the archived realised PVPC per hour (EUR/kWh, tolls and charges included, **taxes excluded**),
-  published next-day prices from about 20:15 local, optionally OMIE day-ahead for an estimate at 14:00.
+  published next-day prices from about 20:35 local (median; 20:19 to 20:50 over 24 days), optionally OMIE day-ahead for an estimate at 14:00.
 - **Out:** `price_eur_per_kwh` per slot with `price_quality`; tariff period labels; the pre-tax cost basis.
 - **Consumers:** [battery-optimizer](battery-optimizer.md), [boost-mode](boost-mode.md) (its threshold must
   use the same pre-tax basis), and every `dataset_id` (the tariff file is hashed into it).
@@ -22,6 +22,7 @@ Home Assistant PVPC sensor, fed by the homelab deployment. Roadmap: [Price Outlo
   and Sunday all valle) are **labels only**: no result takes its price from the YAML.
 - Price outlooks evaluated on the legacy history: `exact`, `published_only`, `persistence`, and the OMIE
   `omie_period` estimate, which passed its gate GC ([plan](../planning/price-outlook-improvement-plan.md)).
+- Re-checked on the live regime 2026-11-18: knowing tomorrow at 14:00 is worth about 1 % of the battery saving, `persistence` captures as much as `omie_period`, and in Oct–Nov the estimate ranks hours well (Spearman about 0.98) but only about two thirds of hours fall within ±20 % of the realised price ([plan §4](../planning/price-outlook-improvement-plan.md#4-re-check-on-the-live-regime-2026-11-18)).
 
 ## Assumptions
 
@@ -34,9 +35,10 @@ Home Assistant PVPC sensor, fed by the homelab deployment. Roadmap: [Price Outlo
 - The price can be negative (26 h at or below 0, minimum -0.0126 EUR/kWh pre-tax, 2024-01 to 2026-10) and
   every consumer must keep it as is; the optimiser does, see
   [battery-optimizer](battery-optimizer.md) for the code references.
+- PVPC is hourly: no change within the hour through 2026-11 (OMIE is 15-minute since 2025-10-01).
 - The service never forecasts unpublished prices; its horizon ends at the last published slot.
-- The periodic full-charge decision depends on the next-day publication time (about 20:15 local, measured by the
-  `pvpc_snapshots` archive): it is taken in the first solve after tomorrow's prices are published, about 3.5 h before
+- The periodic full-charge decision depends on the next-day publication time (about 20:35 local, median; 20:19 to 20:50 over 24 days, measured by the
+  `pvpc_snapshots` archive and the publication flag): it is taken in the first solve after tomorrow's prices are published, about 3.5 h before
   the day starts, and never on an estimated price.
 - **Hard constraint (owner-confirmed 2026-10-30):** the 5.0 kW contracted import limit is enforced by the
   smart meter, which cuts supply on overload, and this has happened. It is not a cost term and must not be
