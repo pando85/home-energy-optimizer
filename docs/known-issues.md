@@ -228,7 +228,7 @@ Omnibattery's PD loop swings by about ±150 to 200 W on a ~2 s period. With the 
 `discharge_margin_w` the grid went to -10..-94 W during the discharge test (Shelly `total_returned` stayed
 0.0 Wh). The config then used 200 W; the code default stays 50 W.
 
-**Deployed value 100 W since 2026-11-05 (owner decision).** 2-second HA grid samples over about 17 h of live discharge on 2026-11-04/05 at the 200 W target had a median of 192 to 195 W, a 1st percentile of 131 to 151 W and were below 0 W in 0 to 0.04% of samples; replaying 100 W on the same data gives about 0.2% of time below zero and about 1 Wh/day of export. Export is alerted from the
+**Deployed value 100 W from 2026-11-05, 50 W since 2026-11-12 (owner decision).** 2-second HA grid samples over about 17 h of live discharge on 2026-11-04/05 at the 200 W target had a median of 192 to 195 W, a 1st percentile of 131 to 151 W and were below 0 W in 0 to 0.04% of samples; replaying 100 W on the same data gives about 0.2% of time below zero and about 1 Wh/day of export. Export is alerted from the
 Shelly's device-integrated returned-energy counter (homelab alerts `BatteryGridExport` and
 `BatteryGridExportSustained`), not from the 2 s samples. A smoother Omnibattery PD tuning profile (owner
 setting) would allow a smaller margin still.
@@ -265,6 +265,17 @@ lever is `pd_min_cycle_interval` 0, which cuts about 15 to 20% of the export at 
 **Open:** whether the grid registration is "self-consumption without surplus" (zero export required; RD 244/2019,
 UNE 217001-IN). Check with the installer, as part of
 [TODO-0.6](planning/home-battery-optimizer-implementation.md).
+
+**Measured 2026-11-12 to 11-17 (margin 50 W from 2026-11-12, value-based load-following live).** Daily export from the
+Shelly's returned-energy counter was 5.6, 5.3, 0.4, 8.5, 16.9 and 65 Wh, 98% of it while load-following was engaged.
+The 65 Wh day (2026-11-17) was mostly one 30-minute discharge slot in which an appliance on circuit 1 cycled about
+2.3 kW on and off every minute: about 45 Wh in that slot, 22 Wh in its worst 15-minute window, which fired the critical
+`BatteryGridExportSustained` alert. The export costs about EUR 0.01 a day against about EUR 0.04 a day of
+load-following value. **Owner decision 2026-11-18: accepted**; the homelab alerts are raised to `BatteryGridExport`
+30 Wh/24 h (from 5) and `BatteryGridExportSustained` 40 Wh/15 min (from 10) ([regime log](components/regime-log.md)).
+The installer check of the grid registration (TODO-0.6) **stays open**. Consequence: `BatteryMarginCanBeLowered`
+(export at most 7 Wh/week) cannot fire while load-following exports at this level, so the margin step-down of the
+[tuning plan](planning/discharge-margin-tuning.md) is parked at the owner's 50 W.
 
 ### The battery holds its last command when Home Assistant is down
 
@@ -375,7 +386,7 @@ large discharge shortfall over the first 24 hours of live control.
 - The real live shortfall (the morning discharge window) has two causes, both by design or forecast:
   - **No export.** Discharge is at most the house load, and the house used less than the plan assumed. The load
     forecast ran high, visible as bias on the `battery-load-forecast` dashboard.
-  - **Import margin.** `actuation.discharge_margin_w` (200 W at the time, 100 W deployed since 2026-11-05) keeps that much
+  - **Import margin.** `actuation.discharge_margin_w` (200 W at the time; 100 W from 2026-11-05, 50 W since 2026-11-12, owner decision) keeps that much
     grid import while discharging, so
     at a house load of a few hundred watts only the load minus the margin can be discharged.
 - Not involved: the per-slot discharge cap (`number.omnibattery_system_max_discharge_power`) was above the
@@ -385,7 +396,7 @@ large discharge shortfall over the first 24 hours of live control.
 planned discharge in the solver at `max(0, forecast house load - actuation.discharge_margin_w)`: the no-export
 row of the LP becomes `discharge[t] - charge[t] <= max(0, load[t] - margin * h)` (`oracle.solve_oracle(...,
 discharge_margin_kw=...)`), so the plan stops promising energy the actuator cannot deliver. One knob: the margin
-is `actuation.discharge_margin_w` (100 W deployed since 2026-11-05), read by the planner when the switch is on, and the day-ahead
+is `actuation.discharge_margin_w` (100 W from 2026-11-05, 50 W since 2026-11-12, owner decision), read by the planner when the switch is on, and the day-ahead
 and final plan share it (the same solve). Off, the model, the plans, `inputs_hash` and `config_hash` are
 byte-identical to before; on, the value joins both hashes. Enabled in the homelab `service.yaml` since 0.14.0 on
 2026-11-05 ([regime log](components/regime-log.md)); compare the "Final plan energy not delivered" panel and the
@@ -425,7 +436,39 @@ per-slot cap whenever the load allowed, with no temperature or actuator derating
 the evening peak was forecast about 1 h late and overestimated. Lesson: 15-minute means mix load-limited and
 cap-limited minutes, so do not infer an actuator shortfall from them. Next review about 2026-11-11 (7 live days).
 
+**Weekly performance reviews (2026-11-11 and 2026-11-18, read only).** Method: the realised saving is the sum over
+1-minute samples of the pre-tax PVPC price times (house load minus grid import), with no export credit. The bound is the
+repository's `oracle.solve_oracle` with perfect foresight on the 15-minute actual load and price, the `tariff.yaml`
+battery spec, a throughput cost of 0.01 EUR/kWh and the terminal SOC fixed to the start SOC. The "deployed-model" bound
+adds the margin (50 W), the high-SOC cost (0.90, 0.01) and the soft cap (1.5 kW, 0.005).
+
+| Week | Realised | Bound (deployed-model) | Capture (deployed-model) |
+|---|---|---|---|
+| 2026-11-04 to 11-10 | EUR 2.75 | EUR 3.79 (3.60) | 72% (76%) |
+| 2026-11-11 to 11-17 | EUR 4.02 | EUR 5.00 (4.92) | 80% (82%) |
+
+- **2026-11-04 to 11-10.** The battery ended the week 20 SOC points lower than it started; with a fair terminal (end at
+  20%) the bound is 3.99 (3.80) and the capture 69% (72%). The same-week estimate of 2026-11-11 was EUR 2.90 realised
+  against about 4.06, about 71%. **Caveat:** per the homelab git history the deployed config had no discharge margin bound,
+  no load-following, no dwell cost and no soft cap from 2026-11-08 15:01 to 2026-11-11 16:36 (+01:00), so this week mixes
+  two regimes ([regime log](components/regime-log.md)); the pod rollout times were not read.
+- **2026-11-11 to 11-17** (value-based load-following live, margin 50 W from 11-12). Start and end SOC were about equal.
+  Load-following added 4.2 kWh worth EUR 0.12 in the week. The remaining gap is dispatch timing: too little discharge at
+  the 17 to 19 h peak and energy carried into the late evening and overnight (11-14, 11-15), consistent with the known
+  late-evening load-forecast artefact that should correct itself around 2026-11-22
+  ([battery-load-forecast](components/battery-load-forecast.md#live-review-2026-11-07)). On 2026-11-12 the battery charged
+  4.9 kWh overnight at 0.16 to 0.23 EUR/kWh to 99% instead of in the midday trough at about 0.04 EUR/kWh; the cause is
+  **not yet established** and it cost about EUR 0.42 that day.
+- **Reserve-floor flapping (0.18.2) confirmed fixed:** allow_charge writes were 6 to 28 per day since the fix, against
+  117 in 24 h before.
+
 ## Battery losses and idle drain are not in the model
+
+**Correction 2026-11-11 (recorded 2026-11-18): the idle drain below is not supported.** The energy counters give an
+all-in AC-to-AC efficiency of about 0.81 between top-of-charge anchors, so an idle drain is at most about 5 W and the
+planner's 0.80 round trip is right on aggregate. The 26 to 34 W estimates (2026-11-07 and 11-08) are not supported and
+their cause is not established; branch `feature/idle-drain-model` is **not to be merged** with 26 W. The per-leg
+efficiencies and their power dependence are not affected. The text below is kept as written at the time.
 
 Status: **open, proposed for the 7-day review (around 2026-11-11 to 11-14).** Live data 2026-11-03 22:45 to 2026-11-07
 07:30 UTC (about 80 h) disagree with the model's scalar 0.80 round trip and zero idle draw

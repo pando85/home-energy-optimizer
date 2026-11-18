@@ -27,12 +27,21 @@ Margin history:
 | commissioning | 50 W | code default; brief exports of -10 to -94 W, PD swing of +-150 to 200 W |
 | 2026-11-03 | 200 W | first committed value (homelab, with the 0.5.0 `dry_run` deploy, about 23:26 local) |
 | 2026-11-05 | 100 W | owner decision, evidence below |
+| 2026-11-12 | 50 W | owner decision (homelab PR #4806), see the note below |
 
 **Evidence for 100 W.** 2-second Home Assistant grid samples over about 17 h of live discharge on 2026-11-04/05 at the
 200 W target: median 192 to 195 W, 1st percentile 131 to 151 W, below 0 W in 0 to 0.04% of the samples. Replaying 100 W
 on the same data gives about 0.2% of the time below zero and about 1 Wh/day exported, and frees about 0.5 to 1.2 kWh/day
 of discharge in low-load hours. Omnibattery's `pd_controller_deadband` is 40 W, so the practical floor is about 50 to
 75 W. Each further 25 W step is worth only a few EUR per year: **lower it only on clean data.**
+
+**Note 2026-11-18: step-down parked at the owner's 50 W.** The owner lowered the margin to 50 W on 2026-11-12 without
+waiting for `BatteryMarginCanBeLowered`. Daily export 2026-11-12 to 11-17 was 0.4 to 65 Wh, 98% of it under
+load-following, and the owner accepted it on 2026-11-18 (alerts raised to 30 Wh/24 h and 40 Wh/15 min,
+[known issues](../known-issues.md#the-pd-loop-oscillates-the-discharge-margin-was-too-small)). The rule's condition of at
+most 7 Wh of export per week cannot hold at this level, so it cannot fire while load-following exports, and the
+25 W step-down of section 2.4 is parked. The alert thresholds quoted below are the ones in force when this plan
+was written (5 Wh/24 h and 10 Wh/15 min).
 
 **Existing alerts** (homelab, `apps/battery-optimizer/rules-service/actuator.yaml`); these are the "raise it" signals:
 
