@@ -132,7 +132,9 @@ token, and the allowlist in `ha_guard` is the restriction (Home Assistant cannot
      switch to `DHW`;
    - the water target is written **only in direct mode** (`sensor.aquarea_heating_mode` = 1, available; the mode is
      static, so an availability test and not an age test), as an **integer clamped to 20 to 35 degC**, only on a
-     **change of at least 1 K** and **at most once per 15 min**; in curve mode (0) or with the sensor unavailable it
+     **change of at least 1 K** and **at most once per 15 min** (**amended 2026-11-20:** while heating already runs, a
+     change of at least 2 K, see the [amendment](#amendment-2026-11-20-quiet-thermostats-restarting-home-assistant-and-the-water-hysteresis));
+     in curve mode (0) or with the sensor unavailable it
      writes no water target and raises an alert metric (`not_direct_mode`);
    - **validated payloads**: a value that is not a finite integer in range never leaves the process (an empty or
      garbage payload would become 0 degC in the unit);
@@ -147,8 +149,9 @@ token, and the allowlist in `ha_guard` is the restriction (Home Assistant cannot
    configured value, **default 21 degC** (**amended 2026-11-18:** available and in range, no age test, see the
    [amendment](#amendment-2026-11-18-floor-helpers-have-no-age-test)); it releases at the floor plus `climate_actuation.floor_margin_c` (default
    0.5 K), which is the hysteresis against chatter. The plan can never lower a floor or shorten the comfort schedule. A room with a missing or `unavailable`
-   reading cannot be proven below its floor and is skipped; no usable room reading at all is "observer without
-   state" (decision 7).
+   reading cannot be proven below its floor and is skipped (**amended 2026-11-20:** an available reading of a
+   steady room is not stale, see the [amendment](#amendment-2026-11-20-quiet-thermostats-restarting-home-assistant-and-the-water-hysteresis));
+   no usable room reading at all is "observer without state" (decision 7).
 
 7. **Fallback = the safe heating state.** On any of: a stale, missing or invalid plan (including a plan not solved
    by this process, so after a restart), a solver failure (`plan_failed`), an observer without state, no usable
@@ -309,3 +312,49 @@ used when it is **available in the Home Assistant session** (a finite number, no
 session (`ha_not_synced`), so a floor is only ever acted on while the session is synced. The rest of decision 6 is
 unchanged. The climate shadow's Prometheus read keeps its 2 h rule: the exporter emits a sample on every scrape, so
 a sample age there is a scrape-freshness test, not a configuration age.
+
+## Amendment 2026-11-20: quiet thermostats, a restarting Home Assistant and the water hysteresis
+
+Three rules of decisions 5 to 7 produced avoidable writes in the first two live days (2026-11-18 to 11-20). None
+widens the allowlist, adds a service call or entity, or weakens the intent that the actuator fails to `Heat+DHW`
+when control is really lost.
+
+1. **A quiet thermostat is not stale.** A thermostat reading older than `room_max_age_s` (3600 s) was skipped, but Home
+   Assistant publishes a climate entity's state only when the value or attributes change, so a steady room went
+   "stale" after an hour; on 2026-11-19 at 17:53 UTC all three did (last updates 60 to 75 min old) and the actuator
+   wrote the safe state for 30 minutes of the evening peak while the plan said off. From this amendment an
+   **available** reading is usable while the session is synced, whatever its age; `room_max_age_s` (default now
+   21600 s, 6 h) is only a backstop for a feed that went silent without turning `unavailable`. The age is still
+   `max(last_updated, last_reported)` of the entity store; the service does not subscribe to `state_reported`, so
+   for a steady thermostat it is the last change. Unavailable, missing and implausible readings are skipped as before.
+2. **A restarting Home Assistant is held, not a fallback.** A restart makes `sensor.aquarea_mode` (and the
+   thermostats) `unavailable` for a few minutes; the actuator treated that as lost control, wrote the safe state
+   (on 2026-11-18 at 21:47 UTC after the comfort window: 30 minutes of heating, 13 of compressor) and, with the
+   unit's own sensor unreadable, could not read its writes back (`safe_state_failed` at 14:53 and 15:12 UTC). Now,
+   after the session was lost and is synced again, or while the mode sensor is unavailable, the actuator **holds** for
+   `climate_actuation.ha_restart_grace_s` (default 600 s, 0 turns it off, at most 1800): it writes nothing but the
+   heartbeat, keeps the last applied state and reports the guard reason `restart_grace`. The grace starts at the
+   resync or when the first restart symptom is seen (the outage itself does not use it up). It covers the
+   two restart-caused fallbacks `mode_sensor_unavailable` and `no_room_reading` (the latter only inside such an
+   episode: thermostats unavailable alone are still an immediate fallback), a plan write that fails because the
+   mode sensor or the session went away (no `write_failed` safe-state attempt, no alert), and an owner select
+   (`input_select.climate_optimizer_mode`) that is `unavailable`, `unknown` or missing, which would otherwise be
+   `select_left_live` (decision 3 still holds: nothing is written on it). An explicit, available select other than
+   `live` (`shadow`, `off`, any other option) stays immediate, as does every other fallback reason, including
+   `no_plan` (a missing plan right after the optimizer's own restart is a different event). If the condition
+   outlasts the grace the safe state is written as before (for the select: `select_left_live`), so a real loss still
+   ends in `Heat+DHW`.
+
+   **Heartbeat and watchdog.** The heartbeat (decision 8) **continues during a hold** while the HA session is synced:
+   the optimizer is alive and holding on purpose, only the unit's sensor (or the select) is unreadable, so the homelab
+   `climate_optimizer_watchdog` must not repeat the safe state under the grace. While the session is not synced no
+   heartbeat can be written (nor anything else), so the watchdog acts only if the hold outlasts its 10-minute
+   heartbeat timeout because HA is really down. Once the grace expires the safe state is written and the heartbeat
+   follows its old rule (only while the safe state is confirmed).
+3. **Water-target hysteresis.** Hourly replans moved the planned water target by 1 K back and forth (56 of 198
+   comparable slots; 28, 27, 28, 27, 28 on 2026-11-20 02:00 to 04:10 UTC), each one a write and a `water_interval` hold
+   for the 15-minute rule. While heating already runs, the water target is now written only when the desired value
+   differs from the unit's by at least 1 K plus `climate_actuation.water_hysteresis_k` (default 1, so 2 K); at the start of
+   a heating block (off to on) and for the safe state it is written exactly (a change of at least 1 K, as before).
+   Integer, 20 to 35, direct mode only and once per 15 min are unchanged; `water_hysteresis_k: 0` restores the old
+   rule. The MPC is untouched: the plan still flip-flops, the actuator no longer follows it.

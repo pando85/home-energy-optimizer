@@ -510,6 +510,7 @@ class ShadowService:
                 refresh=self._refresh_entities,
                 record=self._record_climate_actuation,
                 metrics=self.metrics,
+                synced=lambda: self.ha is not None and self.ha.stats.synced,
             )
         if acting:
             self.actuator = Actuator(

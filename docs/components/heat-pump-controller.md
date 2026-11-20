@@ -24,11 +24,13 @@ on the tank target are in [dhw-price-scheduling](../planning/dhw-price-schedulin
   mode; its helpers and watchdog are removed.
 - **Space heating, live since 2026-11-18 (ADR-0009):** the optimizer's climate actuator
   writes `input_select.heishamon_heatmode` (`Heat+DHW` / `DHW`, minimum on 30 min and off 20 min) and the integer
-  Z1 water target `input_number.heishamon_heatshift_z1` (20 to 35 degC, direct mode only, steps of at least 1 K, once
-  per 15 min) and a heartbeat helper, only while `climate_actuation.mode` is `live` and the owner's
+  Z1 water target `input_number.heishamon_heatshift_z1` (20 to 35 degC, direct mode only, steps of at least 1 K, 2 K
+  while heating already runs, once per 15 min) and a heartbeat helper, only while `climate_actuation.mode` is `live` and the owner's
   `input_select.climate_optimizer_mode` is `live` (the legacy toggle no longer exists). DHW
   (`switch.aquarea_force_dhw_mode`, the tank target), the heater, setpoints and cooling stay out of its reach
-  ([service](../service.md#live-climate-control-adr-0009)).
+  ([service](../service.md#live-climate-control-adr-0009)). Since 2026-11-20 (ADR-0009 amendment) a steady thermostat
+  reading stays usable while HA is synced (backstop 6 h), a restarting HA is held for 10 min before the safe state
+  is written, and a 1 K flip-flop of the planned water target is not written.
 - **Consumers:** the whole-house load that the [battery load forecast](battery-load-forecast.md) learns
   from; [cop-model](cop-model.md) and [thermal-model](thermal-model.md) data; LF-1
   ([hp-consumption-forecast](hp-consumption-forecast.md)) replays it.

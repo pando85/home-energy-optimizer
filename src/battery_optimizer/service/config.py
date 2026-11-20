@@ -413,6 +413,7 @@ CLIMATE_ACTUATION_MODES: tuple[str, ...] = ("shadow", "dry_run", "live")
 
 #: Longest climate actuator tick: well inside the HA watchdog's 10-minute heartbeat window.
 MAX_CLIMATE_TICK_INTERVAL_S = 120.0
+MAX_CLIMATE_RESTART_GRACE_S = 1800.0
 
 #: The comfort-floor helper's accepted range in degC (ADR-0009 decision 6), also the range of the
 #: configured default floor.
@@ -495,8 +496,16 @@ class ClimateActuationSettings:
     readback_timeout_s: float = 30.0
     max_attempts: int = 3
     shutdown_timeout_s: float = 20.0
-    #: A thermostat reading older than this is not usable (a stale reading proves nothing).
-    room_max_age_s: float = 3600.0
+    #: Backstop for a thermostat reading: HA publishes a steady room's state only when it changes,
+    #: so an available reading in a synced session is usable until it is this old (a feed that went
+    #: silent without turning ``unavailable``).
+    room_max_age_s: float = 21600.0
+    #: A restarting HA (resync, mode sensor unavailable) is held, not written to, this long before
+    #: the safe state; 0 turns the grace off.
+    ha_restart_grace_s: float = 600.0
+    #: While heating runs the water target moves only when the desired one is more than this many K
+    #: beyond the 1 K step from the written one (1: a difference of 2 K or more); 0 turns it off.
+    water_hysteresis_k: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -1292,6 +1301,8 @@ _CLIMATE_ACTUATION_KEYS = (
     "max_attempts",
     "shutdown_timeout_s",
     "room_max_age_s",
+    "ha_restart_grace_s",
+    "water_hysteresis_k",
 )
 _CLIMATE_ACTUATION_ENTITY_KEYS = (*CLIMATE_ACTUATION_DOMAINS, "rooms", "floor_helper_prefix")
 _FLOOR_PREFIX = re.compile(r"^input_number\.[a-z0-9_]*_$")
@@ -1386,7 +1397,16 @@ def _parse_climate_actuation(
         max_attempts=_int(raw.get("max_attempts", defaults.max_attempts), f"{name}.max_attempts"),
         shutdown_timeout_s=num("shutdown_timeout_s"),
         room_max_age_s=num("room_max_age_s"),
+        ha_restart_grace_s=num("ha_restart_grace_s", allow_zero=True),
+        water_hysteresis_k=num("water_hysteresis_k", allow_zero=True),
     )
+    if settings.ha_restart_grace_s > MAX_CLIMATE_RESTART_GRACE_S:
+        raise ValueError(
+            f"service config: {name}.ha_restart_grace_s must be <= "
+            f"{MAX_CLIMATE_RESTART_GRACE_S:.0f} s: a restart that long is a loss of control"
+        )
+    if settings.water_hysteresis_k > 4.0:
+        raise ValueError(f"service config: {name}.water_hysteresis_k must be at most 4 K")
     if settings.tick_interval_s > MAX_CLIMATE_TICK_INTERVAL_S:
         raise ValueError(
             f"service config: {name}.tick_interval_s must be <= {MAX_CLIMATE_TICK_INTERVAL_S:.0f} "
