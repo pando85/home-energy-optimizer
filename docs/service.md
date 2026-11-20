@@ -1545,13 +1545,17 @@ if the heartbeat is older than 10 min while the select is `live`.
 
 **A restarting Home Assistant is held, not a fallback** ([ADR-0009 amendment 2026-11-20](adr/0009-live-climate-control.md#amendment-2026-11-20-quiet-thermostats-restarting-home-assistant-and-the-water-hysteresis)).
 After the HA session was lost and syncs again, or while `sensor.aquarea_mode` is unavailable, the actuator holds for
-`ha_restart_grace_s` (600; 0 off, at most 1800): no write, no heartbeat, the last applied state kept, guard reason
-`restart_grace` (`climate_actuator_guard_reason`, so `guard_ok` is 0 meanwhile). It covers `mode_sensor_unavailable`,
-`no_room_reading` inside such an episode, and a plan write that failed because the mode sensor or the session went
-away (no `write_failed` fallback and no `safe_state_failed` alert for it). The grace starts at the resync or when the
-mode sensor is first seen unavailable. If the condition persists past it, the safe state is written as above. All
-other fallback reasons (stale, foreign or missing plan, solver failure, observer, select leaving `live`) are
-immediate.
+`ha_restart_grace_s` (600; 0 off, at most 1800): no write, the last applied state kept, guard reason
+`restart_grace` (`climate_actuator_guard_reason`, so `guard_ok` is 0 meanwhile). **The heartbeat continues** while the
+HA session is synced (the optimizer is alive and holding on purpose), so the homelab watchdog does not repeat the safe
+state under the grace; without a session nothing can be sent, and the watchdog fires only if the hold outlasts its
+10-minute heartbeat timeout because HA is really down. The hold covers `mode_sensor_unavailable`, `no_room_reading`
+inside such an episode, a plan write that failed because the mode sensor or the session went away (no `write_failed`
+fallback and no `safe_state_failed` alert for it), and an owner select that is `unavailable`, `unknown` or missing
+(guard reasons `select_not_live` and `restart_grace` together; otherwise `select_left_live`). The grace starts at the
+resync or at the first such symptom. If the condition persists past it, the safe state is written as above. An
+explicit, available select other than `live` and all other fallback reasons (stale, foreign or missing plan, solver
+failure, observer) are immediate.
 
 **Configuration.** `climate_actuation:` in `config/service.yaml` (a copy of the keys is in
 [configuration](configuration.md#live-climate-control-climate_actuation)): `mode`, `tick_interval_s`,

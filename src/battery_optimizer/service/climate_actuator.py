@@ -17,9 +17,12 @@ turns it into a desired state:
   no heating.
 * A Home Assistant restart is not a loss of control: after the session drops and syncs again, or
   while the mode sensor is unavailable (the room readings too, right after a restart), the actuator
-  **holds** (writes nothing, no heartbeat, guard reason ``restart_grace``) for
+  **holds** (writes nothing but the heartbeat, guard reason ``restart_grace``) for
   ``ha_restart_grace_s`` (600 s by default) and only then falls back, if the condition persists.
-  A write that fails because the mode sensor or the session went away is held the same way.
+  A write that fails because the mode sensor or the session went away is held the same way, and so
+  is an owner select that is unavailable or missing (an explicit ``shadow``/``off`` is immediate).
+  The heartbeat continues while the session is synced: the optimizer is alive and holding on
+  purpose, so the HA watchdog acts only if HA is really down.
 
 Writes are possible only when the deployed ``climate_actuation.mode`` is ``live`` (``dry_run`` runs
 all of this and records the writes it would make, sending nothing) **and** the owner's
@@ -810,7 +813,13 @@ class ClimateActuator:
             self._stand_down()
         elif r.owner != "live":
             reasons.append("select_not_live")
-            if self.in_control:  # the live -> not live edge: the safe state once, then hands off
+            unreadable = r.owner is None and self.fallback is None
+            if self.in_control and unreadable and self._start_grace(now):
+                # the select is unreadable (HA restarting), not set to something else: hold
+                self._grace_hold = "select_unavailable"
+                heartbeat = await self._hold_heartbeat(now)
+            elif self.in_control:  # the live -> not live edge: the safe state once, then hands off
+                self._grace_since = None
                 self._count("climate_actuator_fallbacks", reason="select_left_live")
                 log.warning("climate actuator fallback reason=select_left_live owner=%s", r.owner)
                 ok, writes = await self._drive_safe_state("select_left_live", r, now)
@@ -861,10 +870,10 @@ class ClimateActuator:
         if reason is not None:  # the fallback: the safe state once, then nothing until a plan
             writes: list[dict[str, Any]] = []
             if self.fallback is None and reason in _RESTART_REASONS and self._in_grace(now):
-                # HA restarting: keep the last applied state, no heartbeat; the safe state only if
-                # the condition outlasts the grace
+                # HA restarting: keep the last applied state (heartbeat only); the safe state only
+                # if the condition outlasts the grace
                 self._grace_hold = reason
-                return None, writes
+                return await self._hold_heartbeat(now), writes
             if self.fallback is None:
                 self._count("climate_actuator_fallbacks", reason=reason)
                 log.warning("climate actuator fallback reason=%s", reason)
@@ -901,7 +910,7 @@ class ClimateActuator:
             self.alert = None
         elif self._restart_failure():  # the unit or HA went away mid-write: not a fault
             self._grace_hold = "write_failed"
-            return None, writes
+            return await self._hold_heartbeat(now), writes
         else:  # the desired state failed: at least the safe state, this tick only
             self._count("climate_actuator_fallbacks", reason="write_failed")
             log.warning("climate actuator fallback reason=write_failed")
@@ -910,6 +919,19 @@ class ClimateActuator:
             writes += more
             self.alert = "write_failed" if ok else "safe_state_failed"
         return (await self._heartbeat(now) if ok else None), writes
+
+    def _start_grace(self, now: datetime) -> bool:
+        """Start the restart grace if none runs; whether *now* is inside it."""
+        if self._grace_since is None:
+            self._grace_since = now
+        return self._in_grace(now)
+
+    async def _hold_heartbeat(self, now: datetime) -> str | None:
+        """The heartbeat of a hold: the optimizer is alive and holding on purpose, so the watchdog
+        must not act while the session is synced (without a session it cannot be written)."""
+        if self._synced is not None and not self._synced():
+            return None
+        return await self._heartbeat(now)
 
     def _in_grace(self, now: datetime) -> bool:
         since = self._grace_since

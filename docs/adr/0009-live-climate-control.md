@@ -332,15 +332,25 @@ when control is really lost.
    (on 2026-11-18 at 21:47 UTC after the comfort window: 30 minutes of heating, 13 of compressor) and, with the
    unit's own sensor unreadable, could not read its writes back (`safe_state_failed` at 14:53 and 15:12 UTC). Now,
    after the session was lost and is synced again, or while the mode sensor is unavailable, the actuator **holds** for
-   `climate_actuation.ha_restart_grace_s` (default 600 s, 0 turns it off, at most 1800): it writes nothing, keeps
-   the last applied state, writes no heartbeat and reports the guard reason `restart_grace`. The grace starts at the
-   resync or when the mode sensor is first seen unavailable (the outage itself does not use it up). It covers the
+   `climate_actuation.ha_restart_grace_s` (default 600 s, 0 turns it off, at most 1800): it writes nothing but the
+   heartbeat, keeps the last applied state and reports the guard reason `restart_grace`. The grace starts at the
+   resync or when the first restart symptom is seen (the outage itself does not use it up). It covers the
    two restart-caused fallbacks `mode_sensor_unavailable` and `no_room_reading` (the latter only inside such an
-   episode: thermostats unavailable alone are still an immediate fallback), and a plan write that fails because the
-   mode sensor or the session went away (no `write_failed` safe-state attempt, no alert). If the condition outlasts
-   the grace the safe state is written as before, so a real loss still ends in `Heat+DHW` (and the homelab heartbeat
-   watchdog repeats it after 10 min without a heartbeat regardless). Every other fallback reason, including
-   `no_plan`, is unchanged: a missing plan right after the optimizer's own restart is a different event.
+   episode: thermostats unavailable alone are still an immediate fallback), a plan write that fails because the
+   mode sensor or the session went away (no `write_failed` safe-state attempt, no alert), and an owner select
+   (`input_select.climate_optimizer_mode`) that is `unavailable`, `unknown` or missing, which would otherwise be
+   `select_left_live` (decision 3 still holds: nothing is written on it). An explicit, available select other than
+   `live` (`shadow`, `off`, any other option) stays immediate, as does every other fallback reason, including
+   `no_plan` (a missing plan right after the optimizer's own restart is a different event). If the condition
+   outlasts the grace the safe state is written as before (for the select: `select_left_live`), so a real loss still
+   ends in `Heat+DHW`.
+
+   **Heartbeat and watchdog.** The heartbeat (decision 8) **continues during a hold** while the HA session is synced:
+   the optimizer is alive and holding on purpose, only the unit's sensor (or the select) is unreadable, so the homelab
+   `climate_optimizer_watchdog` must not repeat the safe state under the grace. While the session is not synced no
+   heartbeat can be written (nor anything else), so the watchdog acts only if the hold outlasts its 10-minute
+   heartbeat timeout because HA is really down. Once the grace expires the safe state is written and the heartbeat
+   follows its old rule (only while the safe state is confirmed).
 3. **Water-target hysteresis.** Hourly replans moved the planned water target by 1 K back and forth (56 of 198
    comparable slots; 28, 27, 28, 27, 28 on 2026-11-20 02:00 to 04:10 UTC), each one a write and a `water_interval` hold
    for the 15-minute rule. While heating already runs, the water target is now written only when the desired value

@@ -627,7 +627,8 @@ def test_an_unreadable_mode_sensor_is_held_for_the_grace_then_the_safe_state():
     for _ in range(3):  # HA restarting: nothing written, no heartbeat, no alert, no fallback
         record = tick(actuator, ctx(clock, make_plan(heating=0)))
         assert record["fallback"] is None and record["guard_reasons"] == ["restart_grace"]
-        assert ha.calls == [] and record["heartbeat"] is None and actuator.alert is None
+        # the optimizer is alive and holding on purpose: the watchdog's heartbeat continues
+        assert ha.writes() == [] and record["heartbeat"] == "ok" and actuator.alert is None
         assert actuator.in_control and actuator.snapshot()["guard_ok"] is False
         assert actuator.snapshot()["reasons"] == ("restart_grace",)
         clock.advance(60)
@@ -646,7 +647,7 @@ def test_a_mode_sensor_that_returns_within_the_grace_resumes_the_plan_with_no_sa
     store = world(clock, mode="unavailable", water=26)
     actuator, ha, metrics = make(clock, store)
     tick(actuator, ctx(clock, make_plan(heating=0)))
-    assert ha.calls == []
+    assert ha.writes() == []
     clock.advance(240)
     store.apply(entity_state(ENTS.observed_mode, "DHW", clock.now() - timedelta(minutes=30)))
     record = tick(actuator, ctx(clock, make_plan(heating=0)))
@@ -683,11 +684,11 @@ def test_a_resync_gives_the_unit_its_grace_before_missing_rooms_are_a_fallback()
     store = world(clock, mode="Heat+DHW", since=LONG_AGO, water=26, rooms=None)
     actuator, ha, _ = make(clock, store)
     record = tick(actuator, ctx(clock, make_plan(heating=0), ha_synced=False))
-    assert record["guard_reasons"] == ["ha_not_synced"] and ha.calls == []
+    assert record["guard_reasons"] == ["ha_not_synced"] and ha.calls == []  # no heartbeat either
     clock.advance(3000)  # the outage itself does not use up the grace
     record = tick(actuator, ctx(clock, make_plan(heating=0)))
     assert record["guard_reasons"] == ["restart_grace"] and record["fallback"] is None
-    assert ha.calls == []
+    assert ha.writes() == [] and record["heartbeat"] == "ok"
     clock.advance(SETTINGS.ha_restart_grace_s + 1)
     record = tick(actuator, ctx(clock, make_plan(heating=0)))
     assert record["fallback"] == "no_room_reading" and record["guard_reasons"] == []
@@ -713,7 +714,7 @@ def test_every_other_fallback_reason_ignores_the_grace():
     store = world(clock, mode="unavailable", water=26)  # a restart episode is under way
     actuator, ha, _ = make(clock, store, silent={ENTS.heat_mode})
     tick(actuator, ctx(clock, make_plan(heating=0)))
-    assert ha.calls == []
+    assert ha.writes() == []
     record = tick(actuator, ctx(clock, plan=None))  # a missing plan is still an immediate fallback
     assert record["fallback"] == "no_plan"
 
@@ -748,11 +749,12 @@ def test_a_write_that_fails_while_ha_restarts_is_held_with_no_safe_state_and_no_
     ha = VanishingHA(store, clock)
     actuator = _actuator(clock, store, ha)
     record = tick(actuator, ctx(clock, make_plan(heating=0)))
-    assert actuator.alert is None and record["heartbeat"] is None
+    assert actuator.alert is None and record["heartbeat"] == "ok"
     assert record["guard_reasons"] == ["restart_grace"] and record["fallback"] is None
     # only the plan write was tried (retried), never the safe state
-    assert {entity for _d, _s, entity, _x in ha.calls} == {ENTS.heat_mode}
-    assert all(data["option"] == HEAT_OFF for _d, _s, _e, data in ha.calls)
+    writes = [c for c in ha.calls if c[0] != "input_datetime"]
+    assert {entity for _d, _s, entity, _x in writes} == {ENTS.heat_mode}
+    assert all(data["option"] == HEAT_OFF for _d, _s, _e, data in writes)
     clock.advance(SETTINGS.ha_restart_grace_s + 60)  # still gone after the grace: the safe state
     record = tick(actuator, ctx(clock, make_plan(heating=0)))
     assert record["fallback"] == "mode_sensor_unavailable"
@@ -766,6 +768,69 @@ def test_a_write_that_fails_with_the_session_gone_is_held_too():
     record = tick(actuator, ctx(clock, make_plan(heating=0)))
     assert actuator.alert is None and record["guard_reasons"] == ["restart_grace"]
     assert all(data["option"] == HEAT_OFF for _d, _s, _e, data in ha.calls)
+    assert record["heartbeat"] is None and ha.heartbeats() == []  # no session: nothing to send
+
+
+@pytest.mark.parametrize("owner", [None, "unavailable", "unknown", ""])
+def test_an_unreadable_select_is_held_for_the_grace_not_select_left_live(owner):
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=timedelta(hours=2), water=26)
+    actuator, ha, metrics = make(clock, store)
+    tick(actuator, ctx(clock, make_plan(heating=1, water=26)))  # in control
+    n_beats = len(ha.heartbeats())
+    if owner is None:
+        store._states.pop(OWNER)  # the select is missing from the store
+    else:
+        store.apply(entity_state(OWNER, owner, clock.now() + timedelta(seconds=1)))
+    for _ in range(3):
+        clock.advance(60)
+        record = tick(actuator, ctx(clock, make_plan(heating=0)))
+        assert record["guard_reasons"] == ["select_not_live", "restart_grace"]
+        assert actuator.in_control and record["fallback"] is None and actuator.alert is None
+        assert ha.writes() == [] and record["heartbeat"] == "ok"
+    assert len(ha.heartbeats()) == n_beats + 3
+    assert counter(metrics, "climate_actuator_fallbacks", reason="select_left_live") == 0
+    # it returns: the plan drives again, no safe state was ever written
+    store.apply(entity_state(OWNER, "live", clock.now() + timedelta(seconds=1)))
+    clock.advance(60)
+    record = tick(actuator, ctx(clock, make_plan(heating=1, water=26)))
+    assert record["guard_reasons"] == [] and ha.writes() == []
+
+
+def test_an_unreadable_select_that_outlasts_the_grace_is_select_left_live():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=timedelta(hours=2), water=30)
+    actuator, ha, metrics = make(clock, store)
+    tick(actuator, ctx(clock, make_plan(heating=1, water=30)))
+    n_beats = len(ha.heartbeats())
+    store.apply(entity_state(OWNER, "unavailable", clock.now() + timedelta(seconds=1)))
+    clock.advance(60)
+    assert tick(actuator, ctx(clock, make_plan(heating=1, water=30)))["guard_reasons"] == [
+        "select_not_live",
+        "restart_grace",
+    ]
+    clock.advance(SETTINGS.ha_restart_grace_s)
+    record = tick(actuator, ctx(clock, make_plan(heating=1, water=30)))
+    assert record["guard_reasons"] == ["select_not_live"]
+    assert counter(metrics, "climate_actuator_fallbacks", reason="select_left_live") == 1
+    assert ("heishamon_heatshift_z1", 26) in ha.writes()  # the safe state
+    assert actuator.in_control is False
+    assert len(ha.heartbeats()) == n_beats + 1  # only the held tick's, none after leaving live
+
+
+@pytest.mark.parametrize("owner", ["shadow", "off", "banana"])
+def test_an_explicit_select_other_than_live_is_immediate_even_in_a_restart_episode(owner):
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=timedelta(hours=2), water=30)
+    actuator, ha, metrics = make(clock, store)
+    tick(actuator, ctx(clock, make_plan(heating=1, water=30)))
+    tick(actuator, ctx(clock, make_plan(heating=1, water=30), ha_synced=False))
+    clock.advance(60)  # resync: a grace is running
+    store.apply(entity_state(OWNER, owner, clock.now()))
+    record = tick(actuator, ctx(clock, make_plan(heating=1, water=30)))
+    assert record["guard_reasons"] == ["select_not_live"]
+    assert counter(metrics, "climate_actuator_fallbacks", reason="select_left_live") == 1
+    assert actuator.in_control is False and actuator._grace_since is None
 
 
 def test_the_safe_state_already_in_force_writes_nothing_but_beats():

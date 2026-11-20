@@ -169,7 +169,7 @@ homelab config change of the deployed `service.yaml`, never an environment varia
 | `readback_timeout_s`, `max_attempts` | 30, 3 | A write stays unconfirmed this long before a retry; tries per write (at most 5), at least 10 s apart |
 | `shutdown_timeout_s` | 20 | How long the safe state at SIGTERM is attempted |
 | `room_max_age_s` | 21600 | Backstop: HA publishes a steady room only on change, so an available reading is usable while synced until it is this old (was 3600) |
-| `ha_restart_grace_s` | 600 | After an HA resync or while `sensor.aquarea_mode` is unavailable the actuator holds (no write, no heartbeat, guard reason `restart_grace`) this long before the safe state; 0 off, at most 1800 |
+| `ha_restart_grace_s` | 600 | After an HA resync or while `sensor.aquarea_mode` is unavailable the actuator holds (no write, heartbeat continues while synced, guard reason `restart_grace`; also for an unreadable owner select) this long before the safe state; 0 off, at most 1800 |
 | `water_hysteresis_k` | 1.0 | While heating runs the water target moves only on a difference of 1 K plus this (2 K); the start of heating and the safe state write exactly; 0 off, at most 4 |
 | `entities.heat_mode`, `water_target`, `heartbeat` | `input_select.heishamon_heatmode`, `input_number.heishamon_heatshift_z1`, `input_datetime.climate_optimizer_heartbeat` | **Written** (live only); domain-checked, distinct, the heartbeat must not be the battery's |
 | `entities.observed_mode`, `heating_mode`, `water_request`, `legacy_enable` | `sensor.aquarea_mode`, `sensor.aquarea_heating_mode`, `sensor.aquarea_z1_heat_request_temperature`, `input_boolean.appdaemon_climate_enable` | Only read (readback, dwell clocks, direct mode, the legacy toggle) |

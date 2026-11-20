@@ -1403,8 +1403,7 @@ def _parse_climate_actuation(
     if settings.ha_restart_grace_s > MAX_CLIMATE_RESTART_GRACE_S:
         raise ValueError(
             f"service config: {name}.ha_restart_grace_s must be <= "
-            f"{MAX_CLIMATE_RESTART_GRACE_S:.0f} s (the heartbeat watchdog repeats the safe state "
-            "after 10 minutes without a heartbeat anyway)"
+            f"{MAX_CLIMATE_RESTART_GRACE_S:.0f} s: a restart that long is a loss of control"
         )
     if settings.water_hysteresis_k > 4.0:
         raise ValueError(f"service config: {name}.water_hysteresis_k must be at most 4 K")
