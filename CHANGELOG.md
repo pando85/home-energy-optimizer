@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.20.1](https://github.com/pando85/home-energy-optimizer/tree/v0.20.1) - 2026-11-20
+
+### Fixed
+
+- climate: Tag live records by the optimizer's regime and guard room spikes ([d7c9ef8](https://github.com/pando85/home-energy-optimizer/commit/d7c9ef80321bb0af8fdc98e4651244278e078ab9))
+- climate: Hold a restarting Home Assistant, keep quiet thermostats and damp the water target ([371fad9](https://github.com/pando85/home-energy-optimizer/commit/371fad939136c6a192e0bff00da7d5588cf722cb))
+
+### Chore
+
+- hack: Add the price-information replay and estimate-accuracy scripts ([fb7dc33](https://github.com/pando85/home-energy-optimizer/commit/fb7dc336ac4eba833b6f458574af31752efd8b7f))
+- hack: Add the load-forecast value, candidate and NILM probe scripts ([5fa1101](https://github.com/pando85/home-energy-optimizer/commit/5fa11019ee661e43b75f958a004d4eb462f9fab4))
+
 ## [v0.20.0](https://github.com/pando85/home-energy-optimizer/tree/v0.20.0) - 2026-11-18
 
 ### Added
