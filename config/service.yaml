@@ -469,7 +469,9 @@ climate_actuation:
   readback_timeout_s: 30              # a write stays unconfirmed at most this long before a retry
   max_attempts: 3                     # tries per write (at least 10 s apart), then a failure
   shutdown_timeout_s: 20              # safe state at SIGTERM is attempted at most this long
-  room_max_age_s: 3600                # an older thermostat reading is not usable
+  room_max_age_s: 21600               # backstop: HA publishes a steady room only on change, so a reading stays usable while synced and available
+  ha_restart_grace_s: 600             # hold (write nothing) this long after an HA resync / mode sensor loss before the safe state; 0 off
+  water_hysteresis_k: 1.0             # while heating runs, move the water target only when it differs by 1 K + this (2 K); 0 off
   entities:
     # Written (live mode only).  heat_mode is the select the homelab "Set heatmode" automation
     # turns into the MQTT operating mode; water_target is the shared Z1 helper (min -5, max 40: the

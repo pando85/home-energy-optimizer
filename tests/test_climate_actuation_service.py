@@ -56,6 +56,7 @@ def test_the_committed_config_is_climate_shadow_with_the_adrs_entities():
         21.0,
         26,
     )
+    assert (s.room_max_age_s, s.ha_restart_grace_s, s.water_hysteresis_k) == (21600.0, 600.0, 1.0)
     e = s.entities
     assert (e.heat_mode, e.water_target, e.heartbeat) == (
         "input_select.heishamon_heatmode",
@@ -105,6 +106,11 @@ def test_nothing_is_built_in_shadow_and_the_exposition_is_unchanged(tmp_path):
         ({"climate_actuation.floor_c": 23.1}, "floor_c"),
         ({"climate_actuation.floor_margin_c": -0.1}, "floor_margin_c"),
         ({"climate_actuation.floor_margin_c": 2.5}, "floor_margin_c"),
+        ({"climate_actuation.room_max_age_s": 0}, "room_max_age_s"),
+        ({"climate_actuation.ha_restart_grace_s": -1}, "ha_restart_grace_s"),
+        ({"climate_actuation.ha_restart_grace_s": 1801}, "ha_restart_grace_s"),
+        ({"climate_actuation.water_hysteresis_k": -0.5}, "water_hysteresis_k"),
+        ({"climate_actuation.water_hysteresis_k": 4.5}, "water_hysteresis_k"),
         ({"climate_actuation.max_attempts": 0}, "max_attempts"),
         ({"climate_actuation.max_attempts": 9}, "max_attempts"),
         ({"climate_actuation.entities.heat_mode": "switch.x"}, "entities.heat_mode"),

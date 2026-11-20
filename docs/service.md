@@ -1518,7 +1518,10 @@ clocks taken from the observed `sensor.aquarea_mode` change (`last_changed`), so
 safe state and a floor breach are exempt from the minimum off only, the minimum on always applies. The water target
 is written only in direct mode (`sensor.aquarea_heating_mode` = 1 and available; otherwise no water write and
 `climate_actuator_not_direct_mode` = 1), as an integer clamped to 20 to 35, only on a change of at least 1 K and at
-most once per 15 min (the safe state is exempt from the 15 min). At least 10 s separate two writes to one entity.
+most once per 15 min (the safe state is exempt from the 15 min). While heating already runs the change must be at
+least 1 K plus `water_hysteresis_k` (1 K, so 2 K): a plan that flip-flops by 1 K between hourly replans writes nothing;
+the start of a heating block and the safe state write the desired value exactly. At least 10 s separate two writes
+to one entity.
 A payload that is not a finite integer in range never leaves the process (`Write.validate`, then the guard).
 
 **Comfort floors win.** A comfort room (`climate_actuation.entities.rooms`: `hall_kitchen`, `bedroom`, `office_t`)
@@ -1526,8 +1529,9 @@ whose thermostat reads below its floor forces `Heat+DHW` whatever the plan says,
 in an off slot, `safe_water_target_c`. The floor is `input_number.comfort_floor_<room>` when available (a finite
 number, not `unknown` or `unavailable`; no age test, an owner-set helper never re-reports) and within 18 to 23 degC,
 else `floor_c` (default 21). The override releases at the floor plus
-`floor_margin_c` (0.5 K). A room with a missing, unavailable, implausible or older than `room_max_age_s` (3600)
-reading is skipped; none usable at all is a fallback (`no_room_reading`).
+`floor_margin_c` (0.5 K). A room with a missing, unavailable, implausible or older than `room_max_age_s` (21600, a 6 h backstop)
+reading is skipped; none usable at all is a fallback (`no_room_reading`). HA publishes a thermostat only when it
+changes, so a steady room's available reading is usable while the session is synced, however old.
 
 **Fallback = the safe heating state.** On a missing, stale, invalid or foreign plan, a failed solve
 (`plan_failed`), an observer without state (`observer_no_state`), no usable room reading, an unreadable mode sensor,
@@ -1539,10 +1543,20 @@ plan. A stop (SIGTERM) in `live` cancels the actuator task and attempts the safe
 `shutdown_timeout_s`, before the HA session closes. The homelab `climate_optimizer_watchdog` repeats the safe state
 if the heartbeat is older than 10 min while the select is `live`.
 
+**A restarting Home Assistant is held, not a fallback** ([ADR-0009 amendment 2026-11-20](adr/0009-live-climate-control.md#amendment-2026-11-20-quiet-thermostats-restarting-home-assistant-and-the-water-hysteresis)).
+After the HA session was lost and syncs again, or while `sensor.aquarea_mode` is unavailable, the actuator holds for
+`ha_restart_grace_s` (600; 0 off, at most 1800): no write, no heartbeat, the last applied state kept, guard reason
+`restart_grace` (`climate_actuator_guard_reason`, so `guard_ok` is 0 meanwhile). It covers `mode_sensor_unavailable`,
+`no_room_reading` inside such an episode, and a plan write that failed because the mode sensor or the session went
+away (no `write_failed` fallback and no `safe_state_failed` alert for it). The grace starts at the resync or when the
+mode sensor is first seen unavailable. If the condition persists past it, the safe state is written as above. All
+other fallback reasons (stale, foreign or missing plan, solver failure, observer, select leaving `live`) are
+immediate.
+
 **Configuration.** `climate_actuation:` in `config/service.yaml` (a copy of the keys is in
 [configuration](configuration.md#live-climate-control-climate_actuation)): `mode`, `tick_interval_s`,
 `floor_margin_c`, `floor_c`, `safe_water_target_c`, `readback_timeout_s`, `max_attempts`, `shutdown_timeout_s`,
-`room_max_age_s` and `entities` (`heat_mode`, `water_target`, `heartbeat`, `observed_mode`, `heating_mode`,
+`room_max_age_s`, `ha_restart_grace_s`, `water_hysteresis_k` and `entities` (`heat_mode`, `water_target`, `heartbeat`, `observed_mode`, `heating_mode`,
 `water_request`, `legacy_enable`, `rooms`, `floor_helper_prefix`). It is excluded from the battery plan's config
 hash.
 
@@ -1554,7 +1568,7 @@ hash.
 | `climate_actuator_owner_select` | gauge 0/1: the owner's select as read | `state` (`live`, `shadow`, `off`, `other`, `missing`) |
 | `climate_actuator_in_control` | gauge 0/1: select live, legacy off, HA synced | — |
 | `climate_actuator_guard_ok` | gauge 0/1: the last tick applied the plan (no guard reason, no fallback; absent before the first tick) | — |
-| `climate_actuator_guard_reason` | gauge 0/1: why nothing was written (**alert on `legacy_writer_active`**) | `reason` (`ha_not_synced`, `legacy_writer_active`, `select_not_live`) |
+| `climate_actuator_guard_reason` | gauge 0/1: why nothing was written (**alert on `legacy_writer_active`**) | `reason` (`ha_not_synced`, `legacy_writer_active`, `select_not_live`, `restart_grace`) |
 | `climate_actuator_fallback_active` | gauge 0/1: the safe state in force | `reason` (see `FALLBACK_REASONS`) |
 | `climate_actuator_hold` | gauge 0/1: a machine limit held a write back at the last tick | `reason` (`min_on`, `min_off`, `water_interval`) |
 | `climate_actuator_alert` | gauge 0/1: writes fail (the safe state was attempted, or even that failed) | — |

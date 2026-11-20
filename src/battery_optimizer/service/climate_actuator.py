@@ -15,6 +15,11 @@ turns it into a desired state:
   state (``Heat+DHW`` and ``safe_water_target_c``, water only in direct mode) is written once, then
   nothing is written until a valid plan returns (decision 7).  The worst case is extra kWh, never
   no heating.
+* A Home Assistant restart is not a loss of control: after the session drops and syncs again, or
+  while the mode sensor is unavailable (the room readings too, right after a restart), the actuator
+  **holds** (writes nothing, no heartbeat, guard reason ``restart_grace``) for
+  ``ha_restart_grace_s`` (600 s by default) and only then falls back, if the condition persists.
+  A write that fails because the mode sensor or the session went away is held the same way.
 
 Writes are possible only when the deployed ``climate_actuation.mode`` is ``live`` (``dry_run`` runs
 all of this and records the writes it would make, sending nothing) **and** the owner's
@@ -28,8 +33,11 @@ Machine limits are code, not settings: the heat-mode command keeps the compresso
 they survive a restart; the safe state and a floor breach are exempt from the minimum off only);
 the water target is written only in direct mode (``sensor.aquarea_heating_mode`` = 1), as an
 integer clamped to 20 to 35, on a change of at least 1 K and at most once per 15 min (the safe
-state is exempt from the 15 minutes); at least 10 s separate two writes to one entity; a payload
-that is not a finite integer in range never leaves the process.  Never DHW, the heater, boost,
+state is exempt from the 15 minutes); while heating already runs it moves only when the desired
+target differs by at least 1 K plus ``water_hysteresis_k`` (1 K, so 2 K), which keeps a plan that
+flip-flops by 1 K between replans from writing, and a start of heating writes the desired value
+exactly; at least 10 s separate two writes to one entity; a payload that is not a finite integer
+in range never leaves the process.  Never DHW, the heater, boost,
 sterilization, cooling or a thermostat setpoint.
 
 Writes are ordered restrictive first: turning heating **off** writes the mode; turning it **on**
@@ -109,7 +117,14 @@ _READBACK_REFRESH_EVERY = 8  # polls: one REST GET of the entity every 2 s while
 _RETRY_PAUSE_S = 1.0
 
 #: The guards that stop every write (fixed label set), most urgent first.
-GUARD_REASONS: tuple[str, ...] = ("ha_not_synced", "legacy_writer_active", "select_not_live")
+GUARD_REASONS: tuple[str, ...] = (
+    "ha_not_synced",
+    "legacy_writer_active",
+    "select_not_live",
+    "restart_grace",
+)
+#: The fallbacks a Home Assistant restart produces: held for the grace period, not written at once.
+_RESTART_REASONS = frozenset({"no_room_reading", "mode_sensor_unavailable"})
 #: Every reason for the safe heating state (fixed label set).
 FALLBACK_REASONS: tuple[str, ...] = (
     "no_plan",
@@ -288,6 +303,7 @@ class ClimateActuator:
         refresh: Refresher | None = None,
         record: Recorder | None = None,
         metrics: Any = None,
+        synced: Callable[[], bool] | None = None,
     ) -> None:
         if settings.mode not in ACTUATOR_MODES:
             raise ValueError(f"climate actuator mode must be one of {ACTUATOR_MODES}")
@@ -301,6 +317,7 @@ class ClimateActuator:
         self._refresh = refresh
         self._record = record
         self._metrics = metrics
+        self._synced = synced
         self._lock = asyncio.Lock()
 
         #: The last tick found itself permitted to write (select live, legacy off, synced): only
@@ -324,6 +341,12 @@ class ClimateActuator:
         #: dry_run only: the state each would-be write leaves, on the entity read back.
         self._simulated: dict[str, EntityState] = {}
         self._signature: Any = None
+        #: The HA session dropped and has not yet been seen synced again by a tick.
+        self._was_unsynced = False
+        #: Start of the restart grace (a resync, or the mode sensor lost); ``None``: no episode.
+        self._grace_since: datetime | None = None
+        #: The restart-caused condition this tick held back instead of writing the safe state.
+        self._grace_hold: str | None = None
 
     # ------------------------------------------------------------------ inputs
 
@@ -391,8 +414,12 @@ class ClimateActuator:
 
     def _room_temperature(self, entity: str, now: datetime) -> float | None:
         """The thermostat's current temperature, or ``None`` when it is missing, unavailable,
-        stale or not a plausible number (a room that cannot be proven below its floor is
-        skipped)."""
+        implausible or past the ``room_max_age_s`` backstop (a room that cannot be proven below its
+        floor is skipped).
+
+        HA publishes a thermostat's state only when it changes, so a steady room keeps an old
+        ``observed_at`` while healthy; an available reading in a synced session stays usable and the
+        backstop (hours) only catches a feed that went silent without HA marking it unavailable."""
         state = self._store.get(entity)
         if state is None or not state.available:
             return None
@@ -525,7 +552,9 @@ class ClimateActuator:
         Turning heating off: the mode only.  Turning it on: the water target, then the mode.  The
         minimum on always holds a switch to ``DHW``; the minimum off holds a switch to ``Heat+DHW``
         unless *desired* is exempt; the water target needs direct mode, a change of 1 K and 15 min
-        since the last water write (the exempt skip the 15 minutes)."""
+        since the last water write (the exempt skip the 15 minutes).  While heating already runs the
+        change must exceed 1 K by ``water_hysteresis_k`` (no write for a 1 K flip-flop); a start of
+        heating and the safe state write the desired value exactly."""
         e = self.ents
         writes: list[Write] = []
         holds: list[str] = []
@@ -556,7 +585,11 @@ class ClimateActuator:
         if heating_after and desired.water_c is not None:
             if r.direct is not True:
                 not_direct = True  # curve mode or unreadable: no water target is ever written
-            elif r.water is None or abs(r.water - desired.water_c) >= WATER_MIN_STEP_K:
+            elif r.water is None or abs(r.water - desired.water_c) >= (
+                WATER_MIN_STEP_K
+                if mode_write is not None or desired.exempt_water_limit
+                else WATER_MIN_STEP_K + self.settings.water_hysteresis_k
+            ):
                 last = self._last_water_write_at
                 due = last is None or (now - last).total_seconds() >= WATER_MIN_INTERVAL_S
                 if desired.exempt_water_limit or due:
@@ -763,7 +796,12 @@ class ClimateActuator:
         writes: list[dict[str, Any]] = []
         heartbeat: str | None = None
         self.holds = ()
+        self._grace_hold = None
+        if ctx.ha_synced and self._was_unsynced:  # a resync: the grace for a restarting HA starts
+            self._was_unsynced = False
+            self._grace_since = now
         if not ctx.ha_synced:
+            self._was_unsynced = True
             reasons.append("ha_not_synced")  # nothing can be sent; the HA watchdog covers this
         elif r.legacy_on:
             # One writer only: nothing at all (no safe state, no heartbeat) while the legacy
@@ -784,6 +822,10 @@ class ClimateActuator:
         else:
             self.in_control = True
             heartbeat, writes = await self._tick_in_control(ctx, r)
+        if self._grace_hold is not None:
+            reasons.append("restart_grace")
+        if not self.in_control:
+            self._grace_since = None
         self.reasons = tuple(reasons)
         self._log_transitions(before, r)
         record = self._tick_record(ctx, r, writes, heartbeat)
@@ -796,6 +838,7 @@ class ClimateActuator:
         self.fallback = None
         self.desired = None
         self.alert = None
+        self._grace_since = None
         self.breached.clear()
         self.not_direct_mode = False
 
@@ -811,8 +854,17 @@ class ClimateActuator:
                 reason = "no_room_reading"
             elif r.mode is None:
                 reason = "mode_sensor_unavailable"
+            if r.mode is None and self._grace_since is None:
+                self._grace_since = now  # HA restarting: the unit's own sensor is gone
+        if reason not in _RESTART_REASONS:
+            self._grace_since = None
         if reason is not None:  # the fallback: the safe state once, then nothing until a plan
             writes: list[dict[str, Any]] = []
+            if self.fallback is None and reason in _RESTART_REASONS and self._in_grace(now):
+                # HA restarting: keep the last applied state, no heartbeat; the safe state only if
+                # the condition outlasts the grace
+                self._grace_hold = reason
+                return None, writes
             if self.fallback is None:
                 self._count("climate_actuator_fallbacks", reason=reason)
                 log.warning("climate actuator fallback reason=%s", reason)
@@ -847,6 +899,9 @@ class ClimateActuator:
         ok, writes = await self._apply(planned)
         if ok:
             self.alert = None
+        elif self._restart_failure():  # the unit or HA went away mid-write: not a fault
+            self._grace_hold = "write_failed"
+            return None, writes
         else:  # the desired state failed: at least the safe state, this tick only
             self._count("climate_actuator_fallbacks", reason="write_failed")
             log.warning("climate actuator fallback reason=write_failed")
@@ -855,6 +910,26 @@ class ClimateActuator:
             writes += more
             self.alert = "write_failed" if ok else "safe_state_failed"
         return (await self._heartbeat(now) if ok else None), writes
+
+    def _in_grace(self, now: datetime) -> bool:
+        since = self._grace_since
+        return since is not None and (now - since).total_seconds() < (
+            self.settings.ha_restart_grace_s
+        )
+
+    def _restart_failure(self) -> bool:
+        """Whether a failed write is explained by a restarting HA (the mode sensor unreadable or
+        the session gone) and the grace has not run out.  Starts the grace if none is running."""
+        later = self._clock.now()
+        gone = self._read(later).mode is None or (self._synced is not None and not self._synced())
+        if not gone:
+            return False
+        if self._grace_since is None:
+            self._grace_since = later
+        held = self._in_grace(later)
+        if held:
+            log.warning("climate actuator write failed while HA restarts: hold (restart_grace)")
+        return held
 
     async def shutdown(self) -> bool:
         """The safe state before the process exits (when in control); ``False`` if it failed."""

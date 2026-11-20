@@ -70,7 +70,9 @@ switches it live). Owner: this repository (`climate/mpc*.py`, `b2d.py`,
   machine limits (min on 30 min, min off 20 min, water steps of 1 K and 15 min), the comfort floors (default 21
   degC, helper `comfort_floor_<room>` when available and in 18 to 23 degC, no age test: it is static owner configuration) and the safe-state fallback. It changes neither the MPC nor its
   model, config or scoring (no recalibration trigger). The first run after a restart decides its boundary again
-  (record flagged `redecision`) so there is a plan of this process.
+  (record flagged `redecision`) so there is a plan of this process. Since 2026-11-20 the actuator keeps a steady
+  thermostat reading (6 h backstop), holds a restarting HA for 10 min before the safe state and ignores a 1 K
+  flip-flop of the planned water target (ADR-0009 amendment); the plan itself is unchanged.
 
 ## Calibrated on
 

@@ -316,6 +316,54 @@ def test_the_water_target_moves_by_whole_kelvin_and_at_most_every_fifteen_minute
     assert ha.writes() == [("heishamon_heatshift_z1", 29), ("heishamon_heatshift_z1", 33)]
 
 
+def test_a_one_kelvin_flip_flop_of_the_plan_writes_nothing_while_heating_runs():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=timedelta(hours=1), water=28)
+    actuator, ha, _ = make(clock, store)
+    for water in (27, 28, 27, 28, 29, 28):  # replans moving by 1 K around the unit's 28
+        record = tick(actuator, ctx(clock, make_plan(heating=1, water=water, t0=clock.now())))
+        assert record["holds"] == [] and record["heartbeat"] == "ok"
+        clock.advance(1800)
+    assert ha.writes() == []
+    tick(actuator, ctx(clock, make_plan(heating=1, water=30, t0=clock.now())))  # 2 K: written
+    assert ha.writes() == [("heishamon_heatshift_z1", 30)]
+
+
+def test_the_hysteresis_band_is_configurable():
+    for band, wanted, expected in ((0.0, 27, [27]), (1.0, 27, []), (2.0, 30, []), (2.0, 31, [31])):
+        clock = FakeClock(NOW)
+        store = world(clock, mode="Heat+DHW", since=timedelta(hours=1), water=28)
+        actuator, ha, _ = make(clock, store, settings=replace(SETTINGS, water_hysteresis_k=band))
+        tick(actuator, ctx(clock, make_plan(heating=1, water=wanted)))
+        assert [v for _e, v in ha.writes()] == expected, (band, wanted)
+
+
+def test_the_start_of_a_heating_block_writes_the_desired_water_exactly():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="DHW", since=LONG_AGO, water=28)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, make_plan(heating=1, water=27)))  # 1 K off, but heating starts
+    assert ha.writes() == [("heishamon_heatshift_z1", 27), ("heishamon_heatmode", HEAT_ON)]
+
+
+def test_the_safe_state_water_target_is_written_exactly_while_heating_runs():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=LONG_AGO, water=27)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, plan=None))  # the safe target is 26
+    assert ha.writes() == [("heishamon_heatshift_z1", 26)]
+
+
+def test_the_fifteen_minute_interval_still_holds_a_hysteresis_write():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=timedelta(hours=1), water=26)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, make_plan(heating=1, water=29)))
+    clock.advance(300)
+    record = tick(actuator, ctx(clock, make_plan(heating=1, water=32)))
+    assert record["holds"] == ["water_interval"] and len(ha.writes()) == 1
+
+
 def test_at_least_ten_seconds_separate_two_writes_to_one_entity():
     clock = FakeClock(NOW)
     store = world(clock, mode="Heat+DHW", since=timedelta(hours=2), water=26)
@@ -459,15 +507,50 @@ def test_a_room_without_a_reading_is_skipped_and_none_at_all_is_a_fallback():
     actuator, ha, _ = make(clock, store)
     record = tick(actuator, ctx(clock, make_plan(heating=0)))
     assert record["fallback"] is None and ha.writes() == []
-    # unavailable, stale and implausible readings are skipped alike
+    # a reading past the backstop is skipped
     clock2 = FakeClock(NOW)
     store2 = world(
-        clock2, mode="DHW", since=LONG_AGO, water=26, rooms=15.0, room_age=timedelta(hours=2)
+        clock2, mode="DHW", since=LONG_AGO, water=26, rooms=15.0, room_age=timedelta(hours=7)
     )
     actuator2, ha2, _ = make(clock2, store2)
     record = tick(actuator2, ctx(clock2, make_plan(heating=0)))
     assert record["fallback"] == "no_room_reading"
     assert ha2.writes() == [("heishamon_heatmode", HEAT_ON)]
+
+
+def test_a_steady_room_reading_older_than_an_hour_is_used_while_ha_is_synced():
+    # HA publishes a thermostat only when it changes: 75 min without news is a steady room
+    clock = FakeClock(NOW)
+    store = world(
+        clock, mode="DHW", since=LONG_AGO, water=26, rooms=22.0, room_age=timedelta(minutes=75)
+    )
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert record["observed"]["rooms"] == dict.fromkeys(ROOMS, 22.0)
+    assert record["fallback"] is None and ha.writes() == []
+    # and a steady cold one still forces the floor override
+    clock2 = FakeClock(NOW)
+    store2 = world(
+        clock2, mode="DHW", since=LONG_AGO, water=26, rooms=19.0, room_age=timedelta(hours=3)
+    )
+    actuator2, _ha2, _ = make(clock2, store2)
+    record = tick(actuator2, ctx(clock2, make_plan(heating=0)))
+    assert record["desired"]["source"] == "floor"
+
+
+def test_unavailable_missing_and_implausible_room_readings_are_still_skipped():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="DHW", since=LONG_AGO, water=26, rooms=22.0)
+    now = clock.now()
+    store.apply(entity_state(ENTS.rooms["hall_kitchen"], "unavailable", now))
+    store.apply(
+        entity_state(ENTS.rooms["bedroom"], "heat", now, attributes={"current_temperature": 99.0})
+    )
+    store.apply(entity_state(ENTS.rooms["office_t"], "heat", now, attributes={}))
+    actuator, _ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert record["observed"]["rooms"] == dict.fromkeys(ROOMS)
+    assert record["fallback"] == "no_room_reading"
 
 
 # ---------------------------------------------------------------------------
@@ -537,14 +620,152 @@ def test_the_safe_state_in_curve_mode_writes_the_mode_only():
     assert ha.writes() == [("heishamon_heatmode", HEAT_ON)] and record["not_direct_mode"] is True
 
 
-def test_an_unreadable_mode_sensor_is_a_guard_failure_with_the_safe_state():
+def test_an_unreadable_mode_sensor_is_held_for_the_grace_then_the_safe_state():
     clock = FakeClock(NOW)
     store = world(clock, mode="unavailable", water=26)
-    actuator, ha, _ = make(clock, store, silent={ENTS.heat_mode})
+    actuator, ha, metrics = make(clock, store, silent={ENTS.heat_mode})
+    for _ in range(3):  # HA restarting: nothing written, no heartbeat, no alert, no fallback
+        record = tick(actuator, ctx(clock, make_plan(heating=0)))
+        assert record["fallback"] is None and record["guard_reasons"] == ["restart_grace"]
+        assert ha.calls == [] and record["heartbeat"] is None and actuator.alert is None
+        assert actuator.in_control and actuator.snapshot()["guard_ok"] is False
+        assert actuator.snapshot()["reasons"] == ("restart_grace",)
+        clock.advance(60)
+    assert counter(metrics, "climate_actuator_fallbacks", reason="mode_sensor_unavailable") == 0
+    clock.advance(SETTINGS.ha_restart_grace_s)  # it persists past the grace: a real loss
     record = tick(actuator, ctx(clock, make_plan(heating=0)))
     assert record["fallback"] == "mode_sensor_unavailable"
+    assert record["guard_reasons"] == []
     assert record["heartbeat"] is None  # it cannot confirm even the safe state: no heartbeat
     assert actuator.alert == "safe_state_failed"
+    assert counter(metrics, "climate_actuator_fallbacks", reason="mode_sensor_unavailable") == 1
+
+
+def test_a_mode_sensor_that_returns_within_the_grace_resumes_the_plan_with_no_safe_state():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="unavailable", water=26)
+    actuator, ha, metrics = make(clock, store)
+    tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert ha.calls == []
+    clock.advance(240)
+    store.apply(entity_state(ENTS.observed_mode, "DHW", clock.now() - timedelta(minutes=30)))
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert record["guard_reasons"] == [] and record["fallback"] is None
+    assert ha.writes() == [] and record["heartbeat"] == "ok"
+    clock.advance(3600)  # a later loss starts a new grace
+    store.apply(entity_state(ENTS.observed_mode, "unavailable", clock.now()))
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert record["guard_reasons"] == ["restart_grace"] and ha.writes() == []
+    assert all(
+        counter(metrics, "climate_actuator_fallbacks", reason=reason) == 0
+        for reason in FALLBACK_REASONS
+    )
+
+
+def test_a_zero_grace_writes_the_safe_state_at_once():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="unavailable", water=26)
+    actuator, _ha, _ = make(clock, store, settings=replace(SETTINGS, ha_restart_grace_s=0.0))
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert record["fallback"] == "mode_sensor_unavailable" and record["guard_reasons"] == []
+
+
+def test_without_a_restart_episode_a_missing_room_reading_is_an_immediate_fallback():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=LONG_AGO, water=26, rooms=None)
+    actuator, _ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert record["fallback"] == "no_room_reading" and record["guard_reasons"] == []
+
+
+def test_a_resync_gives_the_unit_its_grace_before_missing_rooms_are_a_fallback():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=LONG_AGO, water=26, rooms=None)
+    actuator, ha, _ = make(clock, store)
+    record = tick(actuator, ctx(clock, make_plan(heating=0), ha_synced=False))
+    assert record["guard_reasons"] == ["ha_not_synced"] and ha.calls == []
+    clock.advance(3000)  # the outage itself does not use up the grace
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert record["guard_reasons"] == ["restart_grace"] and record["fallback"] is None
+    assert ha.calls == []
+    clock.advance(SETTINGS.ha_restart_grace_s + 1)
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert record["fallback"] == "no_room_reading" and record["guard_reasons"] == []
+
+
+def test_a_clean_tick_after_a_resync_leaves_no_grace_behind():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=LONG_AGO, water=26)
+    actuator, ha, _ = make(clock, store)
+    tick(actuator, ctx(clock, make_plan(heating=0), ha_synced=False))
+    clock.advance(60)
+    record = tick(actuator, ctx(clock, make_plan(heating=1, water=26)))
+    assert record["guard_reasons"] == [] and actuator._grace_since is None
+    store.apply(entity_state(ENTS.rooms["bedroom"], "unavailable", clock.now()))
+    for room in ("hall_kitchen", "office_t"):
+        store.apply(entity_state(ENTS.rooms[room], "unavailable", clock.now()))
+    record = tick(actuator, ctx(clock, make_plan(heating=1, water=26)))
+    assert record["fallback"] == "no_room_reading"  # no episode: not held
+
+
+def test_every_other_fallback_reason_ignores_the_grace():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="unavailable", water=26)  # a restart episode is under way
+    actuator, ha, _ = make(clock, store, silent={ENTS.heat_mode})
+    tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert ha.calls == []
+    record = tick(actuator, ctx(clock, plan=None))  # a missing plan is still an immediate fallback
+    assert record["fallback"] == "no_plan"
+
+
+class VanishingHA(FakeHA):
+    """The mode sensor goes unavailable the moment a heat-mode write is sent (HA restarts)."""
+
+    async def send(self, domain, service, entity, data):
+        if entity == ENTS.heat_mode:
+            self.calls.append((domain, service, entity, data))
+            self.sent_at.append((self.clock.now(), entity))
+            self.store.apply(entity_state(ENTS.observed_mode, "unavailable", self.clock.now()))
+            raise HACommandError("actuation", "no synced Home Assistant session")
+        await super().send(domain, service, entity, data)
+
+
+def _actuator(clock, store, ha, **kw):
+    return ClimateActuator(
+        settings=replace(SETTINGS, mode="live"),
+        owner_entity=OWNER,
+        store=store,
+        clock=clock,
+        send=ha.send,
+        metrics=ServiceMetrics(climate_actuation=True),
+        **kw,
+    )
+
+
+def test_a_write_that_fails_while_ha_restarts_is_held_with_no_safe_state_and_no_alert():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=timedelta(hours=2), water=26)
+    ha = VanishingHA(store, clock)
+    actuator = _actuator(clock, store, ha)
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert actuator.alert is None and record["heartbeat"] is None
+    assert record["guard_reasons"] == ["restart_grace"] and record["fallback"] is None
+    # only the plan write was tried (retried), never the safe state
+    assert {entity for _d, _s, entity, _x in ha.calls} == {ENTS.heat_mode}
+    assert all(data["option"] == HEAT_OFF for _d, _s, _e, data in ha.calls)
+    clock.advance(SETTINGS.ha_restart_grace_s + 60)  # still gone after the grace: the safe state
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert record["fallback"] == "mode_sensor_unavailable"
+
+
+def test_a_write_that_fails_with_the_session_gone_is_held_too():
+    clock = FakeClock(NOW)
+    store = world(clock, mode="Heat+DHW", since=timedelta(hours=2), water=26)
+    ha = FakeHA(store, clock, refuse={ENTS.heat_mode})
+    actuator = _actuator(clock, store, ha, synced=lambda: False)
+    record = tick(actuator, ctx(clock, make_plan(heating=0)))
+    assert actuator.alert is None and record["guard_reasons"] == ["restart_grace"]
+    assert all(data["option"] == HEAT_OFF for _d, _s, _e, data in ha.calls)
 
 
 def test_the_safe_state_already_in_force_writes_nothing_but_beats():
