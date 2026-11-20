@@ -78,6 +78,28 @@ def test_regime_detection(state, exists, synced, expected):
     assert shadow.detect_regime(state, exists=exists, synced=synced) == expected
 
 
+@pytest.mark.parametrize(
+    ("owner", "synced", "legacy_on", "expected"),
+    [
+        ("live", True, False, "comfort"),
+        (" Live ", True, False, "comfort"),
+        ("shadow", True, False, "comfort_off"),
+        ("off", True, False, "comfort_off"),
+        ("live", True, True, "legacy"),  # the legacy writer is active: the actuator writes nothing
+        ("shadow", True, True, "legacy"),
+        ("banana", True, False, "unknown"),
+        (None, True, False, "unknown"),  # the select is absent or unavailable
+        ("live", False, False, "unknown"),  # HA not synced
+    ],
+)
+def test_the_regime_of_the_live_optimizer_follows_the_owners_select(
+    owner, synced, legacy_on, expected
+):
+    got = shadow.detect_optimizer_regime(owner, synced=synced, legacy_writer_on=legacy_on)
+    assert got == expected
+    assert got in shadow.REGIMES
+
+
 def _slots(start: datetime, n: int) -> np.ndarray:
     return np.array([int((start + timedelta(minutes=15 * k)).timestamp() * 1e6) for k in range(n)])
 

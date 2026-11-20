@@ -77,6 +77,20 @@ def test_windows_follow_go_live_and_the_settling_days():
     assert g.find_go_live(recs) == date(2026, 11, 10)
 
 
+def test_records_written_as_legacy_after_the_live_switch_count_in_neither_window():
+    """Production went live on 2026-11-18 (13:28 UTC) while records were still tagged
+    ``legacy`` (the helper regime detection found no helper): with ``go_live: 2026-11-18`` those
+    records are in the settling days, so they join neither window; the first ``comfort`` day
+    that counts is go-live plus seven days."""
+    live = date(2026, 11, 18)
+    assert g.window_of(date(2026, 11, 17), "legacy", live) == "legacy"  # the legacy window
+    for day in range(18, 25):  # 11-18 itself (both regimes of that day) through 11-24
+        assert g.window_of(date(2026, 11, day), "legacy", live) is None
+        assert g.window_of(date(2026, 11, day), "comfort", live) is None
+    assert g.window_of(date(2026, 11, 25), "comfort", live) == "new"
+    assert g.window_of(date(2026, 11, 25), "legacy", live) is None
+
+
 def test_a_new_window_verdict_needs_a_configured_go_live():
     scores, days = _records(date(2026, 11, 1), 60, "comfort")
     report = g.evaluate(scores, days)

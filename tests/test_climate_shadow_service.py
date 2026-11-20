@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -311,6 +312,129 @@ def test_regime_inputs_from_the_store(tmp_path):
         shutdown(service)
 
 
+def ticker():
+    """Strictly increasing source timestamps: the store ignores a state that is not newer."""
+    n = [0]
+
+    def tick():
+        n[0] += 1
+        return MIDNIGHT + timedelta(seconds=n[0])
+
+    return tick
+
+
+def spiked_factory(holder):
+    """A job whose hall-kitchen thermostat reads a cooking spike (+5 K in 25 minutes) that is
+    still on at the decision."""
+
+    def factory():
+        service = holder[0]
+        samples = FakeSamples(MIDNIGHT - timedelta(days=10), RUN_AT)
+        hall = next(s for s in shadow.LIVE_SIGNALS if s.alias == "room_hall_kitchen_temp").source
+        raw = samples.data[hall]
+        values = raw.values.copy()
+        minute = (raw.t_us - int(MIDNIGHT.timestamp() * 1e6)) / 60e6  # 0 = the decision
+        up = (minute >= -105) & (minute < -80)
+        values[up] += 5.0 * (minute[up] + 105) / 25
+        values[minute >= -80] += 5.0
+        samples.data[hall] = replace(raw, values=values)
+        return ClimateShadowJob(
+            settings=service.config.climate_shadow,
+            climate_config=CCFG,
+            mpc_config=MPC,
+            prior=prior(),
+            site=SITE,
+            sink=service.sink,
+            data_dir=service.data_dir,
+            samples=samples,
+            code_version="test-sha",
+            plan_settings=SETTINGS,
+            metrics=service.metrics,
+        )
+
+    return factory
+
+
+def decision_with_a_cooking_spike(tmp_path, **overrides):
+    holder: list = []
+    server = FakeHAServer([ha_state(REGIME, "on", MIDNIGHT)])
+    service = make_service(tmp_path, server, factory=spiked_factory(holder), **overrides)
+    holder.append(service)
+    try:
+        asyncio.run(run_synced(service, service.run_climate_shadow))
+    finally:
+        shutdown(service)
+    (dec,) = iter_records(tmp_path / "data", "climate_decisions", MIDNIGHT, RUN_AT)
+    return dec
+
+
+def test_the_decision_does_not_read_a_cooking_spike_as_a_warm_room(tmp_path):
+    (tmp_path / "on").mkdir()
+    (tmp_path / "off").mkdir()
+    guarded = decision_with_a_cooking_spike(tmp_path / "on")
+    raw = decision_with_a_cooking_spike(
+        tmp_path / "off", **{"climate_shadow.room_spike_guard.enabled": False}
+    )
+    assert raw["inputs"]["room_guard"] is None
+    audit = guarded["inputs"]["room_guard"]["rooms"]
+    assert audit["hall_kitchen"]["replaced_24h"] > 0
+    assert audit["hall_kitchen"]["active"] and audit["hall_kitchen"]["raw_last"] > 24.0
+    assert audit["bedroom"]["replaced_24h"] == audit["office_t"]["replaced_24h"] == 0
+    assert guarded["inputs"]["room_guard"]["max_rise_k"] == 2.0
+    # the observer's air state starts lower when the spike is not believed
+    assert guarded["origin"]["x0"][0] < raw["origin"]["x0"][0] - 0.3
+
+
+OWNER = "input_select.climate_optimizer_mode"
+LEGACY_TOGGLE = "input_boolean.appdaemon_climate_enable"
+
+
+def test_the_regime_with_the_live_actuator_is_the_owners_select_not_the_removed_helper(tmp_path):
+    service = make_service(tmp_path, FakeHAServer(), **{"climate_actuation.mode": "live"})
+    tick = ticker()
+    try:
+        assert service.climate_inputs(RUN_AT).regime == "unknown"  # HA never synced
+        service.ha.stats.synced = True
+        # the comfort-control helper does not exist (removed at the switch): not ``legacy``
+        assert service.climate_inputs(RUN_AT).regime == "unknown"  # the select has no state yet
+        for state, regime in (
+            ("live", "comfort"),
+            ("shadow", "comfort_off"),
+            ("off", "comfort_off"),
+        ):
+            service.store.apply(entity_state(OWNER, state, tick()))
+            inputs = service.climate_inputs(RUN_AT)
+            assert (inputs.regime, inputs.regime_state) == (regime, state)
+        service.store.apply(entity_state(OWNER, "live", tick()))
+        service.store.apply(entity_state(LEGACY_TOGGLE, "on", tick()))
+        assert service.climate_inputs(RUN_AT).regime == "legacy"  # one writer only
+        service.store.apply(entity_state(LEGACY_TOGGLE, "off", tick()))
+        service.store.apply(entity_state(OWNER, "unavailable", tick()))
+        inputs = service.climate_inputs(RUN_AT)
+        assert (inputs.regime, inputs.regime_state) == ("unknown", "unavailable")
+        # an old comfort-control helper left in HA does not decide it any more
+        service.store.apply(entity_state(OWNER, "live", tick()))
+        service.store.apply(entity_state(REGIME, "off", tick()))
+        assert service.climate_inputs(RUN_AT).regime == "comfort"
+    finally:
+        shutdown(service)
+
+
+def test_the_regime_without_the_live_actuator_keeps_the_helper_path(tmp_path):
+    for overrides in ({}, {"climate_actuation.mode": "dry_run"}):
+        service = make_service(tmp_path, FakeHAServer(), **overrides)
+        tick = ticker()
+        try:
+            service.ha.stats.synced = True
+            # a select alone decides nothing without the live actuator
+            service.store.apply(entity_state(OWNER, "live", tick()))
+            assert service.climate_inputs(RUN_AT).regime == "legacy"
+            service.store.apply(entity_state(REGIME, "on", tick()))
+            assert service.climate_inputs(RUN_AT).regime == "comfort"
+        finally:
+            shutdown(service)
+
+
 def test_a_job_that_cannot_load_is_reported_and_retried(tmp_path):
     def broken():
         raise ValueError("climate shadow prior 'abcdef' matches 0")
@@ -388,11 +512,30 @@ def test_the_committed_config_keeps_the_job_off_with_placeholder_entities():
         ({"climate_shadow.go_live": "soon"}, "go_live"),
         ({"climate_shadow.prior": "XYZ"}, "prior id"),
         ({"climate_shadow.offset_minutes": 60}, "offset_minutes"),
+        ({"climate_shadow.room_spike_guard.surprise": 1}, "unknown climate_shadow.room_spike"),
+        ({"climate_shadow.room_spike_guard.max_rise_k": 0}, "max_rise_k"),
+        ({"climate_shadow.room_spike_guard.release_k": 2.0}, "release_k must be below"),
+        ({"climate_shadow.room_spike_guard.window_minutes": 0}, "window_minutes"),
+        ({"climate_shadow.room_spike_guard.max_hold_minutes": 10}, "max_hold_minutes"),
+        ({"climate_shadow.room_spike_guard.enabled": "yes"}, "enabled"),
     ],
 )
 def test_bad_climate_shadow_config_is_refused(tmp_path, overrides, match):
     with pytest.raises(ValueError, match=match):
         load_service_config(write_service_config(tmp_path, **overrides))
+
+
+def test_the_spike_guard_is_on_by_default_and_configurable(tmp_path):
+    rule = load_service_config(REPO / "config" / "service.yaml").climate_shadow.room_spike_guard
+    assert rule.enabled and (rule.max_rise_k, rule.window_minutes) == (2.0, 30)
+    assert (rule.release_k, rule.max_hold_minutes, rule.memory_minutes) == (1.0, 120, 360)
+    overrides = {
+        "climate_shadow.room_spike_guard.max_rise_k": 3.0,
+        "climate_shadow.room_spike_guard.enabled": False,
+    }
+    custom = load_service_config(write_service_config(tmp_path, **overrides))
+    rule = custom.climate_shadow.room_spike_guard
+    assert not rule.enabled and rule.max_rise_k == 3.0 and rule.window_minutes == 30
 
 
 def test_go_live_and_the_battery_config_hash(tmp_path):
@@ -414,6 +557,7 @@ CLIMATE_SHADOW_MODULES = [
     *sorted(CLIMATE.glob("mpc*.py")),
     CLIMATE / "b2d.py",
     CLIMATE / "plan_export.py",
+    CLIMATE / "room_guard.py",
     CLIMATE / "shadow.py",
     CLIMATE / "shadow_gates.py",
     REPO / "src" / "battery_optimizer" / "service" / "climate_shadow.py",

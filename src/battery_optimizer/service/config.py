@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from battery_optimizer._env import get_env
+from battery_optimizer.climate.room_guard import SpikeRule
 
 from .thermal import DEFAULT_PARAMS
 
@@ -363,6 +364,8 @@ class ClimateShadowSettings:
     optimizer_mode: str = "off"
     #: A plan is valid this long after its decision time; consumers treat an older one as absent.
     plan_ttl_minutes: int = 90
+    #: Spike guard of the decision's room temperatures (``climate/room_guard.py``); on by default.
+    room_spike_guard: SpikeRule = field(default_factory=SpikeRule)
 
     def entities(self) -> tuple[str, ...]:
         return tuple(
@@ -1166,7 +1169,39 @@ _CLIMATE_SHADOW_KEYS = (
     "entities",
     "optimizer_mode",
     "plan_ttl_minutes",
+    "room_spike_guard",
 )
+_SPIKE_GUARD_KEYS = (
+    "enabled",
+    "max_rise_k",
+    "window_minutes",
+    "release_k",
+    "max_hold_minutes",
+    "memory_minutes",
+)
+
+
+def _parse_spike_guard(raw: Mapping[str, Any]) -> SpikeRule:
+    name = "climate_shadow.room_spike_guard"
+    _keys(raw, name, _SPIKE_GUARD_KEYS)
+    d = SpikeRule()
+    rule = SpikeRule(
+        enabled=_bool(raw.get("enabled", d.enabled), f"{name}.enabled"),
+        max_rise_k=_positive(raw.get("max_rise_k", d.max_rise_k), f"{name}.max_rise_k"),
+        window_minutes=_int(raw.get("window_minutes", d.window_minutes), f"{name}.window_minutes"),
+        release_k=_positive(
+            raw.get("release_k", d.release_k), f"{name}.release_k", allow_zero=True
+        ),
+        max_hold_minutes=_int(
+            raw.get("max_hold_minutes", d.max_hold_minutes), f"{name}.max_hold_minutes"
+        ),
+        memory_minutes=_int(raw.get("memory_minutes", d.memory_minutes), f"{name}.memory_minutes"),
+    )
+    if rule.release_k >= rule.max_rise_k:
+        raise ValueError(f"service config: {name}.release_k must be below max_rise_k")
+    if rule.max_hold_minutes < rule.window_minutes:
+        raise ValueError(f"service config: {name}.max_hold_minutes must be at least window_minutes")
+    return rule
 
 
 def _parse_climate_shadow(raw: Mapping[str, Any]) -> ClimateShadowSettings:
@@ -1242,6 +1277,7 @@ def _parse_climate_shadow(raw: Mapping[str, Any]) -> ClimateShadowSettings:
         mode_entity=entities["mode"],
         optimizer_mode=mode,
         plan_ttl_minutes=ttl,
+        room_spike_guard=_parse_spike_guard(_section(raw, "room_spike_guard")),
     )
 
 

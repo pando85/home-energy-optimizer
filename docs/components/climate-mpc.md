@@ -91,6 +91,13 @@ switches it live). Owner: this repository (`climate/mpc*.py`, `b2d.py`,
 - The live observer (B2) holds the last heat reading over up to 4 consecutive slots without one (a scrape or
   Home Assistant outage; `shadow.MAX_BRIDGE_SLOTS`), so a short outage no longer restarts it; a longer one
   does, and plans wait for 96 unbroken slots (24 h). Live path only: the calibration and the offline replay are unchanged.
+- The live observer and plan read the room temperatures through the **spike guard** (`climate/room_guard.py`,
+  [service](../service.md#climate-shadow-track-b2)): a rise of more than 2 K in 30 minutes above the room's own lowest
+  reading (the hall-kitchen thermostat beside the cooker; none of the other rooms in four weeks) is replaced by the
+  level before it for at most 2 h. Live decision inputs only: the calibration, the offline replay, the refit and the
+  gate scoring read the raw thermostat. Each decision records what was replaced (`inputs.room_guard`).
+- The live record's `regime` follows the owner's `input_select.climate_optimizer_mode` while
+  `climate_actuation.mode` is `live` (`live` is `comfort`), no longer the removed comfort-control helper.
 - Residual: a slot forced on by a minimum on time in progress may be planned against shut valves, where the MILP credits `phi` heat that `simulate` does not deliver (run logic).
 
 ## Invalidated when
@@ -98,6 +105,9 @@ switches it live). Owner: this repository (`climate/mpc*.py`, `b2d.py`,
 - The schedule, lead table, setpoint margin, water curve or machine limits change (edit the MPC config: a new
   hash starts a new lineage; the live helper values do not change the hash, they are recorded per decision).
 - The comfort controller goes live (legacy heat law, offsets and COP no longer hold), a successor to B0's model is accepted, or the outdoor source or heat measurement changes.
+
+The spike guard and the regime tag are changes of the live inputs and of the record's label, not of the plant or of the
+model: no recalibration trigger and no component goes `stale` for them (they are in the [regime log](regime-log.md)).
 
 ## Recalibrate by
 

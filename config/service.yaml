@@ -420,6 +420,19 @@ climate_shadow:
   # this code version (live_locked).  The shadow's own hourly run and scoring are unaffected.
   optimizer_mode: "off"
   plan_ttl_minutes: 90                # a plan is absent for consumers this long after its decision t0
+  # Spike guard of the DECISION's room temperatures (climate/room_guard.py): a thermostat beside
+  # the cooker (hall_kitchen, nearly every morning) that rises more than max_rise_k above its own
+  # lowest reading of the last window_minutes is replaced by the level it had before, until it is
+  # back within release_k of it or max_hold_minutes passed (then the reading is believed).  A rise
+  # back to a level held within memory_minutes (a window closed again) is never a spike.  Scoring,
+  # the refit and the day records read the raw readings; each decision records what was replaced.
+  room_spike_guard:
+    enabled: true
+    max_rise_k: 2.0
+    window_minutes: 30
+    release_k: 1.0
+    max_hold_minutes: 120
+    memory_minutes: 360
   # Read-only Home Assistant helpers of the homelab comfort controller
   # (config/integrations/appdaemon_comfort.yaml); each may be absent until it is deployed.
   entities:

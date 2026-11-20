@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,7 @@ import httpx
 import numpy as np
 
 from battery_optimizer import extract_prom
-from battery_optimizer.climate import plan_export, shadow, shadow_gates
+from battery_optimizer.climate import plan_export, room_guard, shadow, shadow_gates
 from battery_optimizer.climate.config import ClimateConfig, load_climate_config
 from battery_optimizer.climate.data import SITE_FILE, Site, load_site
 from battery_optimizer.climate.mpc import PlanSettings
@@ -339,10 +340,20 @@ class ClimateShadowJob:
             today = local_date(t0, self.tz)
             self._maybe_refit(d, today, now)
             assert self.model is not None
+            d_in = d  # the decision's inputs; scoring, refit and day records read the raw ``d``
+            rule = self.settings.room_spike_guard
+            if rule.enabled:
+                guarded, flags = room_guard.guard_series(series, shadow.ROOM_SOURCES, rule)
+                audit = room_guard.audit(series, shadow.ROOM_SOURCES, rule, guarded, flags, t0)
+                inputs = replace(inputs, room_guard=audit)
+                if any(f.any() for f in flags.values()):
+                    d_in = shadow.build_live_data(
+                        guarded, start=start, end=end, config=self.ccfg, site=self.site
+                    )
             rec = shadow.decide(
                 self.prior,
                 self.model,
-                d,
+                d_in,
                 self.cfg,
                 t0,
                 inputs,
