@@ -109,7 +109,7 @@ from pathlib import Path
 from typing import Any
 
 from battery_optimizer.climate import plan_export
-from battery_optimizer.climate.shadow import LiveInputs, detect_regime
+from battery_optimizer.climate.shadow import LiveInputs, detect_optimizer_regime, detect_regime
 from battery_optimizer.config import TariffConfig
 
 from .actuator import LIVENESS_OK_STATE, ActuationContext, Actuator
@@ -833,7 +833,21 @@ class ShadowService:
             return self.store.get(entity) if entity else None
 
         reg, dhw, away = state(s.regime_entity), state(s.dhw_plan_entity), state(s.away_entity)
-        if s.regime_entity:
+        regime_state = reg.state if reg else None
+        if self.config.climate_actuation.mode == "live" and s.mode_entity:
+            # The optimizer is the deployed controller: the owner's select says whether it is in
+            # charge (the legacy helper no longer exists, and would only read ``legacy``).
+            owner = state(s.mode_entity)
+            legacy = state(self.config.climate_actuation.entities.legacy_enable)
+            regime_state = owner.state if owner is not None else None
+            regime = detect_optimizer_regime(
+                regime_state if owner is not None and owner.available else None,
+                synced=synced,
+                legacy_writer_on=legacy is not None
+                and legacy.available
+                and legacy.state.strip().lower() == "on",
+            )
+        elif s.regime_entity:
             regime = detect_regime(
                 reg.state if reg else None, exists=reg is not None, synced=synced
             )
@@ -841,7 +855,7 @@ class ShadowService:
             regime = "legacy" if synced else "unknown"
         return LiveInputs(
             regime=regime,
-            regime_state=reg.state if reg else None,
+            regime_state=regime_state,
             dhw_plan=dhw.state if dhw is not None and dhw.available else None,
             away=(away.state.strip().lower() == "on")
             if away is not None and away.available

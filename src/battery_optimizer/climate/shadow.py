@@ -81,6 +81,7 @@ __all__ = [
     "PRICE_KEY",
     "PRIORS_DIR",
     "REGIMES",
+    "ROOM_SOURCES",
     "LiveInputs",
     "ShadowPrior",
     "bridge_outages",
@@ -88,6 +89,7 @@ __all__ = [
     "comfort_helper_levels",
     "day_record",
     "decide",
+    "detect_optimizer_regime",
     "detect_regime",
     "fit_shadow_prior",
     "forecast_series",
@@ -117,8 +119,11 @@ MAX_BRIDGE_SLOTS = 4
 #: The thermostat rooms of design section 3: the preregistered room-mean.
 DESIGN_ROOMS = tuple(CLIMATE_ROOMS)
 
-#: Regime of a record: ``legacy`` (no comfort-control helper in HA), ``comfort`` (the helper is
-#: on), ``comfort_off`` (present but off) and ``unknown`` (HA not synced or the state unavailable).
+#: Regime of a record: ``legacy`` (the legacy controller writes space heating: no comfort-control
+#: helper in HA, or the legacy toggle is on), ``comfort`` (the new controller is in charge: the
+#: helper is on, or the optimizer's live actuator is allowed to write, see
+#: :func:`detect_optimizer_regime`), ``comfort_off`` (present but off, or the owner's select is not
+#: ``live``) and ``unknown`` (HA not synced or the state unavailable).
 REGIMES = ("legacy", "comfort", "comfort_off", "unknown")
 
 #: The climate signals the live job reads; the others of the climate feature set stay unknown.
@@ -140,6 +145,13 @@ _LIVE_ALIASES = frozenset(
     }
 )
 LIVE_SIGNALS: tuple[Signal, ...] = tuple(s for s in CLIMATE_SIGNALS if s.alias in _LIVE_ALIASES)
+#: Thermostat room -> key of its current-temperature series in the raw samples (spike guard).
+ROOM_SOURCES: dict[str, str] = {
+    room: sig.source
+    for room in DESIGN_ROOMS
+    for sig in LIVE_SIGNALS
+    if sig.alias == f"room_{room}_temp"
+}
 PRICE_KEY = "price"
 PRICE_METRIC = "hass_sensor_unit_u0x20ac_per_kwh"
 
@@ -522,6 +534,30 @@ def detect_regime(state: str | None, *, exists: bool, synced: bool) -> str:
     return "unknown"
 
 
+def detect_optimizer_regime(
+    owner_state: str | None, *, synced: bool, legacy_writer_on: bool = False
+) -> str:
+    """The control regime while the optimizer's climate actuator is deployed live
+    (``climate_actuation.mode: live``, ADR-0009).  There is no comfort-control helper then (it was
+    removed at the switch of 2026-11-18); what decides is the owner's
+    ``input_select.climate_optimizer_mode`` (*owner_state*, ``None`` when absent or unavailable):
+
+    * the legacy controller's toggle on (the actuator then writes nothing): ``legacy``;
+    * ``live``: ``comfort``, the optimizer is the controller of the new regime;
+    * ``shadow`` or ``off``: ``comfort_off``, the optimizer writes nothing (the safe state once);
+    * anything else, or no state: ``unknown``."""
+    if not synced:
+        return "unknown"
+    if legacy_writer_on:
+        return "legacy"
+    value = (owner_state or "").strip().lower()
+    if value == "live":
+        return "comfort"
+    if value in ("shadow", "off"):
+        return "comfort_off"
+    return "unknown"
+
+
 def _instant(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -608,6 +644,8 @@ class LiveInputs:
     dhw_plan: str | None = None
     away: bool | None = None
     forecast: Mapping[str, Any] | None = None
+    #: The spike guard's audit (:func:`.room_guard.audit`), ``None`` when it is off.
+    room_guard: Mapping[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +775,7 @@ def decide(
             "dhw_source": dhw_source,
             "dhw_slots": [int(i) for i in np.flatnonzero(horizon_dhw)],
             "away": inputs.away,
+            "room_guard": inputs.room_guard,
         },
     }
     levels = mpc_replay.comfort_levels(model.rooms, cfg, comfort)

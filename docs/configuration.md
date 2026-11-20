@@ -142,7 +142,10 @@ data directory, the prior written by `hack/climate_shadow_prior.py`
 `climate/site.yaml`, and, next to the service config, `climate.yaml` and `climate-mpc.yaml` (paths relative to
 the service config's directory). No new variable or credential: it uses `BATTERY_OPTIMIZER_PROMETHEUS_URL`
 and the read-only token, and reads three optional HA helpers of the homelab comfort controller. Set
-`climate_shadow.go_live` on its go-live day. Keys and ops: [shadow service](service.md#climate-shadow-track-b2).
+`climate_shadow.go_live` on its go-live day (production: `"2026-11-18"`, the optimizer's switch to live).
+`climate_shadow.room_spike_guard` (on by default: `max_rise_k`, `window_minutes`, `release_k`,
+`max_hold_minutes`, `memory_minutes`) filters cooking spikes out of the decision's room temperatures. Keys and
+ops: [shadow service](service.md#climate-shadow-track-b2).
 
 ### Live climate control (`climate_actuation`)
 

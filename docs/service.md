@@ -642,8 +642,10 @@ after the boundary (default 10, after the weather fetch at :05), on its own work
    memory and fetched incrementally after the first run. They go through the feature builder's own slot
    rules and the climate loader, cut at the decision `t0`, so a live slot is computed like an offline
    feature-set slot (debiased outdoor sensor, DHW and cooling masks, comfort-room mean, replayed legacy
-   permission). From Home Assistant, through the entity store only: `entities.regime`,
-   `entities.dhw_plan` and `entities.away`, each optional. The forecast is the newest record of the
+   permission). The decision's room readings first pass the **spike guard** (below); scoring, the refit and
+   the day records read the raw readings. From Home Assistant, through the entity store only:
+   `entities.regime`, `entities.mode` (the owner's select), `entities.dhw_plan` and `entities.away`, each
+   optional, and the legacy toggle `climate_actuation.entities.legacy_enable`. The forecast is the newest record of the
    [weather archive](#passive-archives) requested at or before `t0` and within
    `forecast_max_age_minutes` (so the fetch at :05 serves the next hour's decision).
 2. **Refit** (`every_days`, 7): `ua` and `q0` on the `window_days` (28) complete heating-month days
@@ -699,17 +701,45 @@ the private store; no metric exposes one.
 **Definitions** (the B1 replay's, with the
 [preregistration amendment of 2026-10-31](planning/climate-preregistration-2026-27.md#4-amendments)):
 
-- **Regime** per record: `comfort` when `input_boolean.comfort_control_enable` is on, `comfort_off` when it
-  is off, `legacy` when it does not exist, `unknown` when HA is not synced. The preregistered windows:
+- **Regime** per record (`shadow.detect_regime`, `shadow.detect_optimizer_regime`). With
+  `climate_actuation.mode: live` the optimizer is the controller of the new regime and the removed comfort-control
+  helper is not read: `comfort` when the owner's `input_select.climate_optimizer_mode` is `live`, `comfort_off`
+  when it is `shadow` or `off` (the optimizer writes nothing), `legacy` when the legacy toggle
+  `input_boolean.appdaemon_climate_enable` is `on` (one writer only: the actuator writes nothing), `unknown`
+  when HA is not synced or the select has no usable state. In every other `climate_actuation.mode` (`shadow`,
+  `dry_run`: the legacy controller still writes) the helper decides as before: `comfort` when
+  `input_boolean.comfort_control_enable` is on, `comfort_off` when it is off, `legacy` when it does not exist,
+  `unknown` when HA is not synced. `regime_state` records the raw state that decided. The preregistered windows:
   legacy = records in `legacy` before go-live; new = records in `comfort` from go-live plus 7 days through
   2027-03-31. Go-live is `climate_shadow.go_live` only; **without it there is no new-window verdict**, and
   the first `comfort` record is reported as a provisional date that never fixes a window.
+  **Production: `climate_shadow.go_live: "2026-11-18"`** (the local day the optimizer went live, 13:28 UTC) in
+  the service overrides. Records written between that switch and the regime fix (code before this change read the
+  absent helper as `legacy`) are never rewritten (the store is append-only); with go-live set they fall in the
+  settling days, 2026-11-18 to 2026-11-24, which belong to neither window whatever their regime
+  (`shadow_gates.window_of`), so they are not scored; the legacy window ends with 2026-11-17 (the legacy records of the
+  morning of 2026-11-18 are excluded with the rest of that day), and the new window starts on 2026-11-25 with
+  `comfort` records only.
 - **Room-mean**: B0's three `comfort.rooms` (bedroom, hall_kitchen, office_t), the model's `t_air` with
   zero offset; persistence is the same mean held. Office A is excluded (server heat sink). The job refuses
   a `climate.yaml` with other comfort rooms. The four-room mean of design section 3 is a diagnostic.
 - **Gate prediction**: from the persisted origin, driven by the **measured heat and the measured outdoor
   temperature** (B0's 7.3 basis, B1's `air_q`). It tests the thermal model, not the operational weather
   forecast. `heat_plan_weather` (the outdoor series the plan used) is a diagnostic.
+- **Room spike guard** (`climate/room_guard.py`, `climate_shadow.room_spike_guard`; live decision inputs only):
+  a thermostat beside the cooker (hall-kitchen, nearly every morning: +5.2 K in 25 minutes on 2026-11-19) made
+  the observer read a warm room and the plan heat nothing for a day. Per room, on the raw samples: a reading
+  more than `max_rise_k` (2.0 K) above the lowest reading of the last `window_minutes` (30) starts an
+  excursion whose base is that lowest reading; every reading above base + `release_k` (1.0 K) is replaced by
+  the base until one is back within `release_k` or `max_hold_minutes` (120) passed (a lasting step is then
+  believed); a rise back to a level held within `memory_minutes` (360) is never a trigger (a window closed
+  again). It does not look at the heat pump: a rise that large in one room while the others are flat is not
+  heating. The decision's observer, plan and origin read the guarded series; **scoring, the weekly refit and
+  the day records read the raw readings** (the preregistered gates measure the raw thermostat, never
+  amended). Each decision records `inputs.room_guard`: the parameters and per room `replaced_24h`, `active`
+  (the newest reading is replaced), `raw_last`, `used_last` and `max_raw_minus_used_24h`. `enabled: false`
+  restores the raw inputs (`inputs.room_guard` is then `null`). The climate actuator reads the thermostats from
+  Home Assistant, not from this series.
 - **Daily heat**: midnight origins, the heat law under the actions against the measured heat, median APE
   on days above 20% of the window's median daily heat. The action is the replayed legacy permission in the
   legacy regime and the **measured space-heating run** in the comfort regime, which is a weaker test
