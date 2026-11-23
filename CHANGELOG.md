@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.21.0](https://github.com/pando85/home-energy-optimizer/tree/v0.21.0) - 2026-11-23
+
+### Added
+
+- climate: Add vacation mode v1 (ADR-0010) ([bfd5772](https://github.com/pando85/home-energy-optimizer/commit/bfd577236d7fff72cf039790bfd2a5cacc0b5b2f))
+
+### Chore
+
+- deps: Update github-actions ([00fd910](https://github.com/pando85/home-energy-optimizer/commit/00fd91090ba3a64b7d023ed6a024af91ca6a0d6f))
+- deps: Update python:3.14-slim docker digest to 9aaa474 ([c6d7a51](https://github.com/pando85/home-energy-optimizer/commit/c6d7a5151748eaedec6551886d77f01176c5a462))
+- hack: Add the empty-house absence analysis for vacation mode ([bccc9a4](https://github.com/pando85/home-energy-optimizer/commit/bccc9a4a19e4d6d02426050249988d56fa147228))
+
 ## [v0.20.1](https://github.com/pando85/home-energy-optimizer/tree/v0.20.1) - 2026-11-20
 
 ### Fixed
