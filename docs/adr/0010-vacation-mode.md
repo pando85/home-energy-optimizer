@@ -157,7 +157,41 @@ window is not invalid), `climate_actuator_vacation_fallbacks_total{reason}`,
 
 ## Data to collect during the first vacation
 
-_Placeholder, to be filled by the owner and the maintainers before the trip._
+What we already know, from five past whole-house absences with space heating off (2 to 8.5 days, autumn
+to late winter; offline analysis `hack/absence_analysis.py`, private outputs in the data dir):
+
+- **The empty house settles high.** About 1 to 1.5 K the first day, then slowly towards
+  `T_eq ~ 13.8 + 0.49 T_out` (12 settled days, RMSE 0.4 K): about 17 to 18 degC in a cold week, 7 to 11 K above
+  outdoor. The 12 degC guard is not expected to bind. The bedroom runs coldest when the house is empty.
+- **The model fails safe, but for the wrong reason.** Open loop with `Q = 0` it is too warm for the first one to
+  two days (+0.4 to +1.0 K) and too cold after about four (down to -1.7 K at 120 h): it settles at
+  `T_out + q0/ua`, about 4 K above outdoor against the measured 7 to 11 K. Dropping `D` changes nothing and a
+  refit of `q0` asks for *more* gain, not less: the error is structural (a slow envelope node the air + slab
+  model lacks), not an occupancy gain.
+- **Warm-ups are much faster than modelled.** Measured 3 to 6 h from about 19 degC to a 21 degC room mean, with
+  6.4 to 6.8 kW of heat delivered at 27 to 29 degC water; the prior's heat law caps at 4.0 kW and the model
+  predicts the same warm-ups 1.2 to 10 times slower. The model's worst plausible case (hall 24 degC from
+  17.3 degC at 0 degC outdoor, 4 kW) is about 40 h, inside the 48 h look-ahead. So v1 starts warm-ups early:
+  extra kWh, not a cold return.
+- **An observer restart happens:** one absence had a 4 h thermostat data gap that restarted the observer; live,
+  that is a `no_state` decision, which the vacation hold now turns into "heating held off".
+
+What to collect on this vacation (most of it is already recorded; the gaps are marked):
+
+1. **The decisions and their extended plans** (`climate_decisions`, `predicted_room_c` up to 72 h) against the
+   measured rooms, every hour: the coasting and warm-up error of the model the plan actually used.
+2. **One clean warm-up at the plan's water target** (up to 35 degC): heat delivered per slot, water target, flow
+   and return, compressor, each thermostat's `hvac_action` and when each room reaches its floor and the hall its
+   day minimum. All history is at 26 to 29 degC water, so this calibrates the heat cap (4.0 kW modelled, 6.5+
+   measured) and the fast air response.
+3. **Exact labels:** the window as the optimizer read it (`climate_vacations` records), any visit, window
+   opening or shutter change (gap: logged by hand by the owner on return), interior doors left open or closed.
+4. **Base internal gains while empty:** the servers circuit and the other base load (Shelly circuits), and the
+   hot-water tank's losses (AppDaemon `dhw_control` off during the trip, so the tank runs on the unit's own
+   control): a measured gain instead of `q0`.
+5. **Solar:** a radiation or PV series (gap: the solar gain sits on its lower bound in the prior).
+6. **Gap, hardware:** room humidity (for the data-driven guard) and a floor-surface temperature (to separate the
+   heated slab from the slow envelope node). Not available for this trip.
 
 ## After the first vacation
 
@@ -168,17 +202,19 @@ Agreed directions, not built:
   one-week trip in late autumn.
 - **Observer fast restart:** after hours with heating off the slab sits near the air temperature, so the observer
   can start from the measured rooms instead of waiting 24 h.
-- **Empty-house model:** fit the occupancy share of `q0` and `D` from the recorded vacations (the past absences with
-  heating off and this trip), validated on held-out absences, and use it during the absence; correct it online from
-  the first hours of each absence.
+- **Empty-house model:** the past absences show the error is structural, not an occupancy gain (section above). Try a
+  third, slow envelope state (or a neighbour boundary) and a heat cap calibrated on the measured warm-ups,
+  validated on held-out absences including this trip; correct it online from the first hours of each absence.
 - **Data-driven guard:** room humidity sensors, then a damp/mould limit computed from indoor humidity instead of
   the fixed 12 degC.
 - **Gate exclusion:** write the declared deviation into the preregistration and leave vacation days out of the
   comfort and energy scores.
 - **Retire `comfort_away`:** remove `climate_shadow.entities.away` and `inputs.away`.
-- **Hot water:** either move DHW into the optimizer, or retire AppDaemon `dhw_control.py` and let the optimizer own
-  the heat pump's global state; then pause the daily boost during an absence (the unit's own tank target and
-  hygiene cycle stay) and reheat the tank by `ready_at`.
+- **Hot water:** recommended: move DHW into the optimizer (one writer of the heat pump, ADR-0009; DHW and space
+  heating share the compressor; reheat by COP, not price, under ADR-0006, the battery covers price). The
+  alternative, retiring AppDaemon `dhw_control.py` and letting the optimizer switch DHW off, needs a new allowlisted
+  write anyway (`switch.aquarea_holiday_mode`, main power or a `Heat`-only mode). During an absence: no boost, and a
+  sterilization cycle plus a reheat by `ready_at`. DHW costs about 1.5 kWh/day of electricity in an empty week.
 - **Load forecast:** an empty-house load profile for the battery planner during a vacation.
 
 ## Alternatives considered
