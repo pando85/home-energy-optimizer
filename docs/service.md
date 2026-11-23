@@ -413,6 +413,8 @@ ID, price, timestamp or household reading is a label.
 | `climate_plan_valid` | gauge 0/1 (1 while the latest plan is inside `valid_until`) | — |
 | `climate_plan_heating_planned_now`, `climate_plan_water_target_celsius` | gauge: the current slot of a `planned` plan; **absent** when mode is off, no plan is current or the plan has no slots (absent is not 0); the water target only while heating is planned | — |
 | `climate_plan_served_total` | counter | `endpoint` (`plan`, `summary`), `result` (`ok`, `unavailable`) |
+| `climate_vacation_phase` | gauge 0/1 (state set; [ADR-0010](adr/0010-vacation-mode.md), from the helpers at scrape time) | `phase` (`none`, `scheduled`, `away`, `recovery`, `ready`) |
+| `climate_vacation_invalid` | gauge 0/1: both helpers hold a value and the window is rejected (**alert**); all 0 when valid, empty (the cancel: start equals end) or over | `reason` (`unparseable`, `end_before_start`, `too_long`) |
 | `climate_shadow_rmse_kelvin`, `climate_shadow_skill_ratio`, `climate_shadow_abs_bias_kelvin`, `climate_shadow_origins` | gauge | `window` (`legacy`, `new`), `horizon` (`1h`, `6h`, `12h`, `24h`) |
 | `climate_shadow_daily_heat_mdape_ratio`, `climate_shadow_valid_weeks`, `climate_shadow_top_offset_share_ratio` | gauge | `window` |
 | `climate_shadow_gate` | gauge 0/1 (state set) | `window`, `criterion` (the six of the preregistration and `verdict`), `status` (`PASS`, `FAIL`, `UNDETERMINED`) |
@@ -1577,7 +1579,9 @@ hash.
 | `climate_actuator_hold` | gauge 0/1: a machine limit held a write back at the last tick | `reason` (`min_on`, `min_off`, `water_interval`) |
 | `climate_actuator_alert` | gauge 0/1: writes fail (the safe state was attempted, or even that failed) | — |
 | `climate_actuator_not_direct_mode` | gauge 0/1: heating wanted but `Heating_Mode` is not 1 (**alert**) | — |
-| `climate_actuator_floor_override_rooms` | gauge: rooms under a floor override | — |
+| `climate_actuator_floor_override_rooms` | gauge: rooms under a floor override (outside a vacation's absence) | — |
+| `climate_actuator_guard_override_rooms` | gauge: rooms forced to heat by the vacation building guard ([ADR-0010](adr/0010-vacation-mode.md)) | — |
+| `climate_actuator_vacation_fallback_active` | gauge 0/1: a vacation hold is in force (no usable plan while away and the return is far: heating held off, the guard enforced, **no** safe state) | — |
 | `climate_actuator_desired_heating`, `_observed_heating` | gauge 0/1 (`Heat+DHW` = 1) | — |
 | `climate_actuator_desired_water_celsius`, `_observed_water_celsius` | gauge | — |
 | `climate_actuator_last_confirmed_write_timestamp_seconds` | gauge | `entity` (`heat_mode`, `water_target`) |
@@ -1585,7 +1589,8 @@ hash.
 | `climate_actuator_write_failures_total` | counter (each retry) | `reason` (`ha_error`, `readback_timeout`, `forbidden`) |
 | `climate_actuator_fallbacks_total` | counter (**alert on any increase except `shutdown`**) | `reason` |
 | `climate_actuator_heartbeats_total` | counter | `result` (`ok`, `failed`, `dry_run`) |
-| `climate_actuator_floor_overrides_total` | counter: rooms that entered an override | — |
+| `climate_actuator_floor_overrides_total` | counter: rooms that entered an override (not the vacation guard) | — |
+| `climate_actuator_vacation_fallbacks_total` | counter: entries into the vacation hold; never counted in `fallbacks_total` (no `Heat+DHW` written) | `reason` (the `FALLBACK_REASONS` vocabulary; only the plan's reasons occur) |
 
 `GET /status` carries a `climate_actuator` block (mode, `sends`, `in_control`, guard, fallback, desired, holds,
 `not_direct_mode`, floor-override rooms, observed readings, alert, last write and heartbeat times).
@@ -1596,6 +1601,31 @@ fallback, desired state or alert. The plan export's `effective_mode` is `live` o
 `climate_actuation.mode: live` (`plan_export.resolve_mode(..., live_allowed=)`); otherwise a `live` request is
 served as `shadow` with `live_locked: true` and the reason "climate_actuation.mode is not live". The ClimatePlan v1
 contract is unchanged (`advisory: true`).
+
+### Vacation mode (ADR-0010)
+
+The owner sets **Leave** and **Return** (`climate_shadow.vacation`, two `input_datetime` helpers, read only;
+[configuration](configuration.md#climate-shadow-of-the-resident-service)). With `ready_at = Return - 2 h`:
+
+- **Decision.** Slots ending in `[Leave, ready_at)` have no comfort minimum but the guard (12 degC); slots ending
+  in `[ready_at, Return)` carry the normal schedule's minimum at Return; the valve model keeps the normal
+  setpoints (thermostats are not touched). A horizon that ends inside the absence has no terminal term. Once
+  `ready_at` is within `lookahead_hours` (48) the decision plans to Return + 6 h (at most 72 h; the record keeps
+  every slot and `horizon_hours`). Scoring still reads the first 24 h. Solve time measured on the synthetic
+  house of the tests with the committed solver settings: one MILP solve at most 3.6 s at 72 h (20 s limit).
+- **Actuator.** In `[Leave, ready_at)` every room's floor is the guard (`guard_override_rooms`). In
+  `[Leave, ready_at - lookahead_hours)` a fallback caused by the plan is a **vacation hold**: heating off
+  (`DHW`), the guard still forced, the heartbeat continues, `vacation_fallbacks_total` counts it and
+  `fallbacks_total` does not. A missing room reading or mode sensor, and any fallback from
+  `ready_at - lookahead_hours` on, is the normal safe state. From `ready_at` the normal floors apply.
+- **Unavailable helpers** (a restarting HA) keep the last valid window, in the decision and in the actuator,
+  until its end; a cancel (both equal) or a rejected window ends it at once.
+- **Replan.** A change of either helper (not the first state a sync brings) decides the current boundary again
+  60 s later (flagged `redecision`, never scored twice) and wakes the actuator, which reads the helpers itself on
+  every tick.
+- **Model hygiene.** Every window is recorded under `climate_vacations/` (and closed at a cancel or a change),
+  so a restart remembers it; the weekly refit of `ua`/`q0` pauses while a vacation overlaps its 28-day window
+  (`/status` `climate_shadow.refit_paused: vacation`). Score records carry `vacation_phase`.
 
 ## Safety
 

@@ -111,6 +111,15 @@ switches it live). Owner: this repository (`climate/mpc*.py`, `b2d.py`,
 The spike guard and the regime tag are changes of the live inputs and of the record's label, not of the plant or of the
 model: no recalibration trigger and no component goes `stale` for them (they are in the [regime log](regime-log.md)).
 
+**Vacation mode** ([ADR-0010](../adr/0010-vacation-mode.md), v1) changes the live schedule only inside an owner-set
+window: no comfort minimum while the house is empty (the 12 degC guard), the return comfort from Return minus 2 h, a
+horizon up to 72 h near the return and no terminal term while the horizon ends in the absence. Outside a window the
+MILP and its inputs are unchanged (tested), so it is no recalibration trigger. **A vacation is a plant regime of its
+own** (no occupancy gains): its decisions carry `inputs.vacation` and its scores `vacation_phase`, the weekly refit
+pauses while one is in its window, and the gate must leave those days out (a declared deviation, open). The model
+keeps `q0` and the diurnal gain of an occupied house in v1, so it predicts the empty house warm and the warm-up late:
+the first vacation's predicted against measured cooling and warm-up is its first test.
+
 ## Recalibrate by
 
 `uv run python hack/climate_mpc_replay.py --feature-set <id> --dataset <dir> --workers 30` (options

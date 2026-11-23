@@ -68,6 +68,7 @@ Top level of a `200` body of `/climate/plan` (see the schema for exact types and
 | `model` | Lineage for monitoring: `prior_id`, `model_hash`, `mpc_config_sha256`, `solver_status`. |
 | `inputs.comfort` | Per room (`bedroom`, `hall_kitchen`, `office_t`): `floor_c`, `day_min_c` the plan was computed with and whether each came from the controller's helper (`*_from_helper`) or from the optimizer's config. The decision's `comfort` object also carries `window_h` (`start_weekday`, `start_weekend`, `end`: the shared day window in local hours) and `from_helpers.window` (the fields set by a house-wide helper). |
 | `inputs.away` | Away mode at the decision (every room planned at its floor + 0.5 K), `null` if unknown. |
+| `inputs.vacation` | The owner's vacation window at the decision ([ADR-0010](adr/0010-vacation-mode.md)): `phase` (`none`, `scheduled`, `away`, `recovery`, `ready`), `start`, `end`, `ready_at` (`end` minus the ready margin: the return comfort applies from there), `recovery_start` (the first planned heating slot inside `[start, ready_at)`, the warm-up start; once it has begun it is kept), `guard_c` (the only minimum while away) and `invalid_reason`. An empty window (`start == end`: the owner's cancel, or fresh helpers) or one already over is `phase: none` with `invalid_reason: null`. A rejected window (`end_before_start`, `too_long`, `unparseable`; `helpers_unavailable` when a helper is missing) echoes the helpers in `start`/`end` with `ready_at` and `recovery_start` null. |
 | `inputs.weather` | `forecast` or `persistence` (the last outdoor reading held). |
 | `slots` | The per-slot plan (below), `null` unless `planned`. |
 | `requested_mode`, `effective_mode`, `live_locked`, `live_lock_reason`, `mode_source` | The owner's mode and what the optimizer does with it ([Modes](#modes)). Served fresh on every request; not part of `plan_id`. |
@@ -77,7 +78,9 @@ Top level of a `200` body of `/climate/plan` (see the schema for exact types and
 
 Columnar (compact: the whole plan is about 5 KB). Slot `i` covers
 `[slots.start + i * step_minutes, slots.start + (i + 1) * step_minutes)`; `step_minutes` is 15, `n` is 96
-(24 h). Find the slot of "now" by time, never by position in time of arrival. All arrays have length `n`.
+(24 h), and up to 288 (72 h) while a vacation's return is within its look-ahead (ADR-0010: the plan then runs
+to the return plus 6 h). Find the slot of "now" by time, never by position in time of arrival. All arrays have
+length `n`.
 
 | Array | Values | Meaning |
 |---|---|---|
@@ -117,7 +120,9 @@ dashboard needs no templating beyond picking fields:
 
 `/climate/plan/summary` adds, flat: `state`, `reason`, the five mode fields, `plan_id`, `status`, `regime`,
 `generated_at`, `valid_until`, `code_version`, `comfort` (per room, as `inputs.comfort`) and `away`. When no
-plan is current only `version`, `advisory`, `state`, `reason` and the mode fields are present.
+plan is current only `version`, `advisory`, `state`, `reason`, the mode fields and `vacation` are present.
+`vacation` (the shape of `inputs.vacation`) is **always** present: it is read from the owner's helpers at the
+request, not from the plan, so a dashboard sees a window as soon as it is set.
 
 ## Modes
 
