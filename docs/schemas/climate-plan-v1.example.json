@@ -36,7 +36,16 @@
       }
     },
     "away": false,
-    "weather": "forecast"
+    "weather": "forecast",
+    "vacation": {
+      "phase": "none",
+      "start": null,
+      "end": null,
+      "ready_at": null,
+      "recovery_start": null,
+      "guard_c": 12.0,
+      "invalid_reason": null
+    }
   },
   "slots": {
     "start": "2026-11-16T09:00:00+00:00",

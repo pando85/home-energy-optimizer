@@ -54,7 +54,13 @@ __all__ = ["CLIMATE_KINDS", "SCHEMA_VERSION", "ShadowSink", "iter_records"]
 SCHEMA_VERSION = 1
 _ROOT = Path("service") / "v1"
 #: Append-only record kinds of the climate shadow (:mod:`.climate_shadow`).
-CLIMATE_KINDS = ("climate_decisions", "climate_scores", "climate_days", "climate_models")
+CLIMATE_KINDS = (
+    "climate_decisions",
+    "climate_scores",
+    "climate_days",
+    "climate_models",
+    "climate_vacations",
+)
 
 
 def _utc_day(at: datetime) -> str:

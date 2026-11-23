@@ -15,6 +15,13 @@ turns it into a desired state:
   state (``Heat+DHW`` and ``safe_water_target_c``, water only in direct mode) is written once, then
   nothing is written until a valid plan returns (decision 7).  The worst case is extra kWh, never
   no heating.
+* **Vacation (ADR-0010).**  While the owner's window is in ``[start, ready_at)`` every room's
+  floor is the building guard ``climate_shadow.vacation.guard_c`` (a room below it forces
+  ``Heat+DHW``, counted as a guard override); from ``ready_at`` the normal floors.  Inside
+  ``[start, ready_at - lookahead_hours)`` a fallback caused by the plan (none, stale, failed,
+  invalid, no observer state) is a **vacation hold** instead: heating off (``DHW``), the guard still
+  enforced, no safe state.  A room reading or mode sensor that is missing keeps the normal
+  fallback, and from ``ready_at - lookahead_hours`` on the normal fallback applies again.
 * A Home Assistant restart is not a loss of control: after the session drops and syncs again, or
   while the mode sensor is unavailable (the room readings too, right after a restart), the actuator
   **holds** (writes nothing but the heartbeat, guard reason ``restart_grace``) for
@@ -64,6 +71,9 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from battery_optimizer.climate import vacation as vac
 
 from .clock import Clock
 from .config import ClimateActuationSettings
@@ -276,6 +286,10 @@ class _Readings:
     water: float | None
     rooms: Mapping[str, float | None]  # usable current temperature per comfort room
     floors: Mapping[str, float]
+    #: The owner's valid vacation window (ADR-0010), ``None`` without one.
+    vacation: vac.VacationWindow | None = None
+    #: Inside ``[start, ready_at)``: the floors above are the building guard.
+    absent: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -289,6 +303,8 @@ class _Readings:
             "observed_water_c": self.water,
             "rooms": dict(self.rooms),
             "floors": dict(self.floors),
+            "vacation": self.vacation.to_dict() if self.vacation is not None else None,
+            "vacation_absent": self.absent,
         }
 
 
@@ -307,6 +323,8 @@ class ClimateActuator:
         record: Recorder | None = None,
         metrics: Any = None,
         synced: Callable[[], bool] | None = None,
+        vacation: vac.VacationSettings | None = None,
+        tz: ZoneInfo | None = None,
     ) -> None:
         if settings.mode not in ACTUATOR_MODES:
             raise ValueError(f"climate actuator mode must be one of {ACTUATOR_MODES}")
@@ -321,7 +339,13 @@ class ClimateActuator:
         self._record = record
         self._metrics = metrics
         self._synced = synced
+        self._vacation = vacation
+        self._tz = tz or ZoneInfo("UTC")
         self._lock = asyncio.Lock()
+        #: The plan fallback reason held off by the vacation (ADR-0010), ``None`` when not held.
+        self.vacation_hold: str | None = None
+        #: The last valid vacation window read, kept while the helpers are unavailable.
+        self._last_window: vac.VacationWindow | None = None
 
         #: The last tick found itself permitted to write (select live, legacy off, synced): only
         #: then does a select leaving ``live`` or a shutdown write the safe state.
@@ -398,11 +422,14 @@ class ClimateActuator:
         water = self._numeric(e.water_request)
         if water is None:  # the helper the automation mirrors the unit's request into
             water = self._numeric(e.water_target)
+        window = self._vacation_window(now)
+        absent = window is not None and window.absent(now)
+        guard = self._vacation.guard_c if self._vacation is not None else None
         rooms: dict[str, float | None] = {}
         floors: dict[str, float] = {}
         for room, entity in e.rooms.items():
             rooms[room] = self._room_temperature(entity, now)
-            floors[room] = self._floor(room)
+            floors[room] = guard if absent and guard is not None else self._floor(room)
         return _Readings(
             owner=owner,
             legacy_on=legacy_on,
@@ -413,7 +440,37 @@ class ClimateActuator:
             water=water,
             rooms=rooms,
             floors=floors,
+            vacation=window,
+            absent=absent,
         )
+
+    def _vacation_window(self, now: datetime) -> vac.VacationWindow | None:
+        """The owner's valid vacation window from the store (read only), ``None`` without one."""
+        v = self._vacation
+        if v is None or not v.enabled:
+            return None
+
+        def value(entity: str) -> str | None:
+            state = self._store.get(entity)
+            return state.state if state is not None and state.available else None
+
+        read = vac.read_window(
+            value(v.start_entity), value(v.end_entity), tz=self._tz, now=now, settings=v
+        )
+        read = vac.hold_last(read, self._last_window, now)  # an HA restart keeps the window
+        self._last_window = read.window
+        return read.window
+
+    def _vacation_holds(self, r: _Readings, reason: str, now: datetime) -> bool:
+        """Whether a fallback for *reason* is a vacation hold: the house is empty, the return is
+        further than the look-ahead, the reason is the plan's (a missing room reading or mode
+        sensor keeps the normal fallback) and the unit and a room can be read."""
+        v, w = self._vacation, r.vacation
+        if v is None or w is None or not r.absent or reason in _RESTART_REASONS:
+            return False
+        if now >= w.ready_at - timedelta(hours=v.lookahead_hours):
+            return False
+        return r.mode is not None and any(t is not None for t in r.rooms.values())
 
     def _room_temperature(self, entity: str, now: datetime) -> float | None:
         """The thermostat's current temperature, or ``None`` when it is missing, unavailable,
@@ -530,8 +587,9 @@ class ClimateActuator:
                 self.breached.add(room)
                 entered.append(room)
         if entered:
-            log.warning("climate actuator floor override rooms=%s", ",".join(entered))
-            if self._metrics is not None:
+            kind = "guard" if r.absent else "floor"
+            log.warning("climate actuator %s override rooms=%s", kind, ",".join(entered))
+            if self._metrics is not None and not r.absent:
                 self._metrics.climate_actuator_floor_overrides.inc(len(entered))
         return tuple(sorted(self.breached))
 
@@ -835,6 +893,7 @@ class ClimateActuator:
             reasons.append("restart_grace")
         if not self.in_control:
             self._grace_since = None
+            self.vacation_hold = None
         self.reasons = tuple(reasons)
         self._log_transitions(before, r)
         record = self._tick_record(ctx, r, writes, heartbeat)
@@ -867,6 +926,11 @@ class ClimateActuator:
                 self._grace_since = now  # HA restarting: the unit's own sensor is gone
         if reason not in _RESTART_REASONS:
             self._grace_since = None
+        if reason is not None and self._vacation_holds(r, reason, now):
+            return await self._tick_vacation_hold(reason, r, now)
+        if self.vacation_hold is not None:
+            log.info("climate actuator vacation hold cleared reason=%s", self.vacation_hold)
+            self.vacation_hold = None
         if reason is not None:  # the fallback: the safe state once, then nothing until a plan
             writes: list[dict[str, Any]] = []
             if self.fallback is None and reason in _RESTART_REASONS and self._in_grace(now):
@@ -893,8 +957,8 @@ class ClimateActuator:
         if forced:  # the planned water target, or without one the safe target
             water = slot.water_c if slot.heating else self.settings.safe_water_target_c
             desired = Desired(
-                "floor",
-                "floor_override",
+                "vacation_guard" if r.absent else "floor",
+                "vacation_guard" if r.absent else "floor_override",
                 True,
                 water,
                 slot.plan_id,
@@ -903,6 +967,39 @@ class ClimateActuator:
             )
         else:
             desired = Desired("plan", "plan", slot.heating, slot.water_c, slot.plan_id)
+        return await self._reconcile(desired, r, now)
+
+    async def _tick_vacation_hold(
+        self, reason: str, r: _Readings, now: datetime
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        """No usable plan while the house is empty and the return is far (ADR-0010): heating off,
+        the building guard still forced, no safe state (an outage must not heat an empty house for
+        a day).  Counted apart from the safe-state fallbacks."""
+        if self.fallback is not None:  # a safe state written before the hold: leave it behind
+            self.fallback = None
+        if self.vacation_hold != reason:
+            if self.vacation_hold is None:
+                self._count("climate_actuator_vacation_fallbacks", reason=reason)
+            log.warning("climate actuator vacation hold reason=%s (heating held off)", reason)
+            self.vacation_hold = reason
+        forced = self._floor_override(r)
+        if forced:
+            desired = Desired(
+                "vacation_guard",
+                "vacation_guard",
+                True,
+                self.settings.safe_water_target_c,
+                exempt_min_off=True,
+                rooms=forced,
+            )
+        else:
+            desired = Desired("vacation_hold", f"vacation_hold:{reason}", False)
+        return await self._reconcile(desired, r, now)
+
+    async def _reconcile(
+        self, desired: Desired, r: _Readings, now: datetime
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        """Move the unit to *desired*; on a failed write at least the safe state, this tick only."""
         self.desired = desired
         planned, self.holds, self.not_direct_mode = self._plan_writes(desired, r, now)
         ok, writes = await self._apply(planned)
@@ -1023,6 +1120,7 @@ class ClimateActuator:
             "in_control": self.in_control,
             "guard_reasons": list(self.reasons) if ctx is not None else ["shutdown"],
             "fallback": None if self.fallback is None else self.fallback[0],
+            "vacation_hold": self.vacation_hold,
             "plan_id": None if ctx is None or ctx.plan is None else ctx.plan.get("plan_id"),
             "desired": self.desired.to_dict() if self.desired is not None else None,
             "holds": list(self.holds),
@@ -1075,6 +1173,7 @@ class ClimateActuator:
             "holds": list(self.holds),
             "not_direct_mode": self.not_direct_mode,
             "floor_override_rooms": sorted(self.breached),
+            "vacation_hold": self.vacation_hold,
             "observed": self._read(self._clock.now()).to_dict() if self.last_tick_at else None,
             "alert": self.alert,
             "last_error": self.last_error,
@@ -1107,7 +1206,9 @@ class ClimateActuator:
             "fallback": None if self.fallback is None else self.fallback[0],
             "holds": self.holds,
             "not_direct_mode": 1.0 if self.not_direct_mode else 0.0,
-            "floor_override_rooms": len(self.breached),
+            "floor_override_rooms": 0 if r is not None and r.absent else len(self.breached),
+            "guard_override_rooms": len(self.breached) if r is not None and r.absent else 0,
+            "vacation_fallback_active": 1.0 if self.vacation_hold is not None else 0.0,
             "desired_heating": flag(desired.heating) if desired else None,
             "desired_water_celsius": desired.water_c if desired else None,
             "observed_heating": None

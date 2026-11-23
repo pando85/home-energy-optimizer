@@ -23,6 +23,7 @@ import yaml
 
 from battery_optimizer._env import get_env
 from battery_optimizer.climate.room_guard import SpikeRule
+from battery_optimizer.climate.vacation import VacationSettings
 
 from .thermal import DEFAULT_PARAMS
 
@@ -366,6 +367,8 @@ class ClimateShadowSettings:
     plan_ttl_minutes: int = 90
     #: Spike guard of the decision's room temperatures (``climate/room_guard.py``); on by default.
     room_spike_guard: SpikeRule = field(default_factory=SpikeRule)
+    #: Vacation mode (ADR-0010): the owner's Leave/Return helpers, read only; on by default.
+    vacation: VacationSettings = field(default_factory=VacationSettings)
 
     def entities(self) -> tuple[str, ...]:
         return tuple(
@@ -375,6 +378,7 @@ class ClimateShadowSettings:
                 self.dhw_plan_entity,
                 self.away_entity,
                 self.mode_entity,
+                *self.vacation.entities(),
             )
             if e
         )
@@ -1179,6 +1183,16 @@ _CLIMATE_SHADOW_KEYS = (
     "optimizer_mode",
     "plan_ttl_minutes",
     "room_spike_guard",
+    "vacation",
+)
+_VACATION_KEYS = (
+    "enabled",
+    "start_entity",
+    "end_entity",
+    "guard_c",
+    "ready_margin_minutes",
+    "lookahead_hours",
+    "max_days",
 )
 _SPIKE_GUARD_KEYS = (
     "enabled",
@@ -1211,6 +1225,49 @@ def _parse_spike_guard(raw: Mapping[str, Any]) -> SpikeRule:
     if rule.max_hold_minutes < rule.window_minutes:
         raise ValueError(f"service config: {name}.max_hold_minutes must be at least window_minutes")
     return rule
+
+
+def _parse_vacation(raw: Mapping[str, Any]) -> VacationSettings:
+    """``climate_shadow.vacation`` (ADR-0010): two ``input_datetime`` helpers, read only."""
+    name = "climate_shadow.vacation"
+    _keys(raw, name, _VACATION_KEYS)
+    d = VacationSettings()
+    entities = {}
+    for key in ("start_entity", "end_entity"):
+        value = raw.get(key, getattr(d, key))
+        if not isinstance(value, str) or not value.startswith("input_datetime."):
+            raise ValueError(f"service config: {name}.{key} must be an input_datetime entity ID")
+        if not _ENTITY_ID.match(value):
+            raise ValueError(f"service config: {name}.{key} must be an entity ID")
+        entities[key] = value
+    if entities["start_entity"] == entities["end_entity"]:
+        raise ValueError(f"service config: {name}.start_entity and end_entity must differ")
+    guard = _positive(raw.get("guard_c", d.guard_c), f"{name}.guard_c")
+    if not 5.0 <= guard <= 18.0:
+        raise ValueError(f"service config: {name}.guard_c must be in 5 to 18 degC")
+    margin = _int(
+        raw.get("ready_margin_minutes", d.ready_margin_minutes), f"{name}.ready_margin_minutes", 0
+    )
+    if margin > 720:
+        raise ValueError(f"service config: {name}.ready_margin_minutes must be at most 720")
+    lookahead = _int(raw.get("lookahead_hours", d.lookahead_hours), f"{name}.lookahead_hours")
+    if not 24 <= lookahead <= 66:
+        raise ValueError(
+            f"service config: {name}.lookahead_hours must be in 24 to 66 (the horizon is capped "
+            "at 72 h and covers the return plus 6 h)"
+        )
+    max_days = _int(raw.get("max_days", d.max_days), f"{name}.max_days")
+    if max_days > 366:
+        raise ValueError(f"service config: {name}.max_days must be at most 366")
+    return VacationSettings(
+        enabled=_bool(raw.get("enabled", d.enabled), f"{name}.enabled"),
+        start_entity=entities["start_entity"],
+        end_entity=entities["end_entity"],
+        guard_c=guard,
+        ready_margin_minutes=margin,
+        lookahead_hours=lookahead,
+        max_days=max_days,
+    )
 
 
 def _parse_climate_shadow(raw: Mapping[str, Any]) -> ClimateShadowSettings:
@@ -1287,6 +1344,7 @@ def _parse_climate_shadow(raw: Mapping[str, Any]) -> ClimateShadowSettings:
         optimizer_mode=mode,
         plan_ttl_minutes=ttl,
         room_spike_guard=_parse_spike_guard(_section(raw, "room_spike_guard")),
+        vacation=_parse_vacation(_section(raw, "vacation")),
     )
 
 

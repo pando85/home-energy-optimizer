@@ -35,7 +35,7 @@
     "inputs": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["comfort", "away", "weather"],
+      "required": ["comfort", "away", "weather", "vacation"],
       "properties": {
         "comfort": {
           "type": "object",
@@ -53,7 +53,8 @@
           }
         },
         "away": {"type": ["boolean", "null"], "description": "Away mode at the decision (every room planned at its floor + 0.5 K); null when unknown."},
-        "weather": {"enum": ["forecast", "persistence", null], "description": "Outdoor temperature over the horizon: the issued forecast, or the last reading held."}
+        "weather": {"enum": ["forecast", "persistence", null], "description": "Outdoor temperature over the horizon: the issued forecast, or the last reading held."},
+        "vacation": {"$ref": "#/$defs/vacation", "description": "The owner's vacation window at the decision (ADR-0010); phase none without one."}
       }
     },
     "slots": {
@@ -67,7 +68,7 @@
           "properties": {
             "start": {"$ref": "#/$defs/instant", "description": "Equals t0."},
             "step_minutes": {"const": 15},
-            "n": {"type": "integer", "minimum": 1, "maximum": 192},
+            "n": {"type": "integer", "minimum": 1, "maximum": 288, "description": "96 (24 h) normally; up to 288 (72 h) while a vacation's return is within the look-ahead (ADR-0010)."},
             "heating": {"type": "array", "items": {"enum": [0, 1]}, "description": "1: space heating planned on (it permits heating; the heat pump still follows its thermostats); 0: planned off."},
             "water_c": {"type": "array", "items": {"oneOf": [{"type": "integer", "minimum": 20, "maximum": 35}, {"type": "null"}]}, "description": "Absolute water target in degC, already clamped to 20..35, in heating slots; null where heating is 0."},
             "dhw": {"type": "array", "items": {"enum": [0, 1]}, "description": "1: the plan assumed hot-water production in the slot (the controller owns it); heating is 0 there."},
@@ -139,6 +140,21 @@
     }
   ],
   "$defs": {
-    "instant": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?\\+00:00$", "description": "ISO 8601, always UTC with a +00:00 offset."}
+    "instant": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?\\+00:00$", "description": "ISO 8601, always UTC with a +00:00 offset."},
+    "vacation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "start", "end", "ready_at", "recovery_start", "guard_c", "invalid_reason"],
+      "description": "Vacation mode (ADR-0010). An empty window (start == end: the cancel) or one already over is phase none with invalid_reason null. A rejected window echoes the helper values in start/end with ready_at and recovery_start null.",
+      "properties": {
+        "phase": {"enum": ["none", "scheduled", "away", "recovery", "ready"]},
+        "start": {"oneOf": [{"$ref": "#/$defs/instant"}, {"type": "null"}], "description": "Leave (UTC)."},
+        "end": {"oneOf": [{"$ref": "#/$defs/instant"}, {"type": "null"}], "description": "Return (UTC)."},
+        "ready_at": {"oneOf": [{"$ref": "#/$defs/instant"}, {"type": "null"}], "description": "end - ready_margin_minutes: the return comfort applies from here; null without a valid window."},
+        "recovery_start": {"oneOf": [{"$ref": "#/$defs/instant"}, {"type": "null"}], "description": "First planned heating slot inside [start, ready_at): the warm-up start (v1); null when none is planned in the horizon."},
+        "guard_c": {"type": ["number", "null"], "description": "The building guard, the only minimum while away; null in a record written before ADR-0010."},
+        "invalid_reason": {"type": ["string", "null"], "description": "Why the helpers were rejected (unparseable, end_before_start, too_long, helpers_unavailable); null when valid, empty or over."}
+      }
+    }
   }
 }

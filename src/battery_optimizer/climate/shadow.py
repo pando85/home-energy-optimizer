@@ -54,7 +54,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from battery_optimizer.climate import b2d, fit, mpc_replay, plant
+from battery_optimizer.climate import b2d, fit, mpc_replay, plant, vacation
 from battery_optimizer.climate.config import ClimateConfig
 from battery_optimizer.climate.cop import CopModel
 from battery_optimizer.climate.data import ClimateData, Site, build_climate_data, room_offsets
@@ -89,6 +89,7 @@ __all__ = [
     "comfort_helper_levels",
     "day_record",
     "decide",
+    "decision_hours",
     "detect_optimizer_regime",
     "detect_regime",
     "fit_shadow_prior",
@@ -646,6 +647,8 @@ class LiveInputs:
     forecast: Mapping[str, Any] | None = None
     #: The spike guard's audit (:func:`.room_guard.audit`), ``None`` when it is off.
     room_guard: Mapping[str, Any] | None = None
+    #: The owner's vacation window at the decision (ADR-0010), ``None`` when not read.
+    vacation: vacation.VacationRead | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -713,8 +716,15 @@ def decide(
     *,
     settings: PlanSettings | None = None,
     comfort: Mapping[str, Mapping[str, float]] | None = None,
+    vacation_settings: vacation.VacationSettings | None = None,
 ) -> dict[str, Any]:
     """The decision record at *t0_at* (a slot start of *d*; *d* extends one horizon past it).
+
+    With a valid vacation window in *inputs* (ADR-0010, :mod:`.vacation`) the comfort minimum of the
+    absence is the building guard, the return comfort applies from ``ready_at``, the horizon reaches
+    the return once it is within the look-ahead (:func:`decision_hours`; *d* must hold it) and a
+    horizon ending inside the absence has no terminal term.  The valve model keeps the normal
+    schedule's setpoints: the thermostats are not touched.
 
     *comfort* is :func:`comfort_helper_levels` at *t0_at*: the per-room helper values and the
     house-wide day-window hours in effect at the decision, held over the horizon (the controller's
@@ -724,7 +734,15 @@ def decide(
     ``origin`` (the observer state the predictions start from) is kept whenever it exists, so the
     prediction is scored even if the plan fails; ``plan`` is the MPC's (never executed)."""
     cfg = live_config(cfg)
+    vs = vacation_settings or vacation.VacationSettings()
+    read = inputs.vacation or vacation.VacationRead(None, None)
+    window = read.window
+    hours = decision_hours(cfg, inputs, vs, t0_at)
+    if hours != int(cfg.horizon_hours):
+        cfg = override(cfg, ("horizon_hours",), hours)  # the sha256 still names the file
     settings = settings or PlanSettings.from_config(cfg)
+    if vacation.terminal_off(window, t0_at, hours):
+        settings = replace(settings, terminal=False)
     h = int(cfg.horizon_hours * 4)
     t0 = _slot_index(d, t0_at)
     if t0 is None or t0 + h > d.n or t0 < 1:
@@ -739,7 +757,8 @@ def decide(
     history_t_out = outdoor.copy()
     history_t_out[t0:hi] = horizon_t_out
     # horizon DHW: the controller's plan for today's slots, yesterday's measured slots elsewhere
-    back = np.arange(t0, hi) - mpc_replay.SLOTS_PER_DAY
+    # (repeated day after day over a horizon longer than a day)
+    back = t0 - mpc_replay.SLOTS_PER_DAY + (np.arange(t0, hi) - t0) % mpc_replay.SLOTS_PER_DAY
     horizon_dhw = np.where(back >= 0, d.dhw[np.maximum(back, 0)], False)
     local_day = t0_at.astimezone(d.tz).date()
     plan = parse_dhw_plan(inputs.dhw_plan, starts_us=d.starts_us[t0:hi], tz=d.tz, day=local_day)
@@ -765,6 +784,8 @@ def decide(
         "model_hash": model_rec["model_hash"],
         "model_params": dict(model_rec["params"]),
         "mpc_config_sha256": cfg.sha256,
+        "horizon_hours": hours,
+        "terminal": bool(settings.terminal),
         "inputs": {
             "weather": weather,
             "forecast_requested_at": (inputs.forecast or {}).get("requested_at"),
@@ -776,6 +797,7 @@ def decide(
             "dhw_slots": [int(i) for i in np.flatnonzero(horizon_dhw)],
             "away": inputs.away,
             "room_guard": inputs.room_guard,
+            "vacation": vacation.view(read, t0_at, guard_c=vs.guard_c),
         },
     }
     levels = mpc_replay.comfort_levels(model.rooms, cfg, comfort)
@@ -808,6 +830,21 @@ def decide(
             inp["ex"], setpoints=np.broadcast_to(away_sp, inp["ex"].setpoints.shape).copy()
         )
         inp["minimum"] = np.broadcast_to(floor, inp["minimum"].shape).copy()
+    if window is not None:
+        slot_ends = [
+            datetime.fromtimestamp((int(u) + STEP_US) / 1e6, tz=UTC) for u in d.starts_us[t0:hi]
+        ]
+        back_at = window.end.astimezone(d.tz)
+        normal_at_end = mpc_replay.comfort_minimum(
+            model.rooms,
+            np.array([back_at.hour + back_at.minute / 60.0]),
+            np.array([back_at.date().weekday() >= 5]),
+            cfg,
+            levels,
+        )[:, 0]
+        inp["minimum"] = vacation.apply_minimum(
+            inp["minimum"], slot_ends, window, normal_at_end, vs.guard_c
+        )
     rec["inputs"].update(
         {
             "prev_on": bool(inp["prev_on"]),
@@ -822,7 +859,25 @@ def decide(
     rec["plan"] = plan_rec
     ok = plan_rec["status"] in ("optimal", "gap", "time_limit")
     rec["status"] = "planned" if ok else "plan_failed"
+    if ok and window is not None and "plan_on" in plan_rec:
+        recovery = vacation.recovery_start(window, t0_at, list(plan_rec["plan_on"]))
+        rec["inputs"]["vacation"] = vacation.view(
+            read, t0_at, guard_c=vs.guard_c, recovery=recovery
+        )
     return rec
+
+
+def decision_hours(
+    cfg: MpcConfig,
+    inputs: LiveInputs,
+    vacation_settings: vacation.VacationSettings | None,
+    t0_at: datetime,
+) -> int:
+    """The horizon of the decision at *t0_at*: the config's, or up to the return of a vacation
+    whose ``ready_at`` is within the look-ahead (:func:`.vacation.horizon_hours`)."""
+    vs = vacation_settings or vacation.VacationSettings()
+    window = inputs.vacation.window if inputs.vacation is not None else None
+    return vacation.horizon_hours(window, t0_at, int(cfg.horizon_hours), vs)
 
 
 # ---------------------------------------------------------------------------
@@ -888,6 +943,7 @@ def score(
     xs_q, n_q = mpc_replay.heat_driven(model, x0, ex, q_meas)
     # diagnostic: the same with the outdoor series the plan used (forecast or the reading held)
     planned = np.array([np.nan if v is None else v for v in decision["inputs"]["t_out"]], float)
+    planned = planned[:h]  # a vacation decision may have planned past the scored horizon
     xs_f, n_f = (None, 0)
     if planned.size == h and np.isfinite(planned).all():
         xs_f, n_f = mpc_replay.heat_driven(model, x0, replace(ex, t_out=planned), q_meas)
@@ -929,6 +985,8 @@ def score(
         "model_hash": decision.get("model_hash"),
         "action": action,
         "weather": decision["inputs"]["weather"],
+        # tagged so the gate can leave vacation decisions out later (ADR-0010)
+        "vacation_phase": (decision["inputs"].get("vacation") or {}).get("phase"),
         "gate_rooms": list(GATE_ROOMS),
         "room_mean": room_mean,
         "design_rooms": design,

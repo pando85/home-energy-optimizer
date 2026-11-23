@@ -167,6 +167,25 @@ def _comfort(rec: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+#: The vacation object of a decision without one (a record written before ADR-0010).
+NO_VACATION: dict[str, Any] = {
+    "phase": "none",
+    "start": None,
+    "end": None,
+    "ready_at": None,
+    "recovery_start": None,
+    "guard_c": None,
+    "invalid_reason": None,
+}
+
+
+def _vacation(obj: Any) -> dict[str, Any]:
+    """The decision's ``inputs.vacation`` in the contract's shape (ADR-0010)."""
+    if not isinstance(obj, Mapping):
+        return dict(NO_VACATION)
+    return {k: obj.get(k, NO_VACATION[k]) for k in NO_VACATION}
+
+
 def build_plan(
     rec: Mapping[str, Any],
     *,
@@ -265,6 +284,7 @@ def build_plan(
             "comfort": comfort,
             "away": inputs.get("away"),
             "weather": inputs.get("weather"),
+            "vacation": _vacation(inputs.get("vacation")),
         },
         "slots": slots,
     }
@@ -394,13 +414,20 @@ def plan_response(
 
 
 def summary_response(
-    plan: Mapping[str, Any] | None, *, enabled: bool, mode: ModeState, now: datetime
+    plan: Mapping[str, Any] | None,
+    *,
+    enabled: bool,
+    mode: ModeState,
+    now: datetime,
+    vacation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """``GET /climate/plan/summary``: always 200, a flat document for a dashboard sensor.
 
     ``state`` is what a reader gets from ``/climate/plan`` (``planned``, ``skipped``, ``error``
     or one of the not-available states), so the mode and the live lock stay visible while the
-    plan itself is withheld."""
+    plan itself is withheld.  ``vacation`` (ADR-0010) comes from the owner's helpers at *now*, not
+    from the plan, so it is present whatever the plan's state (the caller's *vacation*; without one,
+    the plan's own or :data:`NO_VACATION`)."""
     state = plan_state(plan, enabled=enabled, mode=mode, now=now)
     body: dict[str, Any] = {
         "version": CONTRACT_VERSION,
@@ -408,6 +435,9 @@ def summary_response(
         "state": state,
         "reason": _REASONS.get(state) or (plan or {}).get("reason"),
         **mode.fields(),
+        "vacation": dict(vacation)
+        if vacation is not None
+        else _vacation(((plan or {}).get("inputs") or {}).get("vacation")),
     }
     if state in PLAN_STATES:
         assert plan is not None

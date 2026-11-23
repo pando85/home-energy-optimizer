@@ -633,6 +633,16 @@ def _climate_actuator_families(a: dict[str, Any]) -> Iterable[Metric]:
         "Comfort rooms under a floor override (a room below its floor forces Heat+DHW)",
         a.get("floor_override_rooms"),
     )
+    yield gauge(
+        "guard_override_rooms",
+        "Comfort rooms forced to heat by the vacation building guard (ADR-0010)",
+        a.get("guard_override_rooms"),
+    )
+    yield gauge(
+        "vacation_fallback_active",
+        "1 while a vacation hold keeps heating off for want of a usable plan (no safe state)",
+        a.get("vacation_fallback_active"),
+    )
     for suffix, key, doc in (
         ("desired_heating", "desired_heating", "Requested space heating (1 = Heat+DHW, 0 = DHW)"),
         ("observed_heating", "observed_heating", "Unit's operating mode (1 = Heat+DHW, 0 = DHW)"),
@@ -714,6 +724,26 @@ def _climate_plan_families(c: dict[str, Any]) -> Iterable[Metric]:
             water.add_metric([], float(summary["water_c_now"]))
     yield heating
     yield water
+    vac = c.get("vacation")
+    if vac is not None:
+        from battery_optimizer.climate.vacation import INVALID_REASONS, PHASES
+
+        phase = GaugeMetricFamily(
+            f"{PREFIX}_climate_vacation_phase",
+            "1 for the vacation phase now (ADR-0010; none, scheduled, away, recovery, ready)",
+            labels=["phase"],
+        )
+        for k in PHASES:
+            phase.add_metric([k], 1.0 if k == vac.get("phase") else 0.0)
+        yield phase
+        invalid = GaugeMetricFamily(
+            f"{PREFIX}_climate_vacation_invalid",
+            "1 for why the Leave/Return helpers are rejected while both hold a value",
+            labels=["reason"],
+        )
+        for k in INVALID_REASONS:
+            invalid.add_metric([k], 1.0 if k == vac.get("invalid_reason") else 0.0)
+        yield invalid
 
 
 def _climate_families(c: dict[str, Any]) -> Iterable[Metric]:
@@ -1209,6 +1239,12 @@ class ServiceMetrics:
             ["result"],
             registry=r,
         )
+        self.climate_actuator_vacation_fallbacks = Counter(
+            f"{PREFIX}_climate_actuator_vacation_fallbacks",
+            "Entries into the vacation hold by reason (heating held off, guard active; ADR-0010)",
+            ["reason"],
+            registry=r,
+        )
         self.climate_actuator_floor_overrides = Counter(
             f"{PREFIX}_climate_actuator_floor_overrides",
             "Comfort rooms that entered a floor override (below the floor: Heat+DHW forced)",
@@ -1221,6 +1257,7 @@ class ServiceMetrics:
             self.climate_actuator_write_failures.labels(reason=reason)
         for reason in FALLBACK_REASONS:
             self.climate_actuator_fallbacks.labels(reason=reason)
+            self.climate_actuator_vacation_fallbacks.labels(reason=reason)
         for result in ("ok", "failed", "dry_run"):
             self.climate_actuator_heartbeats.labels(result=result)
 
