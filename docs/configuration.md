@@ -147,6 +147,18 @@ and the read-only token, and reads three optional HA helpers of the homelab comf
 `max_hold_minutes`, `memory_minutes`) filters cooking spikes out of the decision's room temperatures. Keys and
 ops: [shadow service](service.md#climate-shadow-track-b2).
 
+`climate_shadow.vacation` ([ADR-0010](adr/0010-vacation-mode.md), on by default) reads the owner's two
+`input_datetime` helpers, read only:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | `false`: the helpers are not read, no vacation ever applies |
+| `start_entity`, `end_entity` | `input_datetime.climate_vacation_start`, `input_datetime.climate_vacation_end` | Leave and Return, date and time in the service's local time zone |
+| `guard_c` | `12.0` (5 to 18) | The only comfort minimum while the house is empty, also the actuator's floor then: building protection, not comfort |
+| `ready_margin_minutes` | `120` (0 to 720) | The return comfort applies from `end` minus this (`ready_at`) |
+| `lookahead_hours` | `48` (24 to 66) | A decision plans to `end + 6 h` (at most 72 h) once `ready_at` is this close; before it, no usable plan is a vacation hold (heating off), not the safe state |
+| `max_days` | `60` (at most 366) | A longer window is rejected (`too_long`) |
+
 ### Live climate control (`climate_actuation`)
 
 `climate_actuation:` in `config/service.yaml` is the heat pump's counterpart of `mode:` ([ADR-0009](adr/0009-live-climate-control.md)):

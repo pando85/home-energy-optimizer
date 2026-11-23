@@ -108,7 +108,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from battery_optimizer.climate import plan_export
+from battery_optimizer.climate import plan_export, vacation
 from battery_optimizer.climate.shadow import LiveInputs, detect_optimizer_regime, detect_regime
 from battery_optimizer.config import TariffConfig
 
@@ -195,6 +195,8 @@ _THERMAL_SAVE_S = 1800.0
 _FULL_CHARGE_TICK_S = 10.0
 #: Retry period of the Home Assistant time-zone check.
 _TZ_CHECK_RETRY_S = 60.0
+#: After a vacation helper changes, the climate shadow decides again this much later (ADR-0010).
+VACATION_RERUN_DELAY_S = 60.0
 #: Longest the startup catch-up of the climate shadow waits for the first Home Assistant sync.
 CLIMATE_SYNC_TIMEOUT_S = 60.0
 
@@ -489,6 +491,9 @@ class ShadowService:
         self._init_full_charge()
 
         self._climate_sync_timeout_s = climate_sync_timeout_s
+        #: A change of the owner's vacation helpers asks for a new decision (ADR-0010).
+        self._climate_rerun = asyncio.Event()
+        self._vacation_states: dict[str, str | None] = {}
         self._ha_synced = asyncio.Event()  # set by the first HA sync; the catch-up run waits on it
         self.climate: ClimateShadowJob | None = None
         self.climate_error: str | None = None
@@ -511,6 +516,8 @@ class ShadowService:
                 record=self._record_climate_actuation,
                 metrics=self.metrics,
                 synced=lambda: self.ha is not None and self.ha.stats.synced,
+                vacation=config.climate_shadow.vacation if config.climate_shadow.enabled else None,
+                tz=self._tz,
             )
         if acting:
             self.actuator = Actuator(
@@ -675,6 +682,7 @@ class ShadowService:
             self._actuation_wake_on(state, role, result)
         if self.climate_actuator is not None:
             self._climate_wake_on(state)
+        self._vacation_changed(state)
         if (
             role == "price"
             and result is UpdateResult.ACCEPTED
@@ -825,6 +833,43 @@ class ShadowService:
 
     # ------------------------------------------------------------------ climate shadow
 
+    def _vacation_changed(self, state: EntityState) -> None:
+        """A changed Leave/Return helper (not the first state a sync brings) asks the climate loop
+        for a new decision and wakes the actuator, so a cancel or a new window acts in minutes."""
+        v = self.config.climate_shadow.vacation
+        if not (self.config.climate_shadow.enabled and v.enabled):
+            return
+        if state.entity_id not in (v.start_entity, v.end_entity):
+            return
+        value = state.state if state.available else None
+        known = state.entity_id in self._vacation_states
+        before = self._vacation_states.get(state.entity_id)
+        self._vacation_states[state.entity_id] = value
+        if known and before != value:
+            log.info("climate vacation helper changed entity=%s", state.entity_id)
+            self._climate_rerun.set()
+            self._wake_climate_actuator()
+
+    def vacation_read(self, now: datetime) -> vacation.VacationRead:
+        """The owner's vacation window from the entity store (ADR-0010; read only)."""
+        v = self.config.climate_shadow.vacation
+
+        def value(entity: str) -> str | None:
+            state = self.store.get(entity)
+            return state.state if state is not None and state.available else None
+
+        return vacation.read_window(
+            value(v.start_entity), value(v.end_entity), tz=self._tz, now=now, settings=v
+        )
+
+    def vacation_view(self, now: datetime) -> dict[str, Any]:
+        """The summary's ``vacation`` object: the helpers now, the warm-up start of the plan."""
+        read = self.vacation_read(now)
+        recovery = self.climate.vacation_recovery(read.window) if self.climate else None
+        return vacation.view(
+            read, now, guard_c=self.config.climate_shadow.vacation.guard_c, recovery=recovery
+        )
+
     def climate_inputs(self, now: datetime) -> LiveInputs:
         """The HA states the climate job reads (on the loop: the store is the loop's)."""
         s = self.config.climate_shadow
@@ -861,10 +906,12 @@ class ShadowService:
             away=(away.state.strip().lower() == "on")
             if away is not None and away.available
             else None,
+            vacation=self.vacation_read(now),
         )
 
-    async def run_climate_shadow(self) -> dict[str, Any] | None:
-        """Load the job if needed and run it once on its worker; ``None`` when it cannot run."""
+    async def run_climate_shadow(self, *, force: bool = False) -> dict[str, Any] | None:
+        """Load the job if needed and run it once on its worker; ``None`` when it cannot run.
+        *force* decides the current boundary again (a vacation helper changed)."""
         loop = asyncio.get_running_loop()
         if self.climate is None:
             try:
@@ -889,7 +936,7 @@ class ShadowService:
             if weather.enabled:  # issued at or before t0: nothing after the decision
                 t0 = job.decision_time(now)
                 forecast = latest_forecast(self.data_dir, weather.entity_id, t0, max_age)
-            return job.run_once(now, replace(inputs, forecast=forecast))
+            return job.run_once(now, replace(inputs, forecast=forecast), force=force)
 
         try:
             summary = await loop.run_in_executor(self._climate_pool, work)
@@ -931,10 +978,24 @@ class ShadowService:
             else:
                 due = next_run_time(now, timedelta(minutes=60), s.offset_minutes)
             first = False
-            await self.clock.sleep(max(0.0, (due - now).total_seconds()))
+            sleep = asyncio.ensure_future(self.clock.sleep(max(0.0, (due - now).total_seconds())))
+            rerun = asyncio.ensure_future(self._climate_rerun.wait())
+            try:
+                await asyncio.wait({sleep, rerun}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (sleep, rerun):
+                    task.cancel()
+            force = self._climate_rerun.is_set() and not sleep.done()
+            if force:
+                # let both helpers settle (the owner sets Leave, then Return), then decide again
+                await self.clock.sleep(VACATION_RERUN_DELAY_S)
+                self._climate_rerun.clear()
             if catch_up:
                 await self._wait_for_ha_sync()
-            await self.run_climate_shadow()
+            if force:
+                await self.run_climate_shadow(force=True)
+            else:
+                await self.run_climate_shadow()
 
     async def _wait_for_ha_sync(self) -> None:
         """Hold the startup catch-up run until HA has synced, so its regime is not ``unknown``.
@@ -982,7 +1043,11 @@ class ShadowService:
         """``GET /climate/plan/summary``: the flat dashboard document (always served)."""
         plan, mode, now = self._climate_plan_now()
         body = plan_export.summary_response(
-            plan, enabled=self.config.climate_shadow.enabled, mode=mode, now=now
+            plan,
+            enabled=self.config.climate_shadow.enabled,
+            mode=mode,
+            now=now,
+            vacation=self.vacation_view(now) if self.config.climate_shadow.enabled else None,
         )
         self.metrics.climate_plan_served.labels(
             endpoint="summary",
@@ -1001,11 +1066,13 @@ class ShadowService:
         summary = None
         if plan is not None and state in plan_export.PLAN_STATES:
             summary = plan_export.summarise(plan, now)
+        vac = self.vacation_view(now) if s.vacation.enabled else None
         return {
             "mode": mode,
             "state": state,
             "plan": plan,
             "summary": summary,
+            "vacation": vac,
             "age_s": None
             if plan is None
             else max(0.0, (now - datetime.fromisoformat(plan["generated_at"])).total_seconds()),

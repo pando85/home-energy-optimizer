@@ -42,7 +42,7 @@ import httpx
 import numpy as np
 
 from battery_optimizer import extract_prom
-from battery_optimizer.climate import plan_export, room_guard, shadow, shadow_gates
+from battery_optimizer.climate import plan_export, room_guard, shadow, shadow_gates, vacation
 from battery_optimizer.climate.config import ClimateConfig, load_climate_config
 from battery_optimizer.climate.data import SITE_FILE, Site, load_site
 from battery_optimizer.climate.mpc import PlanSettings
@@ -227,6 +227,15 @@ class ClimateShadowJob:
         self.plan_status: str | None = None
         self.redecide_foreign = redecide_foreign
         self.refit_at: datetime | None = None
+        #: Vacation windows seen (ADR-0010), start -> effective end (UTC), from the
+        #: ``climate_vacations`` records: the weekly refit pauses while one overlaps its window.
+        self.vacations: dict[datetime, datetime] = {}
+        #: The window of the previous run, to record a cancel or a change.
+        self._vacation_last: vacation.VacationWindow | None = None
+        #: Why the last due refit was not run (``vacation``), else ``None``.
+        self.refit_paused: str | None = None
+        #: The earliest warm-up start that has begun, per window (sticky, for the phase).
+        self._recovery: dict[tuple[str, str], datetime] = {}
         self._loaded = False
 
     # ------------------------------------------------------------------ schedule
@@ -259,6 +268,22 @@ class ClimateShadowJob:
         scored = {s["t0"] for s in self.scores if self._own(s)}
         for rec in iter_records(self.data_dir, "climate_days", since, until):
             self.days[rec["day"]] = rec
+        for rec in iter_records(self.data_dir, "climate_vacations", since, until):
+            try:
+                start = datetime.fromisoformat(rec["start"])
+                end = datetime.fromisoformat(rec["end"])
+            except KeyError, TypeError, ValueError:
+                continue
+            self.vacations[start] = end
+            ready = rec.get("ready_at")
+            last = self._vacation_last
+            if rec.get("closed"):
+                if last is not None and last.start == start:
+                    self._vacation_last = None
+            elif end > now and ready:
+                self._vacation_last = vacation.VacationWindow(
+                    start, end, datetime.fromisoformat(ready)
+                )
         lookback = now - timedelta(days=self.settings.score_lookback_days + 2)
         newest: dict[str, Any] | None = None
         for rec in iter_records(self.data_dir, "climate_decisions", lookback, until):
@@ -318,27 +343,40 @@ class ClimateShadowJob:
 
     # ------------------------------------------------------------------ run
 
-    def run_once(self, now: datetime, inputs: shadow.LiveInputs) -> dict[str, Any]:
+    def run_once(
+        self, now: datetime, inputs: shadow.LiveInputs, *, force: bool = False
+    ) -> dict[str, Any]:
         """Decide at the last boundary, score what is due, refresh the gates.  Never raises for a
-        data problem: the outcome is the returned (and recorded) status."""
+        data problem: the outcome is the returned (and recorded) status.
+
+        *force* decides the boundary again even if it was decided (a change of the owner's
+        vacation helpers, ADR-0010); the record is flagged ``redecision`` and never scored twice."""
         if not self._loaded:
             self.load(now)
         t0 = self.decision_time(now)
         key = _iso(t0)
-        redecision = key in self.decided and self.redecide_foreign and not self.plan_own
+        redecision = key in self.decided and (
+            force or (self.redecide_foreign and not self.plan_own)
+        )
         if key in self.decided and not redecision:
             return {"status": "skipped", "t0": key}
+        if inputs.vacation is not None:  # an HA restart keeps the window it had
+            inputs = replace(
+                inputs, vacation=vacation.hold_last(inputs.vacation, self._vacation_last, now)
+            )
+        self._track_vacation(inputs.vacation, now)
         started = time.monotonic()
         summary: dict[str, Any] = {"t0": key, "run_at": _iso(now)}
         try:
             series = _cut(self._samples(now), t0)
             start = floor_slot(t0 - self.window, 3600)
-            end = t0 + timedelta(hours=self.horizon_hours)
+            hours = shadow.decision_hours(self.cfg, inputs, self.settings.vacation, t0)
+            end = t0 + timedelta(hours=hours)
             d = shadow.build_live_data(
                 series, start=start, end=end, config=self.ccfg, site=self.site
             )
             today = local_date(t0, self.tz)
-            self._maybe_refit(d, today, now)
+            self._maybe_refit(d, today, now, inputs.vacation)
             assert self.model is not None
             d_in = d  # the decision's inputs; scoring, refit and day records read the raw ``d``
             rule = self.settings.room_spike_guard
@@ -359,6 +397,7 @@ class ClimateShadowJob:
                 inputs,
                 settings=self._plan_settings,
                 comfort=shadow.comfort_helper_levels(series, t0),
+                vacation_settings=self.settings.vacation,
             )
         except Exception as exc:  # noqa: BLE001 - recorded, counted, retried next hour
             log.exception("climate shadow decision at %s failed", key)
@@ -377,6 +416,7 @@ class ClimateShadowJob:
         rec["elapsed_s"] = round(time.monotonic() - started, 3)
         if redecision:  # the boundary was decided before the restart: never scored twice
             rec["redecision"] = True
+        self._sticky_recovery(rec, now)
         self._write("climate_decisions", t0, rec)
         self._publish(rec, own=True)
         self.decided.add(key)
@@ -404,12 +444,94 @@ class ClimateShadowJob:
         }
         return summary
 
-    def _maybe_refit(self, d, today: date, now: datetime) -> None:
+    # ------------------------------------------------------------------ vacation (ADR-0010)
+
+    def _track_vacation(self, read: vacation.VacationRead | None, now: datetime) -> None:
+        """Record every new window, and close the previous one when the owner cancels or changes
+        it (its effective end is then *now*, or its start if it had not begun), so a restart
+        still knows which days were a vacation."""
+        window = read.window if read is not None else None
+        last = self._vacation_last
+        if last is not None and (window is None or window.key() != last.key()):
+            end = max(last.start, min(last.end, now))
+            self.vacations[last.start] = end
+            self._write(
+                "climate_vacations",
+                now,
+                {
+                    "kind": "climate_vacation",
+                    "start": _iso(last.start),
+                    "end": _iso(end),
+                    "ready_at": _iso(last.ready_at),
+                    "closed": True,
+                },
+            )
+        if window is not None and (last is None or window.key() != last.key()):
+            self.vacations[window.start] = window.end
+            self._write(
+                "climate_vacations",
+                now,
+                {"kind": "climate_vacation", **window.to_dict(), "closed": False},
+            )
+        self._vacation_last = window
+
+    def _sticky_recovery(self, rec: dict[str, Any], now: datetime) -> None:
+        """Keep a warm-up that has begun: a later plan with a short pause at its first slot (the
+        minimum off) does not flip the phase back to ``away``."""
+        v = (rec.get("inputs") or {}).get("vacation")
+        window = vacation.window_from_view(v)
+        if window is None or not isinstance(v, dict):
+            return
+        key = window.key()
+        planned = v.get("recovery_start")
+        at = datetime.fromisoformat(planned) if planned else None
+        if at is not None and at <= now and key not in self._recovery:
+            self._recovery[key] = at
+        begun = self._recovery.get(key)
+        if begun is not None and window.absent(now):
+            v["recovery_start"] = _iso(begun)
+            v["phase"] = "recovery"
+
+    def vacation_recovery(self, window: vacation.VacationWindow | None) -> datetime | None:
+        """The warm-up start of *window*: the one that has begun, else the latest plan's."""
+        if window is None:
+            return None
+        begun = self._recovery.get(window.key())
+        if begun is not None:
+            return begun
+        v = ((self.plan or {}).get("inputs") or {}).get("vacation")
+        if vacation.window_from_view(v) is None or not isinstance(v, Mapping):
+            return None
+        if (v.get("start"), v.get("end")) != window.key() or not v.get("recovery_start"):
+            return None
+        return datetime.fromisoformat(v["recovery_start"])
+
+    def _vacation_in_window(self, today: date, now: datetime) -> bool:
+        """A vacation overlaps the refit's trailing window (``window_days`` local days before
+        *today*) or is under way."""
+        days = int(self.cfg.model.reestimate.window_days)
+        first = datetime.combine(today - timedelta(days=days), datetime.min.time(), tzinfo=self.tz)
+        return any(
+            start < now and end > first and end > start for start, end in self.vacations.items()
+        )
+
+    def _maybe_refit(
+        self, d, today: date, now: datetime, read: vacation.VacationRead | None = None
+    ) -> None:
         every = int(self.cfg.model.reestimate.every_days)
         if self.model is not None:
             due = date.fromisoformat(self.model["valid_from"]) + timedelta(days=every)
             if today < due:
+                self.refit_paused = None
                 return
+            if self._vacation_in_window(today, now):
+                # an empty house has no occupancy gains: refitting ua/q0 on it would bias the model
+                # for weeks after the return, so the last parameters stay (ADR-0010)
+                if self.refit_paused is None:
+                    log.info("climate shadow refit paused: a vacation is in its window")
+                self.refit_paused = "vacation"
+                return
+        self.refit_paused = None
         model = shadow.refit(self.prior, d, self.cfg, today)
         model["kind"] = "climate_model"
         model["mpc_config_sha256"] = self.cfg.sha256
@@ -491,6 +613,7 @@ class ClimateShadowJob:
             "model_valid_from": (self.model or {}).get("valid_from"),
             "last_run_at": at,
             "last_refit_at": self.refit_at,
+            "refit_paused": self.refit_paused,
             "last": last,
             "queue": len(self.queue),
             "report": self.report,

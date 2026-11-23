@@ -447,6 +447,19 @@ climate_shadow:
     # The owner's mode select, options exactly off / shadow / live (input_select, created by the
     # homelab).  Read only, like the battery kill switch; absent or unreadable: optimizer_mode.
     mode: input_select.climate_optimizer_mode
+  # Vacation mode (ADR-0010): the owner's Leave / Return helpers (input_datetime, date and time,
+  # local), read only.  While the house is empty ([Leave, Return - ready_margin_minutes)) the only
+  # minimum is guard_c (building protection, not comfort); from Return - ready_margin_minutes the
+  # return comfort.  A decision plans to the return once it is within lookahead_hours (horizon up to
+  # 72 h).  Invalid or missing helpers: no vacation (the normal schedule).
+  vacation:
+    enabled: true
+    start_entity: input_datetime.climate_vacation_start
+    end_entity: input_datetime.climate_vacation_end
+    guard_c: 12.0
+    ready_margin_minutes: 120
+    lookahead_hours: 48
+    max_days: 60
 
 # Live climate control (ADR-0009): the optimizer is the only writer of space heating (the heat-pump
 # operating mode and the Z1 water target).  INDEPENDENT of the battery's `mode`.  mode: shadow

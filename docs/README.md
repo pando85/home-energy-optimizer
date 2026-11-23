@@ -38,6 +38,7 @@ change leads to a recalibration instead of a silent drift.
 | [0005](adr/0005-shared-energy-planning-climate.md) | Shared runtime and climate optimization | Proposed (2026-10-30; architecture only) |
 | [0008](adr/0008-climate-plan-handoff-to-the-comfort-controller.md) | Climate plan handoff to the comfort controller | Proposed (2026-11-05); superseded in part by 0009 |
 | [0009](adr/0009-live-climate-control.md) | Live climate control: the optimizer writes space heating | Accepted (2026-11-18; build and shadow deployment; the switch to live needs the owner's separate approval) |
+| [0010](adr/0010-vacation-mode.md) | Vacation mode: the optimizer plans the absence and the return | Accepted (2026-11-23, v1) |
 
 ## Delivery snapshot (2026-10-25)
 
